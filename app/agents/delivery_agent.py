@@ -25,16 +25,18 @@ against the catalogue and hand them to the compiler.
 """
 
 import json
+from typing import Annotated
 
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
-from sqlalchemy import text as _sql
+from langgraph.prebuilt import ToolNode, InjectedState
 
 from app.models.state import ProductionState
 from app.services.openai_service import llm
-from app.services.database_service import _engine
+from app.services.catalogue_resolver import (
+    resolve_one, resolve_ordered, AmbiguousIdentifier,
+)
 from app.services.premiere_export_service import build_timeline, compile_project
 from app.services.ffmpeg_service import count_audio_streams
 from app.utils.logger import get_logger
@@ -45,51 +47,17 @@ logger = get_logger("delivery_agent")
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def _resolve_one(token: str) -> dict | None:
-    """Resolve a single identifier (shot_id or file-path substring) to a catalogue row.
+def _pid_from_state(state) -> int:
+    """Current project id from the injected graph state (defaults to 1).
 
-    Returns the row dict, or ``None`` when nothing matches (never fabricated).
+    The model never supplies this — the ToolNode injects it from ``ProductionState`` —
+    so Delivery resolves media, and names its output file, ONLY within the current
+    project (audit C-04). Cross-project or ambiguous identifiers cannot be compiled.
     """
-    token = (token or "").strip()
-    if not token:
-        return None
-    if token.isdigit():
-        where, param = "shot_id = :v", {"v": int(token)}
-    else:
-        where, param = "file_path LIKE :v", {"v": f"%{token}%"}
-    query = (
-        "SELECT shot_id, file_path, shot_type, "
-        "duration_seconds, orientation, fps, width, height, codec, has_audio, "
-        "keywords, description, people_count, camera_motion, lighting, mood, "
-        "subject_position "
-        f"FROM shots WHERE {where} ORDER BY shot_id LIMIT 1"
-    )
-    with _engine.begin() as conn:
-        row = conn.execute(_sql(query), param).fetchone()
-    return dict(row._mapping) if row is not None else None
-
-
-def _resolve_ordered_clips(identifiers: str) -> list[dict]:
-    """Resolve an ORDERED, comma-separated identifier list to catalogue rows.
-
-    Each token is a numeric shot_id or a file-path/name substring. Order is PRESERVED
-    exactly (unlike Selection's resolver, which sorts) and repeats are allowed — the
-    delivery timeline is whatever order the Selection Agent laid out. Every token must
-    match a catalogued clip; unmatched tokens are reported by the caller, never faked.
-
-    Returns a list of dicts: each resolved row plus an ``_identifier`` and, for
-    unmatched tokens, ``{"_identifier": tok, "_unresolved": True}``.
-    """
-    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
-    resolved: list[dict] = []
-    for tok in tokens:
-        row = _resolve_one(tok)
-        if row is None:
-            resolved.append({"_identifier": tok, "_unresolved": True})
-        else:
-            row["_identifier"] = tok
-            resolved.append(row)
-    return resolved
+    try:
+        return int((state or {}).get("project_id"))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _to_compiler_clips(rows: list[dict], roles: list[str] | None,
@@ -112,6 +80,9 @@ def _to_compiler_clips(rows: list[dict], roles: list[str] | None,
             "height": r.get("height") or None,
             "has_audio": bool(r.get("has_audio")),
             "audio_streams": streams,
+            "audio_channels": r.get("audio_channels") or None,
+            "audio_sample_rate": r.get("audio_sample_rate") or None,
+            "audio_bit_depth": r.get("audio_bit_depth") or None,
             "role": (roles[i] if roles and i < len(roles) else ""),
         })
     return clips
@@ -129,12 +100,13 @@ def _parse_roles(roles: str | None, count: int) -> list[str] | None:
 
 @tool
 def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
-                              sequence_name: str = "MAPO Edit") -> str:
+                              sequence_name: str = "MAPO Edit",
+                              state: Annotated[dict, InjectedState] = None) -> str:
     """Dry-run the timeline compile: resolve the ordered clips and show the layout.
 
     Use this BEFORE compiling to confirm every clip resolves and to see the computed
     in/out points, sequence timestamps, and track assignment — WITHOUT writing a file.
-    Order is preserved exactly as given.
+    Order is preserved exactly as given. Resolution is scoped to the current project.
 
     Args:
         ordered_identifiers: Comma-separated shot IDs and/or file names/paths IN
@@ -147,13 +119,15 @@ def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
 
     Returns:
         A grounded, numbered preview of the timeline, or a clear error listing any
-        identifiers that did not resolve.
+        identifiers that did not resolve (or that were ambiguous).
     """
-    rows = _resolve_ordered_clips(ordered_identifiers)
-    unresolved = [r["_identifier"] for r in rows if r.get("_unresolved")]
-    if unresolved:
-        return ("Cannot build the timeline — these identifiers matched no catalogued "
-                f"clip: {unresolved}. Fix or remove them (no media will be fabricated).")
+    project_id = _pid_from_state(state)
+    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
+    rows, problems = resolve_ordered(project_id, tokens)
+    if problems:
+        return ("Cannot build the timeline — resolve these identifiers first (no media "
+                "will be fabricated):\n"
+                + "\n".join(f"  • {t}: {r}" for t, r in problems))
     if not rows:
         return "No clips provided. Give the ordered clip list from the Selection Agent."
 
@@ -186,14 +160,15 @@ def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
 @tool
 def compile_premiere_project(ordered_identifiers: str, roles: str = None,
                              sequence_name: str = "MAPO Edit",
-                             project_id: int = 1) -> str:
+                             state: Annotated[dict, InjectedState] = None) -> str:
     """Compile the ordered timeline into a Premiere-importable FCP7 XML (+ JSON).
 
     Resolves each identifier to its real catalogued clip, maps time sequentially from
     the measured durations, assigns tracks (V1 video, A1 original audio, A2 only when a
     clip has a genuine second audio stream), and writes an ``xmeml`` v5 XML that Adobe
     Premiere Pro imports natively — plus a JSON intermediate. Order is PRESERVED exactly;
-    no clip is re-ranked or dropped.
+    no clip is re-ranked or dropped. Media resolution and the output filename are both
+    scoped to the current project.
 
     Args:
         ordered_identifiers: Comma-separated shot IDs and/or file names/paths IN
@@ -202,17 +177,18 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
         roles: Optional comma-separated free-form timeline-step labels aligned 1:1 with
             the clips (recorded as clip comments; descriptive only).
         sequence_name: Name for the Premiere sequence.
-        project_id: Project identifier (used in the output filenames).
 
     Returns:
         The paths to the written .xml (Premiere import) and .json files plus a summary,
-        or a clear error naming any identifiers that did not resolve.
+        or a clear error naming any identifiers that did not resolve (or were ambiguous).
     """
-    rows = _resolve_ordered_clips(ordered_identifiers)
-    unresolved = [r["_identifier"] for r in rows if r.get("_unresolved")]
-    if unresolved:
-        return ("Refusing to compile — these identifiers matched no catalogued clip: "
-                f"{unresolved}. Every media reference must be real; fix the list first.")
+    project_id = _pid_from_state(state)
+    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
+    rows, problems = resolve_ordered(project_id, tokens)
+    if problems:
+        return ("Refusing to compile — resolve these identifiers first (every media "
+                "reference must be a real catalogued clip):\n"
+                + "\n".join(f"  • {t}: {r}" for t, r in problems))
     if not rows:
         return "No clips provided. Supply the ordered clip list from the Selection Agent."
 
@@ -243,14 +219,15 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
 
 @tool
 def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edit",
-                              project_id: int = 1) -> str:
+                              state: Annotated[dict, InjectedState] = None) -> str:
     """Compile STRUCTURED timeline segments (from the Selection plan) into Premiere FCP7 XML.
 
     This is the preferred delivery path: it consumes the Selection Agent's
     `plan_timeline` output directly, so trims (in/out points) and order are honoured
     exactly. Each segment already carries its file, in_point, out_point and optional
     label — this tool resolves the real media, applies those trims, and writes the XML
-    (+ JSON). It NEVER re-orders, drops, or re-times a segment.
+    (+ JSON). It NEVER re-orders, drops, or re-times a segment. Media resolution and the
+    output filename are scoped to the current project.
 
     Args:
         segments_json: JSON — either the full plan object from `plan_timeline`
@@ -258,12 +235,12 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
             segment needs ``file_path`` or ``shot_id``; optional ``in_point`` /
             ``out_point`` (seconds) and ``label``.
         sequence_name: Name for the Premiere sequence.
-        project_id: Project identifier (used in the output filenames).
 
     Returns:
         The written .xml / .json paths + a summary, or a clear error naming any segment
-        whose media did not resolve to a real catalogued clip.
+        whose media did not resolve, was ambiguous, or was flagged invalid upstream.
     """
+    project_id = _pid_from_state(state)
     try:
         data = json.loads(segments_json)
     except (json.JSONDecodeError, TypeError) as e:
@@ -272,11 +249,25 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
     if not segments:
         return "No segments to compile. Provide the plan_timeline JSON."
 
+    # C-06: refuse any segment the planner flagged invalid (real footage but nothing left
+    # after trimming). Never silently emit or repair it.
+    invalid = [s for s in segments if s.get("valid") is False]
+    if invalid:
+        listing = "\n".join(
+            f"  • #{s.get('order', '?')} {s.get('name') or s.get('file_path')}: "
+            f"{s.get('validation_error') or 'invalid segment range'}" for s in invalid)
+        return ("Refusing to compile — the plan contains invalid segment(s); fix the trim "
+                f"or drop the clip in Selection first:\n{listing}")
+
     clips, unresolved = [], []
     for i, seg in enumerate(segments, start=1):
         ident = seg.get("shot_id")
         ident = str(ident) if ident is not None else (seg.get("file_path") or "")
-        row = _resolve_one(ident)
+        try:
+            row = resolve_one(project_id, ident)
+        except AmbiguousIdentifier as e:
+            unresolved.append(str(e))
+            continue
         if row is None:
             unresolved.append(seg.get("file_path") or seg.get("shot_id") or f"segment #{i}")
             continue
@@ -291,6 +282,9 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
             "height": row.get("height") or None,
             "has_audio": bool(row.get("has_audio")),
             "audio_streams": streams,
+            "audio_channels": row.get("audio_channels") or None,
+            "audio_sample_rate": row.get("audio_sample_rate") or None,
+            "audio_bit_depth": row.get("audio_bit_depth") or None,
             "role": seg.get("label") or "",
             # Honour the plan's trims. out_point None → compiler uses the full clip.
             "in_point": seg.get("in_point"),

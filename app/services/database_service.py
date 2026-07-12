@@ -20,7 +20,14 @@ logger = get_logger("database_service")
 
 
 # Schema DDL — always applied (idempotent via IF NOT EXISTS), so an existing file just
-# gains any missing tables.
+# gains any missing tables and indexes.
+#
+# NOTE (audit H-09): the ``UNIQUE (project_id, file_path)`` constraint below stops the
+# same clip being catalogued twice in one project. Because ``CREATE TABLE IF NOT EXISTS``
+# does NOT alter an already-existing table, this constraint only takes effect on a FRESH
+# database (and every ``:memory:`` test run); a proper migration for pre-existing on-disk
+# catalogues is tracked separately. The ``CREATE INDEX IF NOT EXISTS`` statements, by
+# contrast, DO apply retroactively to an existing file.
 _SCHEMA_DDL = """
         CREATE TABLE IF NOT EXISTS projects (
             project_id INTEGER PRIMARY KEY,
@@ -54,8 +61,17 @@ _SCHEMA_DDL = """
             embedding TEXT,
             source_mtime REAL,
             source_size INTEGER,
+            audio_channels INTEGER,
+            audio_sample_rate INTEGER,
+            audio_bit_depth INTEGER,
+            UNIQUE (project_id, file_path),
             FOREIGN KEY (project_id) REFERENCES projects(project_id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id);
+        CREATE INDEX IF NOT EXISTS idx_shots_orientation ON shots(orientation);
+        CREATE INDEX IF NOT EXISTS idx_shots_shot_type ON shots(shot_type);
+        CREATE INDEX IF NOT EXISTS idx_shots_duration ON shots(duration_seconds);
 
         CREATE TABLE IF NOT EXISTS quality_assessments (
             assessment_id INTEGER PRIMARY KEY,
@@ -115,6 +131,25 @@ _DEMO_SEED = """
 """
 
 
+# Columns added to `shots` after the original schema shipped. `CREATE TABLE IF NOT
+# EXISTS` will not alter a pre-existing on-disk table, so these are applied as an
+# idempotent ALTER TABLE ADD COLUMN migration — additive, nullable, safe on every launch.
+_ADDED_SHOT_COLUMNS = (
+    ("audio_channels", "INTEGER"),
+    ("audio_sample_rate", "INTEGER"),
+    ("audio_bit_depth", "INTEGER"),
+)
+
+
+def _migrate_shot_columns(connection) -> None:
+    """Ensure newer nullable `shots` columns exist on both fresh and pre-existing DBs."""
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(shots)").fetchall()}
+    for name, decl in _ADDED_SHOT_COLUMNS:
+        if name not in existing:
+            connection.execute(f"ALTER TABLE shots ADD COLUMN {name} {decl}")
+    connection.commit()
+
+
 def _create_engine(db_target: str):
     """Open a SQLite database, ensure the schema, and seed demo data if empty.
 
@@ -125,9 +160,22 @@ def _create_engine(db_target: str):
     A single shared connection is kept alive via StaticPool — correct for the app's
     single-process model and required for an in-memory database to persist for the
     life of the process.
+
+    Connection PRAGMAs (audit H-08) are set BEFORE the schema/seed runs, while no
+    transaction is open (``PRAGMA journal_mode`` / ``foreign_keys`` cannot change inside
+    one):
+      - ``foreign_keys=ON`` — actually enforce the declared FK relationships.
+      - ``busy_timeout`` — wait rather than fail immediately under brief write contention.
+      - ``journal_mode=WAL`` — concurrent readers + one writer (file databases only; WAL
+        is not applicable to ``:memory:`` and is skipped there).
     """
     connection = sqlite3.connect(db_target, check_same_thread=False)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    if db_target != ":memory:":
+        connection.execute("PRAGMA journal_mode = WAL")
     connection.executescript(_SCHEMA_DDL)
+    _migrate_shot_columns(connection)
 
     # Seed the demo catalogue only when the database is brand new (no shots). This is
     # what lets real ingested rows persist across restarts without the demo clobbering
@@ -181,6 +229,7 @@ _SHOT_COLUMNS = (
     "fps", "codec", "has_audio", "scene_count", "description", "people_count",
     "camera_motion", "lighting", "mood", "subject_position", "embedding",
     "source_mtime", "source_size",
+    "audio_channels", "audio_sample_rate", "audio_bit_depth",
 )
 
 
@@ -207,6 +256,15 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
     insert_sql = _sql(f"INSERT INTO shots ({columns}) VALUES ({placeholders})")
 
     with _engine.begin() as conn:
+        # Ensure a parent projects row exists so the shots.project_id FK (now enforced,
+        # audit H-08) is satisfied. Materialising the project on first ingest also avoids
+        # orphan shots. INSERT OR IGNORE leaves an existing project (e.g. the demo
+        # project 1) untouched.
+        conn.execute(
+            _sql("INSERT OR IGNORE INTO projects (project_id, project_name) "
+                 "VALUES (:pid, :name)"),
+            {"pid": project_id, "name": f"Project {project_id}"},
+        )
         conn.execute(_sql("DELETE FROM shots WHERE project_id = :pid"), {"pid": project_id})
         for row in rows:
             params = {c: row.get(c) for c in _SHOT_COLUMNS}
@@ -237,7 +295,7 @@ def get_catalogued_shots(project_id: int) -> dict:
 
     Each value is a dict of every column (including the source_mtime / source_size
     fingerprint). The Ingest Agent uses this to REUSE prior analysis — skipping the
-    expensive ffprobe/scene-detection/GPT-4o Vision work for files whose path is
+    expensive ffprobe/scene-detection/GPT-5.4 Vision work for files whose path is
     already catalogued and whose content is unchanged.
     """
     from sqlalchemy import text as _sql

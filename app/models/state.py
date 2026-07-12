@@ -1,43 +1,59 @@
 """LangGraph shared state definition for the MAPO multi-agent system.
 
-The system is a strict, user-driven linear pipeline:
+The system is a strict, user-driven linear pipeline with a UI Human-in-the-Loop
+curation layer between retrieval and editing:
 
-    Ingest → Search → Selection
+    Ingest → Search → Curation (UI HITL) → Selection → Delivery
 
-Ingest builds the catalogue; Search retrieves candidates; Selection ranks and
-explains. There is no automated quality scoring — quality is the editor's call,
-informed by the Selection Agent's reasoning.
+- Ingest builds the searchable catalogue (the knowledge base).
+- Search retrieves candidate clips (hybrid recall, retrieval only — never "best").
+- Curation is the editor checking which candidates participate (the Streamlit Bin).
+- Selection orchestrates the curated clips into an intent-driven edit timeline
+  (no fixed narrative arc; there is NO automated quality scoring — quality is the
+  editor's call, informed by the Selection Agent's reasoning).
+- Delivery compiles that timeline into a Premiere-importable project file.
+
+``ProductionState`` is the single object threaded through the whole graph and is the
+TYPED data contract between stages (audit H-05): each stage reads the previous stage's
+field and writes its own, rather than re-parsing natural-language ``messages``. The
+Pydantic shapes live in :mod:`app.models.schemas`. New fields must be added additively
+to stay backward-compatible.
 """
 
-from typing import Annotated
+from typing import Annotated, Optional
 from typing_extensions import TypedDict
 from langgraph.graph.message import AnyMessage, add_messages
 from langgraph.managed.is_last_step import RemainingSteps
 
+from app.models.schemas import DeliveryResult, EditPlan, SearchCandidate
+
 
 class ProductionState(TypedDict):
-    """Central state shared across all agents.
+    """Central state shared across all agents (the inter-stage data contract).
 
     Fields:
         project_id: Current production project identifier.
         messages: Conversation history (user, agent, tool messages).
         loaded_preferences: User/project preferences from long-term memory.
-        ingested_files: List of file paths processed by the Ingest Agent.
-        shot_metadata: Per-shot metadata catalogued by the Ingest Agent.
-        search_results: Candidate clips retrieved by the Search Agent (retrieval only).
-        search_candidates: Structured candidate dicts from hybrid_search, shown in the
-            UI curation layer for the editor to check/uncheck.
+        footage_dir: The footage directory for THIS run, carried on state instead of a
+            mutated global setting, so concurrent sessions can't clobber each other's
+            directory (audit H-07). The Ingest tools read it when no explicit directory
+            argument is given.
+        ingested_files: File paths processed by the Ingest stage.
+        shot_metadata: Per-clip catalogue rows written by the Ingest stage.
+        search_results: Candidate clips retrieved by the Search stage (retrieval only).
+        search_candidates: Structured ``SearchCandidate`` items from ``hybrid_search``,
+            shown in the UI curation layer for the editor to check/uncheck.
         selected_candidates: File paths the editor curated in the UI — the explicit
-            input to the Selection Agent (it works only on these).
+            input to the Selection stage (it works only on these).
         selected_shots: Clips the editor has chosen to keep (Human-in-the-Loop).
-        recommendations: Intent-aware, ranked clip recommendations from the Selection
-            Agent, each paired with an explanation of why it was recommended.
-        edit_timeline: Ordered edit timeline produced by the Selection Agent. Its
-            structure and length are driven by the editing intent (no fixed arc);
-            steps may carry optional free-form labels.
-        delivery_output: Paths + summary of the Premiere-importable project files
-            (FCP7 XML + JSON intermediate) compiled by the Delivery Agent from the
-            edit timeline. Compile-only — no creative decision is recorded here.
+        recommendations: (Legacy) intent-aware clip notes from the Selection stage; the
+            editor always makes the final decision — nothing here is auto-selected.
+        edit_timeline: The Selection stage's structured ``EditPlan`` (mode + ordered
+            segments). Structure and length are intent-driven (no fixed arc). This is the
+            object the Delivery stage compiles verbatim.
+        delivery_output: The Delivery stage's structured ``DeliveryResult`` (written FCP7
+            XML/JSON artefact paths + sequence shape). Compile-only — no creative call.
         remaining_steps: Managed — prevents infinite ReAct loops.
 
     New fields should be added additively to stay backward-compatible.
@@ -45,13 +61,14 @@ class ProductionState(TypedDict):
     project_id: str
     messages: Annotated[list[AnyMessage], add_messages]
     loaded_preferences: str
-    ingested_files: list
-    shot_metadata: list
-    search_results: list
-    search_candidates: list
-    selected_candidates: list
-    selected_shots: list
-    recommendations: list
-    edit_timeline: list
-    delivery_output: list
+    footage_dir: str
+    ingested_files: list[str]
+    shot_metadata: list[dict]
+    search_results: list[SearchCandidate]
+    search_candidates: list[SearchCandidate]
+    selected_candidates: list[str]
+    selected_shots: list[dict]
+    recommendations: list[dict]
+    edit_timeline: Optional[EditPlan]
+    delivery_output: Optional[DeliveryResult]
     remaining_steps: RemainingSteps

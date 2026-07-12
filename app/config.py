@@ -14,9 +14,9 @@ class Settings:
 
     # LLM
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
-    LLM_MODEL_FALLBACK: str = os.getenv("LLM_MODEL_FALLBACK", "gpt-4o-mini")
-    VISION_MODEL: str = os.getenv("VISION_MODEL", "gpt-4o")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5.4")
+    LLM_MODEL_FALLBACK: str = os.getenv("LLM_MODEL_FALLBACK", "gpt-5.4-mini")
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "gpt-5.4")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
     # LangSmith

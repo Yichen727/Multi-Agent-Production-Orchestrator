@@ -342,34 +342,51 @@ def test_plan_segments_full_mode_keeps_full_length():
 
 
 def test_compile_timeline_segments_honours_trims(tmp_path):
-    """Delivery's segment tool trims to the plan's out_points and preserves order."""
+    """Delivery's segment tool trims to the plan's out_points and preserves order.
+
+    Uses REAL catalogued media (audit H-12 makes compilation validate files on disk), so
+    the clips are actual temp files in their own project; durations come from the catalogue.
+    """
     pytest.importorskip("langgraph")
     import json as _json
     import xml.etree.ElementTree as ET
     from app.agents.delivery_agent import compile_timeline_segments
+    from app.services.database_service import replace_project_shots, _engine
+    from sqlalchemy import text
 
-    # Demo shots 1 (12.5s) and 3 (8.2s), trimmed to 4s / 6s in that order.
-    plan = {"mode": "timed", "target_seconds": 10.0, "total_seconds": 10.0, "segments": [
-        {"order": 1, "shot_id": 1, "file_path": "/footage/scene01/take01.mov",
-         "in_point": 0.0, "out_point": 4.0, "label": "open"},
-        {"order": 2, "shot_id": 3, "file_path": "/footage/scene01/take03.mov",
-         "in_point": 0.0, "out_point": 6.0, "label": "peak"},
-    ]}
-    out = compile_timeline_segments.invoke({
-        "segments_json": _json.dumps(plan),
-        "sequence_name": "TrimTest", "project_id": 777,
-    })
-    assert "compiled" in out.lower()
+    a = tmp_path / "take01.mov"; a.write_bytes(b"x")
+    b = tmp_path / "take03.mov"; b.write_bytes(b"x")
+    replace_project_shots(555, [
+        {"file_path": str(a), "duration_seconds": 12.5, "fps": 24.0,
+         "orientation": "landscape", "has_audio": 1},
+        {"file_path": str(b), "duration_seconds": 8.2, "fps": 24.0,
+         "orientation": "landscape", "has_audio": 1},
+    ])
+    try:
+        # 12.5s and 8.2s clips, trimmed to 4s / 6s in that order.
+        plan = {"mode": "timed", "target_seconds": 10.0, "total_seconds": 10.0, "segments": [
+            {"order": 1, "file_path": str(a), "in_point": 0.0, "out_point": 4.0, "label": "open"},
+            {"order": 2, "file_path": str(b), "in_point": 0.0, "out_point": 6.0, "label": "peak"},
+        ]}
+        # project_id is INJECTED from graph state (audit C-03/C-04) — resolution is scoped.
+        out = compile_timeline_segments.invoke({
+            "segments_json": _json.dumps(plan),
+            "sequence_name": "TrimTest", "state": {"project_id": 555},
+        })
+        assert "compiled" in out.lower(), out
 
-    # Find the written XML and verify the trims landed (24fps demo → 4s=96, 6s=144).
-    m = re.search(r"(\S+premiere_777_\S+\.xml)", out)
-    assert m, out
-    root = ET.fromstring(Path(m.group(1)).read_text(encoding="utf-8"))
-    clipitems = root.findall("./sequence/media/video/track/clipitem")
-    names = [c.findtext("name") for c in clipitems]
-    assert names == ["take01.mov", "take03.mov"]  # order preserved
-    outs = [int(c.findtext("out")) for c in clipitems]
-    assert outs == [96, 144]  # trimmed lengths, not full 12.5s / 8.2s
+        # Find the written XML and verify the trims landed (24fps → 4s=96, 6s=144).
+        m = re.search(r"(\S+\.xml)", out)
+        assert m, out
+        root = ET.fromstring(Path(m.group(1)).read_text(encoding="utf-8"))
+        clipitems = root.findall("./sequence/media/video/track/clipitem")
+        names = [c.findtext("name") for c in clipitems]
+        assert names == ["take01.mov", "take03.mov"]  # order preserved
+        outs = [int(c.findtext("out")) for c in clipitems]
+        assert outs == [96, 144]  # trimmed lengths, not full 12.5s / 8.2s
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 555"))
 
 
 def test_compile_timeline_segments_refuses_unresolved():
@@ -388,6 +405,256 @@ def test_file_service_removed():
     import importlib
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("app.services.file_service")
+
+
+# ── Batch 1: project isolation, stable resolution, range validation ───────────
+
+
+def test_resolver_enforces_project_isolation():
+    """C-03/C-04: an identifier never resolves across projects (shot_id or file name)."""
+    from app.services.catalogue_resolver import resolve_one
+    from app.services.database_service import replace_project_shots, _engine
+    from sqlalchemy import text
+    replace_project_shots(77, [{"file_path": "/p77/take01.mov",
+                                "duration_seconds": 4.0, "orientation": "landscape"}])
+    try:
+        assert resolve_one(77, "/p77/take01.mov") is not None      # its own clip
+        assert resolve_one(77, "/footage/scene01/take02.mov") is None   # project 1's file
+        assert resolve_one(1, "/p77/take01.mov") is None            # project 1 can't see it
+        assert resolve_one(77, "3") is None                         # shot_id 3 is project 1
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 77"))
+
+
+def test_resolver_ambiguous_identifier_not_silent():
+    """H-01: a file name matching >1 clip raises instead of silently taking the first."""
+    from app.services.catalogue_resolver import resolve_one, AmbiguousIdentifier
+    # The demo project 1 holds two take01.mov (scene01 + scene02).
+    with pytest.raises(AmbiguousIdentifier):
+        resolve_one(1, "take01.mov")
+    # A shot_id, and a full path, are unambiguous.
+    assert resolve_one(1, "1")["shot_id"] == 1
+    assert resolve_one(1, "/footage/scene01/take01.mov")["shot_id"] == 1
+
+
+def test_build_timeline_rejects_illegal_explicit_range():
+    """C-05: an explicit illegal in/out fails loudly; it is NOT expanded to the full clip."""
+    from app.services.premiere_export_service import build_timeline, InvalidSegmentRange
+    with pytest.raises(InvalidSegmentRange):  # zero-length
+        build_timeline([{"file_path": "/f/a.mov", "duration_seconds": 8.0,
+                         "in_point": 3.0, "out_point": 3.0}])
+    with pytest.raises(InvalidSegmentRange):  # out beyond source
+        build_timeline([{"file_path": "/f/a.mov", "duration_seconds": 8.0,
+                         "in_point": 0.0, "out_point": 99.0}])
+    # No explicit trim → full clip is used (the only time the full source is implied).
+    tl = build_timeline([{"file_path": "/f/a.mov", "duration_seconds": 8.0}])
+    assert tl["clips"][0]["used_seconds"] == 8.0
+
+
+def test_plan_segments_flags_zero_length_trim():
+    """C-06: a trim leaving no middle is flagged invalid, not silently emitted/dropped."""
+    from app.services.timeline_service import plan_segments
+    plan = plan_segments([{"file_path": "/f/short.mov", "shot_id": 9,
+                           "duration_seconds": 2.0}],
+                         target_seconds=None, head_trim=1.5, tail_trim=1.5)
+    assert plan["valid"] is False
+    assert plan["segments"][0]["valid"] is False
+    assert plan["validation_errors"] and plan["validation_errors"][0]["order"] == 1
+
+
+def test_compile_timeline_segments_refuses_invalid_plan():
+    """C-06: Delivery refuses to compile a plan that carries an invalid segment."""
+    pytest.importorskip("langgraph")
+    import json as _json
+    from app.agents.delivery_agent import compile_timeline_segments
+    plan = {"segments": [{"order": 1, "shot_id": 1,
+                          "file_path": "/footage/scene01/take01.mov",
+                          "in_point": 0.0, "out_point": 0.0, "valid": False,
+                          "validation_error": "no middle remains"}]}
+    out = compile_timeline_segments.invoke(
+        {"segments_json": _json.dumps(plan), "state": {"project_id": 1}})
+    assert "refus" in out.lower() and "invalid" in out.lower()
+
+
+def test_ingest_missing_directory_is_structured_failure():
+    """C-08: a hard failure records a structured failure result (UI won't unlock on it)."""
+    pytest.importorskip("langgraph")
+    import app.agents.ingest_agent as ia
+    ia.reset_last_ingest_result()
+    msg = ia.ingest_footage.func(directory="/no/such/dir/xyz", project_id=1)
+    res = ia.get_last_ingest_result()
+    assert res is not None and res.status == "failure" and res.indexed_count == 0
+    assert "not found" in msg.lower()
+
+
+def test_ingest_refuses_when_scan_truncated(tmp_path, monkeypatch):
+    """C-07: >cap files → refuse and DO NOT delete the existing catalogue."""
+    pytest.importorskip("langgraph")
+    import app.agents.ingest_agent as ia
+    from app.services.database_service import (
+        replace_project_shots, get_catalogued_paths, _engine,
+    )
+    from sqlalchemy import text
+    replace_project_shots(88, [{"file_path": "/pre/keep.mov",
+                                "duration_seconds": 3.0, "orientation": "landscape"}])
+    try:
+        for i in range(3):
+            (tmp_path / f"c{i}.mp4").write_bytes(b"x")
+        monkeypatch.setattr(ia, "_MAX_INGEST_FILES", 2)        # force truncation
+        monkeypatch.setattr(ia, "check_ffprobe_installed", lambda: True)
+        ia.reset_last_ingest_result()
+        msg = ia.ingest_footage.func(directory=str(tmp_path), project_id=88)
+        res = ia.get_last_ingest_result()
+        assert res.status == "failure" and res.truncated is True
+        assert "refus" in msg.lower()
+        # The destructive rewrite was skipped — the pre-existing row survived.
+        assert get_catalogued_paths(88) == {"/pre/keep.mov"}
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 88"))
+
+
+# ── Batch 2: architecture convergence (C-09, H-03, H-04, H-06, H-07) ──────────
+
+
+def test_orchestrator_is_fixed_pipeline_no_supervisor():
+    """H-06/C-09: the orchestrator drives four explicit stages — no supervisor, no gate."""
+    pytest.importorskip("langgraph")
+    from app.orchestrator import production_orchestrator as orch
+    # The LLM supervisor and the dead LangGraph approval gate are gone.
+    for absent in ("mapo_agent", "supervisor", "human_approval_gate",
+                   "_needs_approval", "verify_project", "mapo_graph"):
+        assert not hasattr(orch, absent), f"{absent} should be removed"
+    # The four explicit stage functions exist.
+    for stage in ("run_ingest", "run_search", "run_selection", "run_delivery"):
+        assert callable(getattr(orch, stage))
+    # The compiled sub-agents are still exposed.
+    for agent in ("ingest_agent", "search_agent", "selection_agent", "delivery_agent"):
+        assert hasattr(orch, agent)
+
+
+def test_run_delivery_requires_structured_plan():
+    """H-04: Delivery refuses without a structured plan — no media-pool-order fallback."""
+    pytest.importorskip("langgraph")
+    from app.orchestrator import production_orchestrator as orch
+    for bad in (None, {}, {"segments": []}):
+        with pytest.raises(ValueError):
+            orch.run_delivery(bad, 1, "editor_01")
+
+
+def test_extract_plan_reads_tool_output_not_model_prose():
+    """H-03: the plan is read from the plan_timeline TOOL message, immune to model rewrites."""
+    pytest.importorskip("langgraph")
+    from langchain_core.messages import ToolMessage, AIMessage
+    from app.orchestrator import production_orchestrator as orch
+    tool_plan = '{"mode":"timed","segments":[{"order":1,"file_path":"/f/a.mov"}]}'
+    decoy = '{"mode":"HACKED","segments":[{"order":99,"file_path":"/evil.mov"}]}'
+    msgs = [
+        ToolMessage(content="ok\n```json\n" + tool_plan + "\n```",
+                    tool_call_id="x", name="plan_timeline"),
+        AIMessage(content="My plan:\n```json\n" + decoy + "\n```"),  # model prose decoy
+    ]
+    plan = orch._extract_plan(msgs)
+    assert plan is not None and plan["mode"] == "timed"
+    assert plan["segments"][0]["order"] == 1  # tool output won, not the AI-message decoy
+
+
+def test_ingest_reads_footage_dir_from_state_not_global(tmp_path, monkeypatch):
+    """H-07: the footage directory comes from state; the global setting is never mutated."""
+    pytest.importorskip("langgraph")
+    import app.agents.ingest_agent as ia
+    from app.config import settings
+    monkeypatch.setattr(ia, "check_ffprobe_installed", lambda: True)
+    before = settings.RAW_FOOTAGE_DIR
+    ia.reset_last_ingest_result()
+    # An empty existing dir passed via state → "no supported files", proving it was used.
+    msg = ia.ingest_footage.func(
+        directory=None, state={"footage_dir": str(tmp_path), "project_id": 1})
+    assert str(tmp_path) in msg
+    assert settings.RAW_FOOTAGE_DIR == before           # global untouched (H-07)
+    assert ia.get_last_ingest_result().status == "failure"
+
+
+def test_run_search_returns_candidates_via_orchestrator():
+    """H-06: the UI's Search path and the Search Agent share one retrieval entry point."""
+    pytest.importorskip("langgraph")
+    from app.orchestrator import production_orchestrator as orch
+    cands = orch.run_search("aerial cityscape", 1)
+    assert isinstance(cands, list) and len(cands) >= 1
+    assert all("file_path" in c and "suggestion" in c for c in cands)
+
+
+# ── Batch 3: delivery reliability (H-10, H-11, H-12, H-13) ────────────────────
+
+
+def test_timebase_ntsc_mapping():
+    """H-11: fractional NTSC rates map to (integer timebase, ntsc=True); integers don't."""
+    from app.services.premiere_export_service import _timebase_ntsc
+    assert _timebase_ntsc(23.976) == (24, True)
+    assert _timebase_ntsc(29.97) == (30, True)
+    assert _timebase_ntsc(59.94) == (60, True)
+    assert _timebase_ntsc(30000 / 1001) == (30, True)   # the exact rational
+    assert _timebase_ntsc(25.0) == (25, False)
+    assert _timebase_ntsc(24.0) == (24, False)
+    assert _timebase_ntsc(30.0) == (30, False)
+
+
+def test_build_timeline_ntsc_no_frame_drift():
+    """H-11: a 29.97 timeline uses timebase 30 + ntsc, and frames are exact (no drift)."""
+    from app.services.premiere_export_service import build_timeline
+    tl = build_timeline([{"file_path": "/f/a.mov", "duration_seconds": 100.0, "fps": 29.97}],
+                        fps=29.97)
+    assert tl["sequence"]["timebase"] == 30 and tl["sequence"]["ntsc"] is True
+    assert tl["clips"][0]["out_frame"] == 3000  # 100s * 30 — integer, no accumulation error
+
+
+def test_source_file_uses_real_media_params():
+    """H-10: the source <file> carries the clip's OWN dims/rate/audio, not the sequence's."""
+    import xml.etree.ElementTree as ET
+    from app.services.premiere_export_service import build_timeline, to_fcp7_xml
+    clips = [{"file_path": "/f/portrait.mov", "duration_seconds": 5.0, "fps": 30.0,
+              "width": 720, "height": 1280, "has_audio": True, "audio_streams": 1,
+              "audio_channels": 6, "audio_sample_rate": 44100, "audio_bit_depth": 24}]
+    # Sequence deliberately differs from the source (1920x1080@24 vs 720x1280@30).
+    root = ET.fromstring(to_fcp7_xml(build_timeline(clips, fps=24.0, width=1920, height=1080)))
+    # Sequence raster = sequence params.
+    assert root.findtext("./sequence/media/video/format/samplecharacteristics/width") == "1920"
+    # Source <file> = the real source params.
+    fchar = root.find("./sequence/media/video/track/clipitem/file/media/video/samplecharacteristics")
+    assert fchar.findtext("width") == "720" and fchar.findtext("height") == "1280"
+    assert root.findtext("./sequence/media/video/track/clipitem/file/rate/timebase") == "30"
+    fa = root.find("./sequence/media/video/track/clipitem/file/media/audio")
+    assert fa.findtext("samplecharacteristics/samplerate") == "44100"
+    assert fa.findtext("samplecharacteristics/depth") == "24"
+    assert fa.findtext("channelcount") == "6"  # channels, NOT the audio-stream count
+
+
+def test_compile_project_refuses_missing_media(tmp_path):
+    """H-12: compilation validates media on disk and refuses when a file is missing."""
+    from app.services.premiere_export_service import compile_project, MediaValidationError
+    clips = [{"file_path": str(tmp_path / "ghost.mov"), "duration_seconds": 3.0, "fps": 24.0}]
+    with pytest.raises(MediaValidationError):
+        compile_project(clips, write=False)            # verify_media defaults True
+    # Structure-only compiles can still opt out of the disk check.
+    result = compile_project(clips, write=False, verify_media=False)
+    assert result["xml"].startswith("<?xml")
+
+
+def test_compile_project_versions_exports(tmp_path):
+    """H-13: re-exporting the same sequence writes two trackable versions (no overwrite)."""
+    from app.services.premiere_export_service import compile_project
+    media = tmp_path / "clip.mov"; media.write_bytes(b"x")
+    clips = [{"file_path": str(media), "duration_seconds": 4.0, "fps": 24.0,
+              "has_audio": False, "audio_streams": 0}]
+    r1 = compile_project(clips, sequence_name="VerTest", project_id=321, write=True)
+    r2 = compile_project(clips, sequence_name="VerTest", project_id=321, write=True)
+    assert r1["xml_path"] != r2["xml_path"]                    # distinct versions
+    assert Path(r1["xml_path"]).exists() and Path(r2["xml_path"]).exists()
+    # Clean up the two written exports.
+    for r in (r1, r2):
+        Path(r["xml_path"]).unlink(missing_ok=True)
+        Path(r["json_path"]).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

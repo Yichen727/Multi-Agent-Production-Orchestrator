@@ -28,6 +28,9 @@ Design rules honoured here (see CLAUDE.md):
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -42,6 +45,85 @@ DEFAULT_FPS = 24.0
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 
+# Tolerance (seconds) when comparing an explicit out-point against the measured source
+# duration — absorbs float rounding so a legitimately full-length trim isn't rejected.
+_RANGE_EPS = 1e-3
+
+
+class InvalidSegmentRange(ValueError):
+    """An explicit in/out trim is illegal (zero/negative length or outside the source).
+
+    Raised by :func:`build_timeline` rather than silently rewriting the interval to the
+    full clip (audit C-05). Carries the 1-based ``order`` and the clip name so the caller
+    (and the UI) can name exactly which segment failed and why.
+    """
+
+    def __init__(self, order: int, name: str, reason: str):
+        self.order = order
+        self.name = name
+        self.reason = reason
+        super().__init__(f"Segment #{order} ({name}): {reason}")
+
+
+class MediaValidationError(ValueError):
+    """Pre-export validation failed — a clip's media is missing/unreadable on disk (H-12).
+
+    A catalogue row is not proof the file still exists, so compilation validates every
+    clip against the filesystem first and refuses rather than emit a "successful" XML that
+    points at media Premiere cannot relink. Carries the structured ``report``.
+    """
+
+    def __init__(self, report: dict):
+        self.report = report
+        problems = "; ".join(f"#{p['order']} {p['name']}: {p['error']}"
+                             for p in report.get("problems", []))
+        super().__init__(f"Media validation failed for {len(report.get('problems', []))} "
+                         f"clip(s): {problems}")
+
+
+def validate_media(clips: list[dict]) -> dict:
+    """Check every clip's media exists and is a readable file (audit H-12).
+
+    Returns a structured report ``{"ok": bool, "problems": [{order, name, file_path,
+    error}]}``. Existence/readability only — the in/out RANGE against the measured source
+    duration is validated separately by :func:`build_timeline` (`InvalidSegmentRange`).
+    """
+    problems: list[dict] = []
+    for order, clip in enumerate(clips, start=1):
+        fp = clip.get("file_path")
+        name = Path(fp).name if fp else f"clip #{order}"
+        if not fp:
+            problems.append({"order": order, "name": name, "file_path": fp,
+                             "error": "no file_path"})
+            continue
+        p = Path(fp)
+        if not p.exists():
+            problems.append({"order": order, "name": name, "file_path": str(fp),
+                             "error": "file not found on disk"})
+        elif not p.is_file():
+            problems.append({"order": order, "name": name, "file_path": str(fp),
+                             "error": "path is not a file"})
+        elif not os.access(p, os.R_OK):
+            problems.append({"order": order, "name": name, "file_path": str(fp),
+                             "error": "file is not readable"})
+    return {"ok": not problems, "problems": problems}
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically: write a temp file, then ``os.replace``.
+
+    A crash mid-write leaves the temp file, never a truncated/half-written target (H-13).
+    """
+    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# Documented audio fallbacks used only when ingest did not measure the real value.
+DEFAULT_AUDIO_CHANNELS = 2
+DEFAULT_AUDIO_SAMPLE_RATE = 48000
+DEFAULT_AUDIO_BIT_DEPTH = 16
+
 
 # ── JSON intermediate (the neutral, convertible representation) ─────────────────
 
@@ -49,6 +131,26 @@ DEFAULT_HEIGHT = 1080
 def _seconds_to_frames(seconds: float, timebase: int) -> int:
     """Convert a duration in seconds to whole frames at ``timebase`` fps."""
     return int(round(max(0.0, float(seconds or 0.0)) * timebase))
+
+
+def _timebase_ntsc(fps: float) -> tuple[int, bool]:
+    """Map a real frame rate to an FCP7 ``(timebase:int, ntsc:bool)`` pair (audit H-11).
+
+    FCP7/Premiere express fractional NTSC rates as an INTEGER timebase plus an ``ntsc``
+    (1.001 pulldown) flag, so the exact rational is captured without frame drift:
+
+        23.976 → (24, True)   29.97 → (30, True)   59.94 → (60, True)
+        24 / 25 / 30 / 50 / 60 (exact integers) → ntsc = False
+
+    A fractional (non-integer) rate is treated as NTSC; an exact integer rate is not.
+    Falls back to the default fps for a missing/zero rate.
+    """
+    f = float(fps or 0.0)
+    if f <= 0:
+        f = DEFAULT_FPS
+    timebase = max(1, int(round(f)))
+    ntsc = abs(f - timebase) > 1e-3
+    return timebase, ntsc
 
 
 def build_timeline(
@@ -84,7 +186,7 @@ def build_timeline(
     """
     first = clips[0] if clips else {}
     seq_fps = float(fps or first.get("fps") or DEFAULT_FPS) or DEFAULT_FPS
-    timebase = int(round(seq_fps))
+    timebase, seq_ntsc = _timebase_ntsc(seq_fps)
     seq_w = int(width or first.get("width") or DEFAULT_WIDTH)
     seq_h = int(height or first.get("height") or DEFAULT_HEIGHT)
 
@@ -98,11 +200,33 @@ def build_timeline(
             raise ValueError(f"Clip #{order} has no file_path — refusing to fabricate a media reference.")
 
         duration = float(clip.get("duration_seconds") or 0.0)
-        # Explicit in/out from upstream, else full clip.
-        in_s = float(clip.get("in_point") or 0.0)
-        out_s = float(clip.get("out_point") if clip.get("out_point") is not None else duration)
-        if out_s <= in_s:
-            out_s = in_s + duration if duration > 0 else in_s
+        # Trim handling (audit C-05): the full clip is used ONLY when NEITHER an in- nor
+        # an out-point is supplied. When the caller provides an explicit interval it is
+        # VALIDATED, not silently repaired — an illegal range (zero/negative length, or
+        # outside the measured source) raises InvalidSegmentRange naming the segment,
+        # rather than being quietly rewritten back to the full/remaining source duration.
+        has_in = clip.get("in_point") is not None
+        has_out = clip.get("out_point") is not None
+        name = Path(file_path).name
+        if not has_in and not has_out:
+            in_s, out_s = 0.0, duration
+        else:
+            in_s = float(clip.get("in_point") or 0.0)
+            out_s = float(clip["out_point"]) if has_out else duration
+            if in_s < 0:
+                raise InvalidSegmentRange(order, name, f"in_point {in_s:g}s is negative")
+            if duration > 0 and in_s > duration + _RANGE_EPS:
+                raise InvalidSegmentRange(
+                    order, name,
+                    f"in_point {in_s:g}s is beyond the source duration {duration:g}s")
+            if duration > 0 and out_s > duration + _RANGE_EPS:
+                raise InvalidSegmentRange(
+                    order, name,
+                    f"out_point {out_s:g}s exceeds the source duration {duration:g}s")
+            if out_s <= in_s + _RANGE_EPS:
+                raise InvalidSegmentRange(
+                    order, name,
+                    f"out_point {out_s:g}s <= in_point {in_s:g}s (zero-length segment)")
         used = max(0.0, out_s - in_s)
 
         in_f = _seconds_to_frames(in_s, timebase)
@@ -117,6 +241,19 @@ def build_timeline(
         if audio_streams is None:
             audio_streams = 1 if has_audio else 0
 
+        # Real per-source media parameters (audit H-10) — the SOURCE <file> element uses
+        # these, kept separate from the SEQUENCE raster/rate. Fall back to the sequence
+        # size / documented audio defaults only when ingest did not measure a value.
+        src_w = int(clip.get("width") or seq_w)
+        src_h = int(clip.get("height") or seq_h)
+        src_fps = float(clip.get("fps") or seq_fps)
+        audio_channels = int(clip.get("audio_channels") or 0) or (
+            DEFAULT_AUDIO_CHANNELS if has_audio else 0)
+        audio_sample_rate = int(clip.get("audio_sample_rate") or 0) or (
+            DEFAULT_AUDIO_SAMPLE_RATE if has_audio else 0)
+        audio_bit_depth = int(clip.get("audio_bit_depth") or 0) or (
+            DEFAULT_AUDIO_BIT_DEPTH if has_audio else 0)
+
         abs_path = _absolute_path(file_path)
         entries.append({
             "order": order,
@@ -126,9 +263,14 @@ def build_timeline(
             "file_path": str(file_path),
             "absolute_path": str(abs_path),
             "pathurl": _path_to_url(abs_path),
-            "fps": float(clip.get("fps") or seq_fps),
+            "fps": src_fps,
+            "width": src_w,
+            "height": src_h,
             "has_audio": has_audio,
             "audio_streams": int(audio_streams),
+            "audio_channels": audio_channels,
+            "audio_sample_rate": audio_sample_rate,
+            "audio_bit_depth": audio_bit_depth,
             "in_seconds": round(in_s, 3),
             "out_seconds": round(out_s, 3),
             "used_seconds": round(used, 3),
@@ -145,7 +287,7 @@ def build_timeline(
             "name": sequence_name,
             "fps": seq_fps,
             "timebase": timebase,
-            "ntsc": timebase in (30, 60, 24) and abs(seq_fps - timebase) > 0.01,
+            "ntsc": seq_ntsc,
             "width": seq_w,
             "height": seq_h,
             "total_frames": playhead_frames,
@@ -194,29 +336,46 @@ def _rate_xml(timebase: int, ntsc: bool, indent: str) -> str:
     )
 
 
-def _file_element(clip: dict, timebase: int, ntsc: bool, seq_w: int, seq_h: int,
-                  file_id: str, define: bool, indent: str) -> str:
-    """A <file> element. Defined fully once per source file, then referenced by id.
+def _file_element(clip: dict, file_id: str, define: bool, indent: str) -> str:
+    """A <file> element carrying the clip's REAL source media parameters (audit H-10).
+
+    The source ``<file>`` describes the ORIGINAL media, independent of the sequence:
+      - video ``<rate>`` and ``<width>``/``<height>`` come from the clip's own fps and
+        pixel dimensions (not the sequence raster/rate);
+      - audio ``<channelcount>`` / ``<samplerate>`` / ``<depth>`` are the measured values
+        (documented fallbacks only when ingest did not capture them). ``channelcount`` is
+        the number of CHANNELS — not the number of audio streams (which drives A1/A2).
 
     FCP7 requires each media file be fully described the first time its id appears;
     later clipitems (e.g. the audio track linked to the same file) reference the id
-    with an empty <file id="..."/> so Premiere links them to one master clip.
+    with an empty ``<file id="..."/>`` so Premiere links them to one master clip.
     """
     if not define:
         return f'{indent}<file id="{file_id}"/>'
 
     name = escape(clip["name"])
+    src_tb, src_ntsc = _timebase_ntsc(clip.get("fps"))
+    src_w = int(clip.get("width") or 0)
+    src_h = int(clip.get("height") or 0)
     total_dur_frames = _seconds_to_frames(
-        clip["out_seconds"] if clip["out_seconds"] > 0 else clip["used_seconds"], timebase)
+        clip["out_seconds"] if clip["out_seconds"] > 0 else clip["used_seconds"], src_tb)
     total_dur_frames = max(total_dur_frames, clip["out_frame"], 1)
+
+    video_char = f"{_rate_xml(src_tb, src_ntsc, indent + '        ')}\n"
+    if src_w > 0 and src_h > 0:
+        video_char += (f"{indent}        <width>{src_w}</width>\n"
+                       f"{indent}        <height>{src_h}</height>\n")
+
     audio_block = ""
     if clip["audio_streams"] > 0:
-        channels = clip["audio_streams"]
+        channels = int(clip.get("audio_channels") or DEFAULT_AUDIO_CHANNELS)
+        samplerate = int(clip.get("audio_sample_rate") or DEFAULT_AUDIO_SAMPLE_RATE)
+        depth = int(clip.get("audio_bit_depth") or DEFAULT_AUDIO_BIT_DEPTH)
         audio_block = (
             f"{indent}    <audio>\n"
             f"{indent}      <samplecharacteristics>\n"
-            f"{indent}        <samplerate>48000</samplerate>\n"
-            f"{indent}        <depth>16</depth>\n"
+            f"{indent}        <samplerate>{samplerate}</samplerate>\n"
+            f"{indent}        <depth>{depth}</depth>\n"
             f"{indent}      </samplecharacteristics>\n"
             f"{indent}      <channelcount>{channels}</channelcount>\n"
             f"{indent}    </audio>\n"
@@ -225,13 +384,12 @@ def _file_element(clip: dict, timebase: int, ntsc: bool, seq_w: int, seq_h: int,
         f'{indent}<file id="{file_id}">\n'
         f"{indent}  <name>{name}</name>\n"
         f"{indent}  <pathurl>{escape(clip['pathurl'])}</pathurl>\n"
-        f"{_rate_xml(timebase, ntsc, indent + '  ')}\n"
+        f"{_rate_xml(src_tb, src_ntsc, indent + '  ')}\n"
         f"{indent}  <duration>{total_dur_frames}</duration>\n"
         f"{indent}  <media>\n"
         f"{indent}    <video>\n"
         f"{indent}      <samplecharacteristics>\n"
-        f"{indent}        <width>{seq_w}</width>\n"
-        f"{indent}        <height>{seq_h}</height>\n"
+        f"{video_char}"
         f"{indent}      </samplecharacteristics>\n"
         f"{indent}    </video>\n"
         f"{audio_block}"
@@ -316,7 +474,7 @@ def to_fcp7_xml(timeline: dict) -> str:
         # ── Video clipitem (V1): defines the file the first time it appears ──
         define_here = clip["absolute_path"] not in defined_files
         defined_files.add(clip["absolute_path"])
-        file_xml = _file_element(clip, tb, ntsc, w, h, fid, define_here, "        ")
+        file_xml = _file_element(clip, fid, define_here, "        ")
         video_items.append(
             f'      <clipitem id="{v_id}">\n'
             f"        <name>{name}</name>\n"
@@ -436,6 +594,7 @@ def compile_project(
     width: int | None = None,
     height: int | None = None,
     write: bool = True,
+    verify_media: bool = True,
 ) -> dict:
     """Compile ordered clips into the JSON intermediate + FCP7 XML, and (optionally) write both.
 
@@ -444,8 +603,11 @@ def compile_project(
         sequence_name: Name of the Premiere sequence.
         project_id: Project id (used for the output filename).
         fps / width / height: Sequence overrides; otherwise inferred from the clips.
-        write: When True, write ``<sequence>.xml`` and ``<sequence>.json`` to
-            ``settings.PROCESSED_OUTPUT_DIR / "exports"``.
+        write: When True, write the ``.xml`` and ``.json`` to
+            ``settings.PROCESSED_OUTPUT_DIR / "exports"`` (versioned + atomic).
+        verify_media: When True (default), validate every clip's media exists on disk
+            BEFORE compiling and raise :class:`MediaValidationError` if not (audit H-12) —
+            so a moved/deleted file fails loudly instead of producing a dead-link XML.
 
     Returns:
         Dict with ``timeline`` (JSON intermediate), ``xml`` (the FCP7 document string),
@@ -453,6 +615,11 @@ def compile_project(
     """
     if not clips:
         raise ValueError("No clips to compile — nothing to deliver.")
+
+    if verify_media:
+        report = validate_media(clips)
+        if not report["ok"]:
+            raise MediaValidationError(report)
 
     timeline = build_timeline(clips, sequence_name=sequence_name, fps=fps,
                               width=width, height=height)
@@ -464,12 +631,17 @@ def compile_project(
         output_dir = settings.PROCESSED_OUTPUT_DIR / "exports"
         output_dir.mkdir(parents=True, exist_ok=True)
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in sequence_name).strip("_") or "edit"
-        xml_path = output_dir / f"premiere_{project_id}_{safe}.xml"
-        json_path = output_dir / f"premiere_{project_id}_{safe}.json"
-        xml_path.write_text(xml, encoding="utf-8")
-        json_path.write_text(json.dumps(timeline, indent=2), encoding="utf-8")
+        # Versioned filename (timestamp + short uuid) so a re-export of the same sequence
+        # never silently overwrites a prior export — each is a trackable version (H-13).
+        version = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
+        stem = f"premiere_{project_id}_{safe}_{version}"
+        xml_path = output_dir / f"{stem}.xml"
+        json_path = output_dir / f"{stem}.json"
+        _atomic_write(xml_path, xml)
+        _atomic_write(json_path, json.dumps(timeline, indent=2))
         result["xml_path"] = str(xml_path)
         result["json_path"] = str(json_path)
-        logger.info(f"Compiled Premiere project → {xml_path}")
+        result["version"] = version
+        logger.info(f"Compiled Premiere project -> {xml_path}")
 
     return result

@@ -199,6 +199,23 @@ def plan_segments(clips: list[dict], target_seconds: float | None,
             in_p = 0.0
             dur = round(src, 3)
             out_p = dur
+        # Segment-level validity (audit C-06): a clip with real footage (src > 0) but
+        # NOTHING left after trimming/allocation (dur <= 0) is an ILLEGAL segment. It is
+        # flagged here — with a human-readable reason — instead of being silently emitted
+        # or dropped, so Delivery can refuse and the UI can show the file name, source
+        # length, and trim parameters. (src == 0 means the source length is simply
+        # unknown, not illegal — left valid for the compiler to handle.)
+        valid = True
+        validation_error = None
+        if src > 0 and dur <= 0:
+            valid = False
+            if trimming:
+                validation_error = (
+                    f"clip is {src:g}s — shorter than the requested trim "
+                    f"(first {head_trim:g}s + last {tail_trim:g}s); no middle remains")
+            else:
+                validation_error = f"allocated screen time is 0s (source {src:g}s)"
+
         segments.append({
             "order": i + 1,
             "shot_id": c.get("shot_id"),
@@ -210,14 +227,22 @@ def plan_segments(clips: list[dict], target_seconds: float | None,
             "in_point": round(in_p, 3),
             "out_point": round(out_p, 3),
             "duration": dur,
+            "valid": valid,
+            "validation_error": validation_error,
         })
 
     mode = "trim" if trimming else ("timed" if timed else "full")
+    validation_errors = [
+        {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
+        for s in segments if not s["valid"]
+    ]
     return {
         "mode": mode,
         "target_seconds": round(float(target_seconds), 3) if timed else None,
         "head_trim": head_trim,
         "tail_trim": tail_trim,
         "total_seconds": round(sum(s["duration"] for s in segments), 3),
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
         "segments": segments,
     }

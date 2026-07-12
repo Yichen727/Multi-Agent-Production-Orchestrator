@@ -20,16 +20,18 @@ candidates, not raw Search output.
 """
 
 import json
+from typing import Annotated
 
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, InjectedState
 from sqlalchemy import text as _sql
 
 from app.models.state import ProductionState
 from app.services.openai_service import llm
-from app.services.database_service import db, _engine
+from app.services.database_service import db
+from app.services.catalogue_resolver import resolve_ordered
 from app.services.retrieval_service import group_size
 from app.services.timeline_service import parse_target_duration, plan_segments
 from app.utils.logger import get_logger
@@ -40,96 +42,59 @@ logger = get_logger("selection_agent")
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def _resolve_identifiers(identifiers: str) -> list[dict]:
-    """Fetch full metadata for candidates named by shot_id OR file path/name.
+def _pid_from_state(state) -> int:
+    """Current project id from the injected graph state (defaults to 1).
 
-    ``identifiers`` is a comma-separated list; each entry is either a numeric shot_id
-    or a file-path substring (the UI curates by path). Returns catalogue rows as
-    dicts — never fabricated.
+    The MODEL never supplies this — it is injected by the ToolNode from
+    ``ProductionState`` (see ``InjectedState`` on the tools), so a tool call can never
+    target another project's catalogue (audit C-03). Identifier resolution is then
+    scoped to this id by ``catalogue_resolver``.
     """
-    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
-    if not tokens:
-        return []
-
-    ids = [int(t) for t in tokens if t.isdigit()]
-    paths = [t for t in tokens if not t.isdigit()]
-
-    clauses = []
-    params: dict = {}
-    if ids:
-        id_binds = ", ".join(f":id{i}" for i in range(len(ids)))
-        clauses.append(f"shot_id IN ({id_binds})")
-        params.update({f"id{i}": v for i, v in enumerate(ids)})
-    for i, p in enumerate(paths):
-        clauses.append(f"file_path LIKE :p{i}")
-        params[f"p{i}"] = f"%{p}%"
-
-    if not clauses:
-        return []
-
-    query = (
-        "SELECT shot_id, file_path, shot_type, "
-        "duration_seconds, orientation, fps, keywords, description, "
-        "people_count, camera_motion, lighting, mood, subject_position "
-        f"FROM shots WHERE {' OR '.join(clauses)} ORDER BY shot_id"
-    )
-    with _engine.begin() as conn:
-        rows = conn.execute(_sql(query), params)
-        return [dict(r._mapping) for r in rows]
-
-
-def _resolve_in_order(identifiers: str) -> list[dict]:
-    """Resolve a comma-separated identifier list PRESERVING the given order (and repeats).
-
-    Unlike ``_resolve_identifiers`` (which sorts by shot_id), this keeps the exact
-    order the caller supplied — needed for timeline planning, where the sequence IS the
-    edit. Each token is a shot_id or a file-path substring; unresolved tokens are
-    dropped (the tool reports the count) — never fabricated.
-    """
-    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
-    ordered: list[dict] = []
-    for tok in tokens:
-        where, param = ("shot_id = :v", {"v": int(tok)}) if tok.isdigit() \
-            else ("file_path LIKE :v", {"v": f"%{tok}%"})
-        query = (
-            "SELECT shot_id, file_path, shot_type, duration_seconds, fps, "
-            "camera_motion, mood, people_count FROM shots "
-            f"WHERE {where} ORDER BY shot_id LIMIT 1"
-        )
-        with _engine.begin() as conn:
-            row = conn.execute(_sql(query), param).fetchone()
-        if row is not None:
-            ordered.append(dict(row._mapping))
-    return ordered
+    try:
+        return int((state or {}).get("project_id"))
+    except (TypeError, ValueError):
+        return 1
 
 
 # ── Tools: candidate enrichment, timeline planning, delivery ────────────────────
 
 
 @tool
-def get_candidate_details(identifiers: str) -> str:
+def get_candidate_details(identifiers: str,
+                          state: Annotated[dict, InjectedState] = None) -> str:
     """Fetch full metadata for the editor-curated candidates.
 
     Use this on the clips the user selected in the UI so you can place each in the
     timeline from its real attributes (shot_type, camera_motion, mood, people_count,
-    duration, etc.).
+    duration, etc.). Resolution is scoped to the current project.
 
     Args:
         identifiers: Comma-separated shot IDs and/or file names/paths
             (e.g. "3, IMG_5231.MOV, /footage/goal.mov").
     """
-    rows = _resolve_identifiers(identifiers)
+    project_id = _pid_from_state(state)
+    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
+    rows, problems = resolve_ordered(project_id, tokens)
     if not rows:
-        return "No matching catalogued clips for those identifiers."
+        detail = "No matching catalogued clips for those identifiers in this project."
+        if problems:
+            detail += "\n" + "\n".join(f"  • {t}: {r}" for t, r in problems)
+        return detail
     for r in rows:
+        r.pop("_identifier", None)
         r["group_size"] = group_size(r.get("people_count"))
-    return json.dumps(rows, indent=2, default=str)
+    out = json.dumps(rows, indent=2, default=str)
+    if problems:
+        out += ("\n\nCould not resolve (fix these — nothing was fabricated):\n"
+                + "\n".join(f"  • {t}: {r}" for t, r in problems))
+    return out
 
 
 @tool
 def plan_timeline(ordered_identifiers: str, importance: str = None,
                   target_duration_text: str = None,
-                  head_trim: float = 0.0, tail_trim: float = 0.0) -> str:
+                  head_trim: float = 0.0, tail_trim: float = 0.0,
+                  state: Annotated[dict, InjectedState] = None) -> str:
     """Turn an ORDERED clip list into a structured timeline plan (segments for Delivery).
 
     This is what makes the timeline concrete: it resolves each clip's real duration,
@@ -168,7 +133,15 @@ def plan_timeline(ordered_identifiers: str, importance: str = None,
         in/out points). Report the readable part to the editor; the JSON is consumed
         downstream by Delivery.
     """
-    clips = _resolve_in_order(ordered_identifiers)
+    project_id = _pid_from_state(state)
+    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
+    clips, problems = resolve_ordered(project_id, tokens)
+    if problems:
+        # H-01: never silently drop or first-match an ambiguous/unknown identifier — the
+        # timeline order IS the edit, so refuse and let the editor disambiguate by id.
+        return ("Cannot plan the timeline — resolve these identifiers first (nothing was "
+                "fabricated or silently dropped):\n"
+                + "\n".join(f"  • {t}: {r}" for t, r in problems))
     if not clips:
         return "No catalogued clips matched those identifiers — nothing to plan."
 
@@ -218,7 +191,14 @@ def plan_timeline(ordered_identifiers: str, importance: str = None,
                 f"({s['duration']:.1f}s of {s['source_duration']:.1f}s) · importance {s['importance']:g}")
         else:
             lines.append(f"  {s['order']}. {s['name']} — full {s['duration']:.1f}s")
-    if no_middle:
+    # C-06: an invalid segment (real footage but nothing left after trimming) must block
+    # delivery. plan_segments flags these; warn clearly and note Delivery will refuse.
+    if not plan.get("valid", True):
+        bad = plan.get("validation_errors", [])
+        lines += ["", (f"⛔ {len(bad)} segment(s) are INVALID and will block export — "
+                       "fix the trim or drop the clip:")]
+        lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad]
+    elif no_middle:
         lines += ["", (f"⚠ {len(no_middle)} clip(s) are shorter than "
                        f"{head_trim + tail_trim:g}s and have no middle left after trimming: "
                        + ", ".join(no_middle))]
@@ -227,19 +207,21 @@ def plan_timeline(ordered_identifiers: str, importance: str = None,
 
 
 @tool
-def generate_delivery_summary(project_id: int = 1) -> str:
-    """Generate a text summary of the project for delivery handoff.
+def generate_delivery_summary(
+        state: Annotated[dict, InjectedState] = None) -> str:
+    """Generate a text summary of the current project for delivery handoff.
 
-    Args:
-        project_id: Project identifier.
+    The project is taken from the injected graph state (not model-supplied).
     """
+    project_id = _pid_from_state(state)
     project = db.run(
-        f"SELECT project_name, client_name, frame_rate, resolution FROM projects WHERE project_id = {project_id};",
-        include_columns=True,
+        _sql("SELECT project_name, client_name, frame_rate, resolution "
+             "FROM projects WHERE project_id = :pid"),
+        parameters={"pid": project_id}, include_columns=True,
     )
     shot_count = db.run(
-        f"SELECT COUNT(*) as total FROM shots WHERE project_id = {project_id};",
-        include_columns=True,
+        _sql("SELECT COUNT(*) as total FROM shots WHERE project_id = :pid"),
+        parameters={"pid": project_id}, include_columns=True,
     )
 
     return f"""Delivery Summary

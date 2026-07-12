@@ -1,25 +1,36 @@
-"""Production Orchestrator — Supervisor + Human-in-the-Loop gate.
+"""Production Orchestrator — the explicit four-stage pipeline driver.
 
-Assembles the four agents of the linear MAPO pipeline into a unified LangGraph:
+This module IS the orchestration layer (audit H-06). MAPO is a strict, user-driven
+linear pipeline and the orchestrator drives it as a fixed state machine — there is no
+LLM "supervisor" routing between agents. Each stage is an explicit function that invokes
+exactly one specialised ReAct sub-agent (or, for Search, the retrieval service directly):
 
-    Ingest → Search → Selection → Delivery
+    ① run_ingest    → ingest_agent      (build the catalogue)
+    ② run_search    → retrieval_service (hybrid recall — retrieval only)
+    ③ run_selection → selection_agent   (intent-driven edit timeline)
+    ④ run_delivery  → delivery_agent     (compile the timeline → Premiere FCP7 XML)
 
-- Project verification gate (HITL)
-- Supervisor routing to the specialised agents (the editor drives the order via
-  the UI; Search/Selection/Delivery stay locked until Ingest completes)
-- Approval gate (HITL) before editorial recommendations are finalised
+The Streamlit UI is a thin presentation layer that calls these functions in order; the
+code path, the architecture diagram, and the thesis description are therefore the same
+(no "documented supervisor, actually bypassed by the UI" discrepancy).
+
+HUMAN-IN-THE-LOOP (audit C-09): there is ONE HITL mechanism — the editor's direct
+control in the UI. The **curation checkboxes** decide which candidate clips participate,
+and the explicit **Export** button is what triggers Delivery. There is no separate
+LangGraph ``interrupt()`` approval gate (the old one was dead code — it fired on state
+fields no agent wrote, and the UI never resumed it), so it has been removed rather than
+left as a misleading no-op.
 """
+
+import json
+import re
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
-from langgraph.types import interrupt
-from langgraph_supervisor import create_supervisor
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import HumanMessage, ToolMessage
 
 from app.models.state import ProductionState
-from app.services.openai_service import llm
 
 # The four agents of the linear pipeline:
 #   Ingest    = scan, classify, catalogue footage (build the knowledge base)
@@ -28,6 +39,7 @@ from app.services.openai_service import llm
 #   Delivery  = compile the timeline into a Premiere-importable project (FCP7 XML)
 from app.agents.ingest_agent import (
     ingest_assistant, ingest_tool_node, should_continue_ingest,
+    reset_last_ingest_result, get_last_ingest_result,
 )
 from app.agents.search_agent import (
     search_assistant, search_tool_node, should_continue_search,
@@ -38,7 +50,7 @@ from app.agents.selection_agent import (
 from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
 )
-
+from app.services.retrieval_service import hybrid_search, expand_query, hoist_orientation
 from app.utils.logger import get_logger
 
 logger = get_logger("orchestrator")
@@ -53,7 +65,7 @@ in_memory_store = InMemoryStore()
 
 
 def _build_agent_graph(name, assistant_fn, tool_node, should_continue_fn):
-    """Helper: build a ReAct sub-agent graph."""
+    """Helper: build a ReAct sub-agent graph (assistant → tools → assistant)."""
     graph = StateGraph(ProductionState)
     graph.add_node(f"{name}_assistant", assistant_fn)
     graph.add_node(f"{name}_tools", tool_node)
@@ -76,132 +88,160 @@ search_agent = _build_agent_graph("search", search_assistant, search_tool_node, 
 selection_agent = _build_agent_graph("selection", selection_assistant, selection_tool_node, should_continue_selection)
 delivery_agent = _build_agent_graph("delivery", delivery_assistant, delivery_tool_node, should_continue_delivery)
 
-logger.info("All 4 sub-agent graphs compiled.")
+logger.info("All 4 sub-agent graphs compiled (fixed-pipeline orchestration, no supervisor).")
 
 
-# ── Supervisor ───────────────────────────────────────────────────────────────
-
-SUPERVISOR_PROMPT = """You are the MAPO ORCHESTRATOR SUPERVISOR, the central
-coordination agent for the Multi-Agent Production Orchestrator system.
-
-You route each production task to the appropriate specialised agent. You do NOT
-perform tasks yourself — you coordinate the team. The system is an assistant editor,
-never an autonomous one; the human stays in control.
-
-THE PIPELINE IS A STRICT LINEAR FLOW:
-
-    1. ingest_agent — Build the knowledge base. Scan the footage directory, extract
-       metadata, classify shots, and store the catalogue (SQLite + JSON).
-       Route for: "run ingest", "index footage", "scan / catalogue the footage".
-
-    2. search_agent — RETRIEVAL ONLY. Finds candidate clips matching a natural-
-       language query and returns them with metadata and an optional relevance
-       score. Does NOT rank or recommend a "best" clip.
-       Route for: "find / show me / which clips have ..." style queries.
-
-    3. selection_agent — Intent-aware EDITORIAL orchestration. Interprets editing
-       intent (style, emotion, pace, duration), assigns each curated clip a narrative
-       role, and lays out an ordered edit timeline.
-       Route for: "recommend / best / build the timeline / what should I use for ..."
-
-    4. delivery_agent — PROJECT COMPILER. Takes the ordered edit timeline and compiles
-       it into a Premiere Pro–importable project file (FCP7 XML + JSON). It preserves
-       clip order exactly and makes NO creative decision.
-       Route for: "export / deliver / render the timeline / make a Premiere project".
-
-ROUTING RULES:
-- Search, Selection and Delivery only make sense AFTER ingest has built the catalogue.
-- For a creative request, prefer routing search_agent FIRST to gather candidates,
-  THEN selection_agent to build the timeline from them — never let search_agent recommend.
-- Route delivery_agent LAST, only once an ordered timeline exists; it just compiles.
-- Pass full conversation context so agents build on each other's work.
-- After the relevant agent completes, summarise the result concisely."""
-
-supervisor = create_supervisor(
-    agents=[ingest_agent, search_agent, selection_agent, delivery_agent],
-    model=llm,
-    prompt=SUPERVISOR_PROMPT,
-    state_schema=ProductionState,
-    output_mode="last_message",
-).compile()
-
-logger.info("Supervisor initialized with 4 sub-agents.")
+# ASCII-only log lines below: the Windows console codec (gbk) cannot encode emoji/arrows.
 
 
-# ── Human-in-the-Loop Gates ─────────────────────────────────────────────────
+# ── Shared state / config helpers ─────────────────────────────────────────────
 
 
-def verify_project(state: ProductionState, config: RunnableConfig):
-    """HITL Gate 1: Verify project context before agents begin."""
-    if not state.get("project_id"):
-        interrupt(HumanMessage(
-            content="Please provide the project ID or project name to begin."
-        ))
+def _base_state(project_id, extra: dict | None = None) -> dict:
+    """A fresh ProductionState for one stage invocation.
 
-    project_id = state.get("project_id", "1")
-    return {
-        "project_id": project_id,
-        "messages": [SystemMessage(content=f"Project verified: ID {project_id}. Starting orchestration.")],
+    project_id and footage_dir are carried ON state (not via a mutated global), so
+    concurrent sessions stay isolated (audit H-07).
+    """
+    state: dict = {
+        "project_id": str(project_id),
+        "messages": [],
+        "loaded_preferences": "",
+        "footage_dir": "",
+        "ingested_files": [], "shot_metadata": [], "search_results": [],
+        "search_candidates": [], "selected_candidates": [], "selected_shots": [],
+        "recommendations": [], "edit_timeline": None, "delivery_output": None,
     }
+    if extra:
+        state.update(extra)
+    return state
 
 
-def human_approval_gate(state: ProductionState, config: RunnableConfig):
-    """HITL Gate 2: Pause for human review of editorial recommendations."""
+def _config(stage: str, user_id, project_id) -> dict:
+    """A per-stage runnable config with a stable thread id and the user id."""
+    return {"configurable": {
+        "thread_id": f"mapo-{stage}-{user_id}-{project_id}",
+        "user_id": user_id,
+    }}
 
-    messages = state.get("messages", [])
-    summary = (
-        "\n".join(str(m.content) for m in messages[-3:])
-        if messages
-        else "No recommendations."
+
+def _pid(project_id) -> int:
+    try:
+        return int(project_id)
+    except (TypeError, ValueError):
+        return project_id
+
+
+def _extract_plan(messages) -> dict | None:
+    """Pull the structured timeline plan from the ``plan_timeline`` TOOL output.
+
+    Reads the plan out of the plan_timeline ToolMessage — the tool's own output, which
+    the model cannot rewrite — rather than scraping the assistant's prose. So the model
+    reformatting its narration can never corrupt or hide the plan Delivery receives
+    (audit H-03). Returns the most recent structured plan, or ``None`` if none was produced.
+    """
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) not in (None, "plan_timeline"):
+            continue
+        content = m.content if isinstance(m.content, str) else ""
+        for match in re.findall(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL):
+            try:
+                obj = json.loads(match)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "segments" in obj:
+                return obj
+    return None
+
+
+# ── The four pipeline stages (the ONE real orchestration path) ─────────────────
+
+
+def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
+    """① Ingest — invoke the Ingest sub-agent to build the catalogue.
+
+    The footage directory is passed on state (``footage_dir``), never by mutating a
+    global setting (audit H-07). Returns ``(narration, IngestResult | None)``; the
+    caller unlocks later stages ONLY on a real structured success (audit C-08).
+    """
+    reset_last_ingest_result()
+    msg = (f"Run ingest analysis on the footage directory '{directory}' for project "
+           f"{project_id}. Call the ingest_footage tool now to build the catalogue.")
+    state = _base_state(project_id, {
+        "messages": [HumanMessage(content=msg)],
+        "footage_dir": str(directory),
+    })
+    result = ingest_agent.invoke(state, config=_config("ingest", user_id, project_id))
+    return result["messages"][-1].content, get_last_ingest_result()
+
+
+def run_search(query: str, project_id) -> list[dict]:
+    """② Search — hybrid retrieval (retrieval only), the same path the Search agent uses.
+
+    Runs the query through the shared query understanding (orientation hoist + synonym
+    expansion) and ``hybrid_search`` so the UI's direct search and the Search Agent's
+    tool behave identically. Returns candidate dicts; never ranks a "best" clip.
+    """
+    residual, orientation = hoist_orientation(query, None)
+    expanded = expand_query(residual) if residual and residual.strip() else None
+    return hybrid_search(_pid(project_id), keywords=expanded or None,
+                         orientation=orientation)
+
+
+def run_selection(intent: str, selected_paths: list[str],
+                  project_id, user_id) -> tuple[str, dict | None]:
+    """③ Selection — invoke the Selection sub-agent on the curated clips.
+
+    Returns ``(narration, structured_plan | None)``. The structured plan is read from the
+    plan_timeline tool output (audit H-03), never from the model's prose.
+    """
+    clip_list = "\n".join(f"- {p}" for p in selected_paths)
+    message = (
+        f"My editing intent: {intent}\n\n"
+        f"The editor has selected these clips for the edit (work ONLY with these):\n{clip_list}\n\n"
+        "Fetch their details, decide the order and each clip's importance, then call "
+        "plan_timeline (passing my editing-intent text so it can detect any target "
+        "duration). The timeline's structure, pacing and number of steps are driven by my "
+        "intent — do NOT assume a fixed narrative arc. For each step explain why the clip "
+        "sits there, how it connects to the previous clip, and what it does for the pacing."
     )
+    state = _base_state(project_id, {
+        "messages": [HumanMessage(content=message)],
+        "selected_candidates": list(selected_paths),
+    })
+    result = selection_agent.invoke(state, config=_config("select", user_id, project_id))
+    return result["messages"][-1].content, _extract_plan(result["messages"])
 
-    approval_request = HumanMessage(
-        content=(
-            "🔍 REVIEW REQUIRED\n\n"
-            f"Recent recommendations:\n{summary}\n\n"
-            "Please approve (type 'approved') or request changes."
-        )
+
+def run_delivery(plan: dict, project_id, user_id,
+                 sequence_name: str = "MAPO Edit") -> str:
+    """④ Delivery — compile the Selection timeline into a Premiere project.
+
+    REQUIRES the structured plan from Selection (audit H-04): Delivery is driven ONLY by
+    the explicit ordered segments the Selection Agent produced. There is NO fallback to
+    the Bin/media-pool order — without a structured plan there is no defined edit order
+    to compile, so this raises rather than invent one.
+    """
+    if not (plan and plan.get("segments")):
+        raise ValueError(
+            "Delivery requires a structured timeline plan (ordered segments) from "
+            "Selection. Generate the edit timeline in ③ Selection first — there is no "
+            "implicit media-pool-order fallback.")
+    message = (
+        f"Compile the timeline into a Premiere Pro project named '{sequence_name}'.\n\n"
+        "The Selection Agent produced these STRUCTURED timeline segments. Call "
+        "compile_timeline_segments with segments_json set to EXACTLY this JSON — do not "
+        "re-order, add, drop, or re-time any segment:\n\n"
+        f"{json.dumps(plan)}"
     )
-
-    interrupt(approval_request)
-
-    return {
-        "messages": [approval_request]
-    }
-
-
-# ── Assemble Full Graph ──────────────────────────────────────────────────────
-
-mapo_graph = StateGraph(ProductionState)
-
-mapo_graph.add_node("verify_project", verify_project)
-mapo_graph.add_node("supervisor", supervisor)
-mapo_graph.add_node("human_approval_gate", human_approval_gate)
-
-mapo_graph.add_edge(START, "verify_project")
-mapo_graph.add_edge("verify_project", "supervisor")
+    state = _base_state(project_id, {
+        "messages": [HumanMessage(content=message)],
+        "edit_timeline": plan,
+    })
+    result = delivery_agent.invoke(state, config=_config("deliver", user_id, project_id))
+    return result["messages"][-1].content
 
 
-# Pause for human review whenever the pipeline has produced an editorial decision
-# the editor must own: a selection or a ranked recommendation.
-def _needs_approval(state: ProductionState, config: RunnableConfig) -> str:
-    if state.get("selected_shots") or state.get("recommendations"):
-        return "approval"
-    return "end"
-
-
-mapo_graph.add_conditional_edges(
-    "supervisor",
-    _needs_approval,
-    {"approval": "human_approval_gate", "end": END},
-)
-mapo_graph.add_edge("human_approval_gate", END)
-
-# Compile
-mapo_agent = mapo_graph.compile(
-    name="MAPO_Full_System",
-    checkpointer=checkpointer,
-    store=in_memory_store,
-)
-
-logger.info("✅ Full MAPO system compiled successfully.")
+logger.info("MAPO pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")

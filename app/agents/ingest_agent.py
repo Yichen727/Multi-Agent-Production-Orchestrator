@@ -19,13 +19,17 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from typing import Annotated
+
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, InjectedState
+from sqlalchemy import text as _sql
 
 from app.config import settings
 from app.models.state import ProductionState
+from app.models.schemas import IngestResult
 from app.services.openai_service import llm, embed_texts
 from app.services.database_service import (
     db, replace_project_shots, get_catalogued_paths, get_catalogued_shots,
@@ -33,12 +37,61 @@ from app.services.database_service import (
 from app.services.ffmpeg_service import (
     generate_proxy, get_video_duration, check_ffmpeg_installed,
     check_ffprobe_installed, probe_video_metadata, detect_scene_count,
-    extract_sample_frames_b64,
+    detect_scene_cut_times, choose_frame_count,
+    extract_scene_representative_frames_b64, extract_sample_frames_b64,
 )
 from app.services.vision_service import analyze_frames
 from app.utils.logger import get_logger
 
 logger = get_logger("ingest_agent")
+
+
+# ── Structured ingest outcome (audit C-08) ─────────────────────────────────────
+#
+# ingest_footage still returns a human-readable summary for the LLM, but it ALSO records
+# a structured IngestResult here. The UI reads it (in-process, single-user) to gate the
+# later phases on real success + indexed_count > 0, instead of trusting that the agent
+# returned some text — an error string like "Directory not found" is non-empty too.
+_LAST_INGEST_RESULT: IngestResult | None = None
+
+
+def _record_ingest_result(result: IngestResult) -> IngestResult:
+    global _LAST_INGEST_RESULT
+    _LAST_INGEST_RESULT = result
+    return result
+
+
+def reset_last_ingest_result() -> None:
+    """Clear the recorded result. The UI calls this BEFORE a run so a stale success from
+    an earlier ingest can't unlock the pipeline when this run never reached the tool."""
+    global _LAST_INGEST_RESULT
+    _LAST_INGEST_RESULT = None
+
+
+def get_last_ingest_result() -> IngestResult | None:
+    """Structured result of the most recent ingest_footage run this session, or None."""
+    return _LAST_INGEST_RESULT
+
+
+def _scan_dir(directory, state) -> Path:
+    """Resolve the footage directory: explicit arg → injected state → global default.
+
+    Reading ``state['footage_dir']`` (seeded per-run by the orchestrator) instead of a
+    mutated global ``settings.RAW_FOOTAGE_DIR`` keeps concurrent sessions isolated
+    (audit H-07). The global is only the last-resort fallback.
+    """
+    return Path(directory or (state or {}).get("footage_dir") or settings.RAW_FOOTAGE_DIR)
+
+
+def _resolve_pid(state, project_id: int) -> int:
+    """Project id: injected graph state wins over the model-supplied arg, else default 1."""
+    pid = (state or {}).get("project_id")
+    if pid is None:
+        pid = project_id
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return 1
 
 
 # ── Tools: ingest / media preparation ─────────────────────────────────────────
@@ -181,48 +234,64 @@ def generate_proxy_for_file(file_path: str) -> str:
 _MAX_INGEST_FILES = 200
 
 
-def _find_video_files(scan_dir: Path) -> list[Path]:
-    """Bounded, single-pass, symlink-safe walk for supported video files."""
+def _find_video_files(scan_dir: Path) -> tuple[list[Path], bool]:
+    """Bounded, single-pass, symlink-safe walk for supported video files.
+
+    Returns ``(files, truncated)``. ``truncated`` is True when the scan hit
+    ``_MAX_INGEST_FILES``. The caller MUST NOT perform the destructive catalogue rewrite
+    when truncated (audit C-07): ``replace_project_shots`` deletes the project's rows and
+    writes only what it is given, so writing a silently-capped first-N set would erase
+    the rest of the catalogue and report success.
+    """
     exts = {"." + e.strip().lower().lstrip(".") for e in settings.SUPPORTED_VIDEO_FORMATS}
     found: list[Path] = []
+    truncated = False
     for dirpath, _dirnames, filenames in os.walk(scan_dir, followlinks=False):
         for name in filenames:
             if os.path.splitext(name)[1].lower() in exts:
                 found.append(Path(dirpath) / name)
                 if len(found) >= _MAX_INGEST_FILES:
-                    return found
-    return found
+                    truncated = True
+                    break
+        if truncated:
+            break
+    return found, truncated
 
 
 @tool
-def detect_new_footage(directory: str = None, project_id: int = 1) -> str:
+def detect_new_footage(directory: str = None, project_id: int = 1,
+                       state: Annotated[dict, InjectedState] = None) -> str:
     """Detect footage on disk that is NOT yet in the project's catalogue.
 
     Read-only. Compares the video files in the directory against the catalogued
     file paths and reports which are new — useful before deciding to (re)ingest.
 
     Args:
-        directory: Footage directory to check. Defaults to RAW_FOOTAGE_DIR.
+        directory: Footage directory to check. Defaults to the run's footage directory.
         project_id: Project whose catalogue to compare against.
     """
-    scan_dir = Path(directory or settings.RAW_FOOTAGE_DIR)
+    scan_dir = _scan_dir(directory, state)
+    project_id = _resolve_pid(state, project_id)
     if not scan_dir.exists():
         return f"Directory not found: {scan_dir}"
 
-    on_disk = _find_video_files(scan_dir)
+    on_disk, truncated = _find_video_files(scan_dir)
     known = get_catalogued_paths(project_id)
     new_files = [f for f in on_disk if str(f) not in known]
+
+    cap_note = (f"\n⚠ Only the first {_MAX_INGEST_FILES} files were scanned (per-run "
+                "capacity limit) — there may be more.") if truncated else ""
 
     if not on_disk:
         return f"No supported video files found in {scan_dir}."
     if not new_files:
         return (f"All {len(on_disk)} file(s) in {scan_dir} are already catalogued for "
-                f"project {project_id}. Nothing new to ingest.")
+                f"project {project_id}. Nothing new to ingest.{cap_note}")
 
     preview = "\n".join(f"  • {f.name}" for f in new_files[:30])
     more = "" if len(new_files) <= 30 else f"\n  … and {len(new_files) - 30} more."
     return (f"{len(new_files)} new file(s) (of {len(on_disk)} on disk) not yet "
-            f"catalogued for project {project_id}:\n{preview}{more}")
+            f"catalogued for project {project_id}:\n{preview}{more}{cap_note}")
 
 
 def _semantic_text(description: str | None, keywords: str, mood: str | None,
@@ -274,12 +343,13 @@ def _can_reuse(cached: dict, mtime: float | None, size: int | None) -> bool:
 @tool
 def ingest_footage(directory: str = None, project_id: int = 1,
                    analyze_content: bool = True, generate_proxies: bool = False,
-                   force_reanalyze: bool = False) -> str:
+                   force_reanalyze: bool = False,
+                   state: Annotated[dict, InjectedState] = None) -> str:
     """Run the ingest pipeline on a directory and (re)build the catalogue.
 
     INCREMENTAL BY DEFAULT: a file whose path is already catalogued and whose
     content is unchanged (same size + modification time) is REUSED as-is — its
-    ffprobe metadata and GPT-4o Vision tags are kept, so no FFmpeg or LLM work runs
+    ffprobe metadata and GPT-5.4 Vision tags are kept, so no FFmpeg or LLM work runs
     for it again. Only new or modified files go through full analysis. This keeps
     repeated ingests fast and avoids re-spending Vision API calls.
 
@@ -289,7 +359,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
          (portrait/landscape/square, rotation-aware), fps, codec, audio presence,
          duration.
       3. SHOT/SCENE DETECTION — FFmpeg scene-change cut count.
-      4. VISION TAGGING (if analyze_content) — GPT-4o watches sampled frames and
+      4. VISION TAGGING (if analyze_content) — GPT-5.4 watches sampled frames and
          returns a description, shot type, objects, searchable keywords, and an
          approximate people count.
       5. (optional) PROXY generation for each clip.
@@ -301,9 +371,9 @@ def ingest_footage(directory: str = None, project_id: int = 1,
     unclassified rather than guessed.
 
     Args:
-        directory: Footage directory to ingest. Defaults to RAW_FOOTAGE_DIR.
+        directory: Footage directory to ingest. Defaults to the run's footage directory.
         project_id: Project to (re)build the catalogue for.
-        analyze_content: Run GPT-4o Vision tagging on sampled frames (default True).
+        analyze_content: Run GPT-5.4 Vision tagging on sampled frames (default True).
         generate_proxies: Also generate a low-res proxy per clip (slow; default False).
         force_reanalyze: Ignore the cache and re-analyse every file (default False).
 
@@ -311,17 +381,39 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         A summary: clips indexed, how many were reused vs newly analysed, the
         orientation breakdown, and how many were vision-tagged.
     """
-    scan_dir = Path(directory or settings.RAW_FOOTAGE_DIR)
+    scan_dir = _scan_dir(directory, state)
+    project_id = _resolve_pid(state, project_id)
     if not scan_dir.exists():
-        return f"Directory not found: {scan_dir}"
+        msg = f"Directory not found: {scan_dir}"
+        _record_ingest_result(IngestResult(status="failure", project_id=project_id,
+                                            message=msg, errors=[msg]))
+        return msg
     if not check_ffprobe_installed():
-        return ("Error: ffprobe (FFmpeg) is not on PATH, so real metadata cannot be "
-                "probed. Install FFmpeg and try again — nothing was catalogued.")
+        msg = ("Error: ffprobe (FFmpeg) is not on PATH, so real metadata cannot be "
+               "probed. Install FFmpeg and try again — nothing was catalogued.")
+        _record_ingest_result(IngestResult(status="failure", project_id=project_id,
+                                            message=msg, errors=["ffprobe not on PATH"]))
+        return msg
 
-    found = _find_video_files(scan_dir)
+    found, truncated = _find_video_files(scan_dir)
     if not found:
         exts = sorted("." + e.strip().lower().lstrip(".") for e in settings.SUPPORTED_VIDEO_FORMATS)
-        return f"No supported video files found in {scan_dir}. Supported: {exts}"
+        msg = f"No supported video files found in {scan_dir}. Supported: {exts}"
+        _record_ingest_result(IngestResult(status="failure", project_id=project_id,
+                                            message=msg, errors=["no supported files"]))
+        return msg
+    if truncated:
+        # C-07: refuse rather than delete the catalogue and keep only the first N files.
+        msg = (f"Refusing to ingest: {scan_dir} holds more than {_MAX_INGEST_FILES} "
+               "supported video files, which exceeds this build's per-run capacity. "
+               "Ingesting anyway would DELETE the existing catalogue and keep only the "
+               f"first {_MAX_INGEST_FILES}, so NOTHING was changed. Split the footage "
+               "into smaller batches (or raise the limit) and re-run. No rows were "
+               "written or deleted.")
+        _record_ingest_result(IngestResult(
+            status="failure", project_id=project_id, truncated=True, message=msg,
+            errors=[f"scan exceeded the {_MAX_INGEST_FILES}-file per-run cap"]))
+        return msg
 
     cache = {} if force_reanalyze else get_catalogued_shots(project_id)
     do_vision = analyze_content and bool(settings.OPENAI_API_KEY)
@@ -331,6 +423,9 @@ def ingest_footage(directory: str = None, project_id: int = 1,
     tagged = 0
     reused = 0
     proxies = 0
+    scene_sampled = 0        # clips whose frames came from scene midpoints
+    even_sampled = 0         # clips that fell back to adaptive even sampling
+    frames_sent = 0          # total frames sent to the vision model
 
     for f in found:
         path = str(f)
@@ -345,6 +440,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                 "keywords", "width", "height", "orientation", "fps",
                 "codec", "has_audio", "scene_count", "description", "people_count",
                 "camera_motion", "lighting", "mood", "subject_position", "embedding",
+                "audio_channels", "audio_sample_rate", "audio_bit_depth",
             )}
             # Refresh the fingerprint in case the previous ingest stored none.
             row["source_mtime"] = mtime if mtime is not None else cached.get("source_mtime")
@@ -362,8 +458,11 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             unreadable += 1
         orientation_counts[meta["orientation"]] = orientation_counts.get(meta["orientation"], 0) + 1
 
-        # Shot/scene cut detection (only meaningful for readable clips).
-        scene_count = detect_scene_count(path) if meta["ok"] else 0
+        # Shot/scene cut detection (only meaningful for readable clips). We keep
+        # the cut TIMESTAMPS so vision sampling can hit one frame per scene.
+        cut_times = detect_scene_cut_times(path) if meta["ok"] else []
+        scene_count = (len(cut_times) + 1) if cut_times else (
+            detect_scene_count(path) if meta["ok"] else 0)
 
         # Vision tagging from sampled frames.
         shot_type = "unclassified"
@@ -375,8 +474,29 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         mood = None
         subject_position = None
         if do_vision and meta["ok"]:
-            frames = extract_sample_frames_b64(path, meta["duration_seconds"])
-            tags = analyze_frames(frames) if frames else None
+            duration = meta["duration_seconds"]
+            # Adaptive frame budget: more frames for longer / multi-scene clips.
+            frame_count = choose_frame_count(duration, scene_count)
+            # Prefer one representative frame per detected scene (midpoint).
+            frames, sampled_timestamps = extract_scene_representative_frames_b64(
+                path, duration, cut_times, max_frames=frame_count)
+            sampling_strategy = "scene-midpoint" if cut_times else "adaptive-even"
+            if not frames:
+                # Scene sampling produced nothing usable → adaptive even sampling.
+                frames = extract_sample_frames_b64(path, duration, count=frame_count)
+                sampled_timestamps = []
+                sampling_strategy = "adaptive-even"
+            if frames:
+                frames_sent += len(frames)
+                if sampling_strategy == "scene-midpoint":
+                    scene_sampled += 1
+                else:
+                    even_sampled += 1
+            tags = analyze_frames(
+                frames, duration_seconds=duration, scene_count=scene_count or None,
+                sampled_timestamps=sampled_timestamps or None,
+                sampling_strategy=sampling_strategy,
+            ) if frames else None
             if tags is not None:
                 tagged += 1
                 shot_type = tags.shot_type or "unclassified"
@@ -430,22 +550,53 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             "embedding": embedding,
             "source_mtime": mtime,
             "source_size": size,
+            # Real source audio params for a faithful Premiere export (audit H-10).
+            "audio_channels": meta.get("audio_channels"),
+            "audio_sample_rate": meta.get("audio_sample_rate"),
+            "audio_bit_depth": meta.get("audio_bit_depth"),
         })
 
     count = replace_project_shots(project_id, rows)
     analysed = count - reused
     logger.info(f"Ingested {count} file(s) into project {project_id} from {scan_dir} "
-                f"({reused} reused, {analysed} analysed)")
+                f"({reused} reused, {analysed} analysed, {unreadable} unreadable)")
+
+    # Status (audit C-08 / L-03): a run with unreadable files is NOT a clean success, and
+    # a run where EVERY file was unreadable (nothing usable indexed) is a failure.
+    if count == 0:
+        status = "failure"
+    elif unreadable == 0:
+        status = "success"
+    elif unreadable < count:
+        status = "partial_success"
+    else:
+        status = "failure"
+
+    warnings: list[str] = []
+    if unreadable:
+        warnings.append(f"{unreadable} file(s) could not be probed and were stored as 'unknown'")
+    if do_vision and tagged < analysed:
+        warnings.append(f"{analysed - tagged} newly analysed clip(s) were not vision-tagged")
 
     breakdown = ", ".join(f"{k}: {v}" for k, v in orientation_counts.items() if v)
+    headline = {
+        "success": "Ingest completed successfully.",
+        "partial_success": "Ingest completed with warnings (some files were unreadable).",
+        "failure": "Ingest FAILED — no usable clips were indexed.",
+    }[status]
     summary = (
-        f"Ingest completed successfully. Indexed {count} clip(s) from {scan_dir} "
+        f"{headline} Indexed {count} clip(s) from {scan_dir} "
         f"into project {project_id} — {analysed} newly analysed, {reused} reused "
         f"from previous analysis.\n"
         f"Orientation — {breakdown}."
     )
     if do_vision:
-        summary += f"\nVision-tagged {tagged} newly analysed clip(s) with GPT-4o."
+        summary += f"\nVision-tagged {tagged} newly analysed clip(s) with GPT-5.4."
+        summary += (
+            f"\nFrame sampling — {scene_sampled} clip(s) via scene midpoints, "
+            f"{even_sampled} via adaptive even sampling; "
+            f"{frames_sent} frame(s) sent to the vision model."
+        )
     elif analyze_content:
         summary += "\nVision tagging skipped (no OPENAI_API_KEY)."
     else:
@@ -454,7 +605,14 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         summary += f"\nGenerated {proxies} proxy file(s)."
     if unreadable:
         summary += f"\n({unreadable} file(s) could not be probed and were stored as 'unknown'.)"
-    summary += "\nFootage indexed and ready for search."
+    if status != "failure":
+        summary += "\nFootage indexed and ready for search."
+
+    _record_ingest_result(IngestResult(
+        status=status, project_id=project_id, indexed_count=count,
+        reused_count=reused, unreadable_count=unreadable, truncated=False,
+        message=headline, warnings=warnings,
+    ))
     return summary
 
 
@@ -472,11 +630,12 @@ def get_shots_by_type(shot_type: str) -> str:
         shot_type: Type of shot to search for.
     """
     return db.run(
-        f"""SELECT s.shot_id, s.file_path, s.shot_type,
-                   s.duration_seconds, s.keywords
-            FROM shots s
-            WHERE s.shot_type LIKE '%{shot_type}%'
-            ORDER BY s.shot_id;""",
+        _sql("""SELECT s.shot_id, s.file_path, s.shot_type,
+                       s.duration_seconds, s.keywords
+                FROM shots s
+                WHERE s.shot_type LIKE :stype
+                ORDER BY s.shot_id"""),
+        parameters={"stype": f"%{shot_type}%"},
         include_columns=True,
     )
 
@@ -489,7 +648,8 @@ def classify_shot_attributes(shot_id: int) -> str:
         shot_id: Unique shot identifier.
     """
     return db.run(
-        f"""SELECT * FROM shots WHERE shot_id = {shot_id};""",
+        _sql("SELECT * FROM shots WHERE shot_id = :sid"),
+        parameters={"sid": shot_id},
         include_columns=True,
     )
 
@@ -508,7 +668,8 @@ def export_metadata_json(project_id: int = 1) -> str:
         Path to the exported JSON file.
     """
     shots = db.run(
-        f"SELECT * FROM shots WHERE project_id = {project_id};",
+        _sql("SELECT * FROM shots WHERE project_id = :pid"),
+        parameters={"pid": project_id},
         include_columns=True,
     )
 
@@ -559,7 +720,7 @@ tool on the footage directory. One call runs the whole pipeline per clip:
 - extract REAL technical metadata (dimensions, orientation, fps, codec, audio,
   duration)
 - detect shot/scene cuts (FFmpeg)
-- VISION TAGGING: GPT-4o watches sampled frames and returns a semantic description,
+- VISION TAGGING: GPT-5.4 watches sampled frames and returns a semantic description,
   shot type, objects, searchable keywords, an approximate people count, plus editing-
   oriented dimensions (camera motion, lighting, mood, subject position)
 - SEMANTIC EMBEDDING: the description + keywords + mood/lighting are embedded into a
@@ -568,12 +729,12 @@ It then replaces the project's catalogue with those rows. You may also call
 `detect_new_footage` first to see what is new, and `export_metadata_json` afterwards.
 
 INCREMENTAL — ingest is cheap to re-run: files already analysed and unchanged are
-REUSED automatically (no re-probing, no GPT-4o calls), and only new or modified files
+REUSED automatically (no re-probing, no GPT-5.4 calls), and only new or modified files
 are analysed. Do NOT pass force_reanalyze unless the user explicitly wants every clip
 re-analysed from scratch.
 
 CRITICAL — only report what the tools actually measured or the vision model actually
-saw. The pipeline records true technical facts plus GPT-4o's frame observations; it
+saw. The pipeline records true technical facts plus GPT-5.4's frame observations; it
 does NOT identify *who* people are, and any step that cannot run leaves its fields
 'unclassified'. NEVER invent file names, shot types, keywords, counts, or scores that
 the tools did not return.

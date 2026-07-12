@@ -1,4 +1,4 @@
-"""Vision service — GPT-4o frame analysis for automatic shot tagging.
+"""Vision service — GPT-5.4 frame analysis for automatic shot tagging.
 
 Turns sampled video frames into structured, searchable tags (shot type, objects,
 keywords, a one-line description, and an approximate people count). This is the
@@ -51,16 +51,59 @@ _VISION_INSTRUCTION = (
 )
 
 
-def analyze_frames(frames_b64: list[str]) -> VisionTags | None:
-    """Analyse sampled frames with GPT-4o Vision and return structured tags.
+def _sampling_context(frames_b64: list[str], duration_seconds: float | None,
+                      scene_count: int | None,
+                      sampled_timestamps: list[float] | None,
+                      sampling_strategy: str | None) -> str:
+    """Build an optional context block describing how the frames were sampled.
+
+    Gives the model grounding (clip length, how many shots, where each frame sits
+    on the timeline) so it can better judge shot type / camera motion / whether
+    several distinct scenes are present. It is guidance only — the model is still
+    told to describe ONLY what is visibly present and never to invent content.
+    Returns "" when no context is available.
+    """
+    lines: list[str] = []
+    if duration_seconds and duration_seconds > 0:
+        lines.append(f"- Clip duration: ~{duration_seconds:.1f}s")
+    if scene_count and scene_count > 0:
+        lines.append(f"- Detected shot/scene cuts: ~{scene_count} distinct shot(s); "
+                     "frames may span several different scenes.")
+    if sampled_timestamps:
+        ts = ", ".join(f"{t:.1f}s" for t in sampled_timestamps)
+        lines.append(f"- The {len(frames_b64)} frame(s) were sampled at: {ts}")
+    if sampling_strategy:
+        lines.append(f"- Sampling strategy: {sampling_strategy}")
+    if not lines:
+        return ""
+    return (
+        "\n\nContext about the sampled frames (guidance only — still describe ONLY "
+        "what is visibly present, and prefer 'unknown' over a guess):\n"
+        + "\n".join(lines)
+    )
+
+
+def analyze_frames(frames_b64: list[str], duration_seconds: float | None = None,
+                   scene_count: int | None = None,
+                   sampled_timestamps: list[float] | None = None,
+                   sampling_strategy: str | None = None) -> VisionTags | None:
+    """Analyse sampled frames with GPT-5.4 Vision and return structured tags.
 
     Args:
         frames_b64: Base64-encoded JPEG frames from one clip.
+        duration_seconds: Clip duration (optional context for the model).
+        scene_count: Detected number of shots (optional context).
+        sampled_timestamps: Seconds each frame was taken at (optional context).
+        sampling_strategy: How frames were chosen, e.g. 'scene-midpoint' or
+            'adaptive-even' (optional context).
 
     Returns:
         A ``VisionTags`` instance, or ``None`` if vision analysis is unavailable
         (no API key, no frames) or the call failed — callers should then leave the
         shot's semantic fields unclassified rather than fabricate them.
+
+    The extra arguments are optional, so the legacy ``analyze_frames(frames_b64)``
+    call still works unchanged.
     """
     if not settings.OPENAI_API_KEY:
         logger.warning("No OPENAI_API_KEY — skipping vision analysis.")
@@ -68,7 +111,12 @@ def analyze_frames(frames_b64: list[str]) -> VisionTags | None:
     if not frames_b64:
         return None
 
-    content = [{"type": "text", "text": _VISION_INSTRUCTION}]
+    instruction = _VISION_INSTRUCTION + _sampling_context(
+        frames_b64, duration_seconds, scene_count, sampled_timestamps,
+        sampling_strategy,
+    )
+
+    content = [{"type": "text", "text": instruction}]
     for b64 in frames_b64:
         content.append({
             "type": "image_url",

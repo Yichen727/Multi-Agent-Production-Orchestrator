@@ -11,9 +11,10 @@ The LLM's only job here is to translate the user's request into a STRUCTURED que
 """
 
 from pathlib import Path
+from typing import Annotated
 
 from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, InjectedState
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 
@@ -23,6 +24,18 @@ from app.services.retrieval_service import hybrid_search
 from app.utils.logger import get_logger
 
 logger = get_logger("search_agent")
+
+
+def _pid_from_state(state) -> int:
+    """Current project id from the injected graph state (defaults to 1).
+
+    Injected by the ToolNode from ``ProductionState`` — the model never fills it — so a
+    search is always confined to the current project's catalogue (audit C-02).
+    """
+    try:
+        return int((state or {}).get("project_id"))
+    except (TypeError, ValueError):
+        return 1
 
 
 # ── Formatting ─────────────────────────────────────────────────────────────────
@@ -63,7 +76,8 @@ def _format_candidates(candidates: list[dict]) -> str:
 @tool
 def search_catalogue(keywords: str = None, shot_type: str = None,
                      orientation: str = None, people: int = None,
-                     min_duration: float = None, max_duration: float = None) -> str:
+                     min_duration: float = None, max_duration: float = None,
+                     state: Annotated[dict, InjectedState] = None) -> str:
     """Unified hybrid search over the catalogue — the ONE search tool.
 
     Combines structured SQL filters with semantic vector recall (falling back to
@@ -86,19 +100,21 @@ def search_catalogue(keywords: str = None, shot_type: str = None,
         and a grounded relevance %. Retrieval only — never a "best" pick.
     """
     candidates = hybrid_search(
-        1, keywords=keywords, shot_type=shot_type, orientation=orientation,
-        people=people, min_duration=min_duration, max_duration=max_duration,
+        _pid_from_state(state), keywords=keywords, shot_type=shot_type,
+        orientation=orientation, people=people,
+        min_duration=min_duration, max_duration=max_duration,
     )
     return _format_candidates(candidates)
 
 
 @tool
-def list_all_shots() -> str:
+def list_all_shots(state: Annotated[dict, InjectedState] = None) -> str:
     """List every catalogued shot with its metadata (ground-truth check).
 
     Useful when the query asks for "all clips" or to see exactly what is catalogued.
+    Scoped to the current project.
     """
-    return _format_candidates(hybrid_search(1, top_k=200))
+    return _format_candidates(hybrid_search(_pid_from_state(state), top_k=200))
 
 
 # ── Agent Assembly ───────────────────────────────────────────────────────────

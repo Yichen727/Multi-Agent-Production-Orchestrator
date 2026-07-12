@@ -24,11 +24,8 @@ Launch:
 """
 
 import base64
-import json
-import re
 import streamlit as st
 from pathlib import Path
-from langchain_core.messages import HumanMessage
 
 # Must be first Streamlit command
 st.set_page_config(page_title="MAPO", page_icon="🎬", layout="wide")
@@ -76,34 +73,16 @@ def _toggle_select_all():
         st.session_state[_bin_key(c["file_path"])] = value
 
 
-# ── Graph / service loaders ─────────────────────────────────────────────────
+# ── Orchestrator (the single, explicit pipeline path — audit H-06) ─────────────
+#
+# The UI is a thin presentation layer: every stage goes through the pipeline
+# orchestrator's explicit stage functions (no LLM supervisor, no bypass). These are
+# lazy-imported so Streamlit reruns don't recompile the graphs each time.
 
 
-def get_mapo_agent():
-    from app.orchestrator.production_orchestrator import mapo_agent
-    return mapo_agent
-
-
-def get_selection_agent():
-    from app.orchestrator.production_orchestrator import selection_agent
-    return selection_agent
-
-
-def get_delivery_agent():
-    from app.orchestrator.production_orchestrator import delivery_agent
-    return delivery_agent
-
-
-def _base_state(project_id, extra=None):
-    state = {
-        "project_id": project_id, "messages": [], "loaded_preferences": "",
-        "ingested_files": [], "shot_metadata": [], "search_results": [],
-        "search_candidates": [], "selected_candidates": [], "selected_shots": [],
-        "recommendations": [], "edit_timeline": [], "delivery_output": [],
-    }
-    if extra:
-        state.update(extra)
-    return state
+def _orch():
+    from app.orchestrator import production_orchestrator as orch
+    return orch
 
 
 def _pid(project_id):
@@ -113,108 +92,17 @@ def _pid(project_id):
         return project_id
 
 
-# ── Backend calls ─────────────────────────────────────────────────────────────
-
-
-def run_query(query: str, project_id: str, user_id: str, footage_dir: str):
-    from app.config import settings
-    settings.RAW_FOOTAGE_DIR = Path(footage_dir)
-    mapo_agent = get_mapo_agent()
-    config = {"configurable": {"thread_id": f"streamlit-{user_id}-{project_id}", "user_id": user_id}}
-    augmented = query
-    if any(kw in query.lower() for kw in ["scan", "index", "ingest", "catalogue", "import", "footage", "folder", "directory"]):
-        augmented = f"{query}[System context: footage directory is {footage_dir}]"
-    result = mapo_agent.invoke(
-        _base_state(project_id, {"messages": [HumanMessage(content=augmented)]}), config=config)
-    return result["messages"][-1].content
-
-
-def _extract_plan(messages) -> dict | None:
-    """Pull the structured timeline plan (from plan_timeline) out of the agent messages.
-
-    plan_timeline embeds the plan as a ```json fenced block; we take the most recent one
-    that parses and carries a "segments" list. Returns None if there is none.
-    """
-    for m in reversed(messages):
-        content = getattr(m, "content", "") or ""
-        if not isinstance(content, str):
-            continue
-        for match in re.findall(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL):
-            try:
-                obj = json.loads(match)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict) and "segments" in obj:
-                return obj
-    return None
+# ── Backend calls (thin wrappers over the orchestrator stages) ─────────────────
 
 
 def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str):
-    """Run the Selection Agent. Returns (narration_text, structured_plan_or_None)."""
-    selection_agent = get_selection_agent()
-    config = {"configurable": {"thread_id": f"streamlit-select-{user_id}-{project_id}", "user_id": user_id}}
-    clip_list = "\n".join(f"- {p}" for p in selected_paths)
-    message = (
-        f"My editing intent: {intent}\n\n"
-        f"The editor has selected these clips for the edit (work ONLY with these):\n{clip_list}\n\n"
-        "Fetch their details, decide the order and each clip's importance, then call "
-        "plan_timeline (passing my editing-intent text so it can detect any target "
-        "duration). The timeline's structure, pacing and number of steps are driven by my "
-        "intent — do NOT assume a fixed narrative arc. For each step explain why the clip "
-        "sits there, how it connects to the previous clip, and what it does for the pacing."
-    )
-    result = selection_agent.invoke(
-        _base_state(project_id, {"messages": [HumanMessage(content=message)], "selected_candidates": selected_paths}),
-        config=config)
-    return result["messages"][-1].content, _extract_plan(result["messages"])
+    """③ Selection — returns (narration_text, structured_plan_or_None)."""
+    return _orch().run_selection(intent, selected_paths, project_id, user_id)
 
 
-def run_delivery(plan: dict | None, timeline_text: str, ordered_paths: list[str],
-                 project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
-    """Compile the Selection timeline into a Premiere-importable project.
-
-    Prefers the STRUCTURED plan (segments with in/out trims) — the Delivery Agent calls
-    `compile_timeline_segments` and honours the trims + order exactly. Falls back to the
-    ordered clip list (full clips) when no structured plan is available. Delivery
-    re-orders NOTHING — it compiles what it is handed.
-    """
-    delivery_agent = get_delivery_agent()
-    config = {"configurable": {"thread_id": f"streamlit-deliver-{user_id}-{project_id}", "user_id": user_id}}
-    if plan and plan.get("segments"):
-        message = (
-            f"Compile the timeline into a Premiere Pro project named '{sequence_name}'.\n\n"
-            "The Selection Agent produced these STRUCTURED timeline segments. Call "
-            "compile_timeline_segments with segments_json set to EXACTLY this JSON — do "
-            "not re-order, add, drop, or re-time any segment:\n\n"
-            f"{json.dumps(plan)}"
-        )
-    else:
-        clip_list = "\n".join(f"- {p}" for p in ordered_paths)
-        message = (
-            f"Compile the edit timeline below into a Premiere Pro project named "
-            f"'{sequence_name}'.\n\n"
-            f"The Selection Agent laid out this timeline (PRESERVE THIS ORDER EXACTLY):\n"
-            f"{timeline_text}\n\n"
-            f"The curated clip paths (ground-truth list, same intended order):\n{clip_list}\n\n"
-            "Preview the timeline, then compile the FCP7 XML. Do not re-order or drop clips."
-        )
-    result = delivery_agent.invoke(
-        _base_state(project_id, {"messages": [HumanMessage(content=message)],
-                                 "selected_candidates": ordered_paths}),
-        config=config)
-    return result["messages"][-1].content
-
-
-def run_and_record(query: str, project_id: str, user_id: str, footage_path: str):
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.spinner("MAPO is processing..."):
-        try:
-            response = run_query(query, project_id, user_id, footage_path)
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            return response
-        except Exception as e:
-            st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
-            return None
+def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
+    """④ Delivery — compile the STRUCTURED plan (required; no Bin-order fallback, H-04)."""
+    return _orch().run_delivery(plan, project_id, user_id, sequence_name=sequence_name)
 
 
 def load_bin(project_id):
@@ -224,15 +112,12 @@ def load_bin(project_id):
 
 
 def do_search(query: str, project_id: str):
-    """Search = rank/mark matches. Sets 🟡 suggested only; never touches selection."""
-    from app.services.retrieval_service import hybrid_search, expand_query, hoist_orientation
-    # Pull any orientation word out of the raw query FIRST, so "find all horizontal
-    # shots" runs as a pure orientation filter (no misleading %) and only genuine
-    # content is sent through synonym expansion.
-    residual, orientation = hoist_orientation(query, None)
-    expanded = expand_query(residual) if residual and residual.strip() else None
-    candidates = hybrid_search(_pid(project_id), keywords=expanded or None,
-                               orientation=orientation)
+    """② Search — rank/mark matches via the orchestrator's Search stage.
+
+    Delegates to ``run_search`` (the same query understanding + hybrid recall the Search
+    Agent uses), then marks 🟡 suggested / ⚪ neutral in the Bin. Never touches selection.
+    """
+    candidates = _orch().run_search(query, project_id)
     st.session_state.suggested = {
         c["file_path"]: c["relevance"]
         for c in candidates if c.get("suggestion") in ("suggested", "neutral")
@@ -533,18 +418,24 @@ def main():
     st.subheader("④ Deliver")
     st.caption("Compiles the edit timeline into a Premiere Pro–importable project "
                "(FCP7 XML + JSON). Preserves clip order exactly — no re-editing.")
-    have_timeline = bool(st.session_state.get("last_timeline"))
+    # H-04: Delivery needs the STRUCTURED plan (ordered segments) from Selection — not
+    # merely some timeline text. Without a structured plan there is no defined edit order
+    # to compile and NO media-pool-order fallback, so Deliver stays disabled.
+    _plan = st.session_state.get("last_timeline_plan")
+    have_plan = bool(_plan and _plan.get("segments"))
     if locked:
         st.info("🔒 Locked — run Ingest first.")
-    elif not have_timeline:
-        st.info("Generate an edit timeline in ③ Selection first.")
+    elif not have_plan:
+        st.info("Generate a structured edit timeline in ③ Selection first "
+                "(Delivery compiles the ordered segments — there is no media-pool fallback).")
     else:
-        st.caption(f"Timeline ready · {len(st.session_state.get('last_timeline_paths', []))} clip(s).")
+        st.caption(f"Timeline ready · {len(_plan['segments'])} segment(s) · "
+                   f"mode: {_plan.get('mode', 'full')}.")
     seq_name = st.text_input("Sequence name", value="MAPO Edit",
-                             disabled=locked or not have_timeline, key="seq_name")
+                             disabled=locked or not have_plan, key="seq_name")
     run_deliver = st.button("📦 Export to Premiere (FCP7 XML)", use_container_width=True,
-                            disabled=locked or not have_timeline,
-                            help="Delivery Agent — compiles the timeline into an importable project file")
+                            disabled=locked or not have_plan,
+                            help="Delivery Agent — compiles the ordered timeline segments")
 
     # Delivery output renders HERE, inside the Deliver section.
     if st.session_state.get("delivery_output_text"):
@@ -552,10 +443,36 @@ def main():
             st.markdown(st.session_state.delivery_output_text)
     st.divider()
 
-    # ── Resolve actions ──────────────────────────────────────────────────────
-    quick_query = None
+    # ── Resolve actions (each button runs exactly one explicit pipeline stage) ──
     if run_ingest:
-        quick_query = f"Run ingest analysis on the footage directory at {footage_path} "
+        with st.spinner("Ingest Agent is scanning, tagging and cataloguing footage..."):
+            try:
+                from app.services.database_service import get_catalogued_paths
+                # run_ingest passes the footage directory on state (no global mutation,
+                # H-07) and returns a structured IngestResult.
+                response, res = _orch().run_ingest(footage_path, project_id, user_id)
+                st.session_state.messages.append(
+                    {"role": "user", "content": f"[Ingest] {footage_path}"})
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                # C-08: unlock later phases ONLY on a real structured success — status
+                # success/partial_success AND clips indexed AND an independent catalogue
+                # check. A non-empty agent message (e.g. "Directory not found") never unlocks.
+                catalogued = len(get_catalogued_paths(_pid(project_id)))
+                if (res is not None and res.status in ("success", "partial_success")
+                        and res.indexed_count > 0 and catalogued > 0):
+                    st.session_state.ingest_done = True
+                    load_bin(project_id)
+                    if res.status == "partial_success":
+                        warn = res.message + ("\n" + "; ".join(res.warnings) if res.warnings else "")
+                        st.warning(warn)
+                else:
+                    reason = (res.message if res is not None else
+                              "the agent never completed an ingest (no structured result)")
+                    st.error("Ingest did not succeed — Search/Selection/Delivery stay "
+                             f"locked: {reason}")
+            except Exception as e:
+                st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
+        st.rerun()
     elif run_select:
         if intent_text.strip():
             with st.spinner("Selection Agent is orchestrating the edit..."):
@@ -567,13 +484,11 @@ def main():
                         "role": "user",
                         "content": f"[Selection] intent: {intent_text.strip()} · {len(selected_paths)} clip(s)"})
                     st.session_state.messages.append({"role": "assistant", "content": response})
-                    # Capture the timeline + structured plan so Delivery can compile it
-                    # (trims + order preserved) without re-ordering anything.
+                    # The STRUCTURED plan is the ONLY thing Delivery consumes (audit
+                    # H-04): there is no Bin-order fallback. If Selection produced no
+                    # structured plan, Delivery stays disabled and asks for a re-run.
                     st.session_state.last_timeline = response
                     st.session_state.last_timeline_plan = plan
-                    st.session_state.last_timeline_paths = (
-                        [s["file_path"] for s in plan["segments"]] if plan and plan.get("segments")
-                        else selected_paths)
                     # A fresh timeline invalidates any previous export.
                     st.session_state.delivery_output_text = ""
                 except Exception as e:
@@ -584,10 +499,9 @@ def main():
     elif run_deliver:
         with st.spinner("Delivery Agent is compiling the Premiere project..."):
             try:
+                # H-04: Delivery is driven ONLY by the structured plan's ordered segments.
                 response = run_delivery(
                     st.session_state.get("last_timeline_plan"),
-                    st.session_state.get("last_timeline", ""),
-                    st.session_state.get("last_timeline_paths", []),
                     project_id, user_id, (seq_name.strip() or "MAPO Edit"))
                 st.session_state.delivery_output_text = response
                 st.session_state.messages.append({
@@ -606,27 +520,6 @@ def main():
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-
-    if quick_query:
-        response = run_and_record(quick_query, project_id, user_id, footage_path)
-        if run_ingest and response is not None:
-            st.session_state.ingest_done = True
-            load_bin(project_id)
-        st.rerun()
-
-    # Chat-bar style input: a wide text box + a compact ➤ send button on one row.
-    # A form is used (not st.chat_input) because st.chat_input is pinned to the bottom
-    # and auto-focuses, which scrolls the whole page down on load; a form does not.
-    with st.form("followup", clear_on_submit=True, border=False):
-        c_in, c_send = st.columns([8, 1])
-        with c_in:
-            prompt = st.text_input("Ask MAPO a follow-up...", label_visibility="collapsed",
-                                   placeholder="Ask MAPO a follow-up...")
-        with c_send:
-            sent = st.form_submit_button("➤", use_container_width=True)
-        if sent and prompt.strip():
-            run_and_record(prompt, project_id, user_id, footage_path)
-            st.rerun()
 
 
 if __name__ == "__main__":
