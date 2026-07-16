@@ -357,6 +357,101 @@ def extract_scene_representative_frames_b64(
     return frames, sampled
 
 
+def build_event_windows(duration_seconds: float, cut_times: list[float],
+                        max_events: int = 12, min_event_seconds: float = 1.0,
+                        long_scene_seconds: float = 8.0) -> list[tuple[float, float]]:
+    """Turn scene-cut timestamps into ordered ``(start, end)`` event windows.
+
+    This is the temporal-segmentation step of event-based ingestion. Scene cuts are the
+    PRIMARY event boundaries (a cut almost always separates two events), but a single
+    long continuous shot can hold several events (a person enters, sits, then stands), so
+    any scene longer than ``long_scene_seconds`` is sub-divided into roughly equal
+    sub-windows. All boundaries come from REAL measured time (probe duration + FFmpeg
+    cuts); nothing is invented.
+
+    Args:
+        duration_seconds: Clip duration from probe.
+        cut_times: Scene-cut timestamps from :func:`detect_scene_cut_times`.
+        max_events: Hard cap on windows per clip (bounds per-clip Vision cost). When more
+            windows would be produced they are uniformly down-sampled, preserving spread.
+        min_event_seconds: Windows shorter than this are merged into the previous one so a
+            noisy cut can't spawn a sub-second "event".
+        long_scene_seconds: A scene longer than this is sub-divided.
+
+    Returns:
+        Ordered, non-overlapping ``(start, end)`` tuples covering the clip. Empty when the
+        duration is unknown/zero (caller then falls back to whole-clip analysis).
+    """
+    if not duration_seconds or duration_seconds <= 0:
+        return []
+
+    dur = float(duration_seconds)
+    valid_cuts = sorted(t for t in (cut_times or []) if t and 0.0 < t < dur)
+    boundaries = [0.0] + valid_cuts + [dur]
+
+    windows: list[tuple[float, float]] = []
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        span = end - start
+        if span <= 0:
+            continue
+        if span > long_scene_seconds:
+            # Sub-divide a long continuous shot into ~long_scene_seconds chunks.
+            parts = max(2, int(round(span / long_scene_seconds)))
+            step = span / parts
+            for p in range(parts):
+                windows.append((round(start + p * step, 3),
+                                round(start + (p + 1) * step, 3)))
+        else:
+            windows.append((round(start, 3), round(end, 3)))
+
+    # Merge windows shorter than the floor into the previous one (avoid noise events).
+    merged: list[tuple[float, float]] = []
+    for w in windows:
+        if merged and (w[1] - w[0]) < min_event_seconds:
+            merged[-1] = (merged[-1][0], w[1])
+        else:
+            merged.append(w)
+
+    # Cap the count: uniformly down-sample windows while preserving order + spread.
+    cap = max(1, max_events)
+    if len(merged) > cap:
+        step = len(merged) / cap
+        merged = [merged[int(k * step)] for k in range(cap)]
+
+    return merged
+
+
+def extract_frames_in_window_b64(input_path: str, start: float, end: float,
+                                 count: int = 3, max_width: int = 768) -> list[str]:
+    """Grab ``count`` frames spread across ``[start, end]`` as base64 JPEGs.
+
+    Event tagging needs SEVERAL frames from the SAME window (start → middle → end) so the
+    vision model can see the CHANGE — a single frame cannot show that a person "sits
+    down". Frames are seeked to interior fractions of the window so they span the action
+    without landing exactly on the cut boundary.
+
+    Returns the frames in temporal order (may be shorter than ``count`` if some seeks
+    fail; empty when FFmpeg is unavailable).
+    """
+    if not check_ffmpeg_installed():
+        return []
+    count = max(1, count)
+    span = max(0.0, end - start)
+    if span <= 0:
+        timestamps = [max(0.0, start)]
+    else:
+        # Interior fractions: e.g. count=3 → 0.2, 0.5, 0.8 of the window.
+        timestamps = [round(start + span * (i + 1) / (count + 1), 3)
+                      for i in range(count)]
+    frames: list[str] = []
+    for ts in timestamps:
+        b64 = _grab_frame_b64(input_path, ts, max_width)
+        if b64:
+            frames.append(b64)
+    return frames
+
+
 def extract_sample_frames_b64(input_path: str, duration_seconds: float = 0.0,
                               count: int = 3, max_width: int = 768) -> list[str]:
     """Grab evenly spaced frames as base64 JPEGs (in-memory, no temp files).

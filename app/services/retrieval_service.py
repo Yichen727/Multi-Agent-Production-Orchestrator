@@ -265,11 +265,87 @@ def _suggestion(relevance: float | None) -> str:
     return "low"
 
 
+def _fetch_project_events(project_id, wanted_paths: set) -> list[dict]:
+    """Fetch a project's temporal events, restricted to a set of parent file paths.
+
+    Reads every ``clip_events`` row for the project once and keeps only those whose parent
+    clip survived the SQL hard filters (``wanted_paths``), so event-aware recall never
+    surfaces a clip the structured filters already excluded. Empty list when the project
+    has no events (→ retrieval degrades to pure clip-level, unchanged).
+    """
+    if not wanted_paths:
+        return []
+    with _engine.begin() as conn:
+        rows = conn.execute(
+            _sql("SELECT file_path, start_seconds, end_seconds, action, state_change, "
+                 "keywords, subjects, embedding FROM clip_events WHERE project_id = :pid"),
+            {"pid": project_id},
+        )
+        return [dict(r._mapping) for r in rows if r._mapping["file_path"] in wanted_paths]
+
+
+def _score_events(rows: list[dict], terms: list[str],
+                  query_vec) -> list[tuple[dict, float]]:
+    """Score event rows against a query (vector cosine noisy-OR lexical), shared logic.
+
+    Used both by ``search_events`` (Selection's moment primitive) and by
+    ``hybrid_search``'s event-aware clip recall, so event scoring has ONE source of truth.
+    Returns ``(row, relevance)`` pairs aligned to ``rows``.
+    """
+    sim: dict[int, float] = {}
+    rows_with_vec = [r for r in rows if r.get("embedding")]
+    if query_vec is not None and rows_with_vec:
+        try:
+            matrix = np.asarray(
+                [json.loads(r["embedding"]) for r in rows_with_vec], dtype=float)
+            sims = _cosine(query_vec, matrix)
+            sim = {id(r): float(max(0.0, s)) for r, s in zip(rows_with_vec, sims)}
+        except (ValueError, TypeError) as e:
+            logger.error(f"Event cosine ranking failed, using lexical only: {e}")
+    scored = []
+    for r in rows:
+        lex = _event_lexical_score(r, terms)
+        vec = sim.get(id(r))
+        rel = (1.0 - (1.0 - _calibrate_cosine(vec)) * (1.0 - lex)) if vec is not None else lex
+        scored.append((r, rel))
+    return scored
+
+
+def _best_event_by_path(project_id, wanted_paths: set, terms: list[str],
+                        query_vec) -> dict[str, dict]:
+    """Best-matching temporal event per parent clip, for event-aware clip recall.
+
+    Aggregates each clip's events to the single strongest match, so a clip whose OVERALL
+    tags miss the query still surfaces when a MOMENT inside it hits — while the retrieval
+    unit stays the clip. Returns ``{file_path: {start, end, action, relevance}}``.
+    """
+    rows = _fetch_project_events(project_id, wanted_paths)
+    if not rows:
+        return {}
+    best: dict[str, dict] = {}
+    for r, rel in _score_events(rows, terms, query_vec):
+        fp = r["file_path"]
+        cur = best.get(fp)
+        if cur is None or rel > cur["relevance"]:
+            best[fp] = {"file_path": fp, "start_seconds": r.get("start_seconds"),
+                        "end_seconds": r.get("end_seconds"),
+                        "action": r.get("action"), "relevance": rel}
+    return best
+
+
 def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
                   orientation: str = None, people: int = None,
                   min_duration: float = None, max_duration: float = None,
                   top_k: int = 20) -> list[dict]:
-    """Unified hybrid retrieval: SQL hard filters + semantic/lexical recall.
+    """Unified hybrid retrieval: SQL hard filters + EVENT-AWARE semantic/lexical recall.
+
+    The retrieval unit is always the CLIP (Search browses footage; Selection cuts moments
+    — a hard responsibility boundary). But recall is event-aware: a clip's relevance is
+    the reinforcing (noisy-OR) combination of its OWN clip-level match and the best match
+    among its temporal events, so a clip whose overall tags miss the query still surfaces
+    when a MOMENT inside it hits (e.g. "celebration" finds a clip whose only celebratory
+    beat is one event). The matched moment is attached as ``matched_event`` for preview
+    context only — it never turns the result into a moment.
 
     Args:
         project_id: Project whose catalogue to search.
@@ -282,11 +358,11 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
         top_k: Maximum number of candidates to return.
 
     Returns:
-        A list of candidate dicts, each carrying real catalogue metadata plus a
-        ``relevance`` (0–1 or None when no query was given), a ``group_size`` label,
-        and a ``suggestion`` marker ('suggested' | 'neutral' | 'low'). Ranked by
-        relevance when a query is present, otherwise by file path. Never fabricates
-        rows — an empty catalogue or no matches yields an empty list.
+        A list of CLIP candidate dicts, each carrying real catalogue metadata plus a
+        ``relevance`` (0–1 or None when no query was given), a ``group_size`` label, a
+        ``suggestion`` marker ('suggested' | 'neutral' | 'low'), and (when a moment drove
+        the match) a ``matched_event``. Ranked by relevance when a query is present,
+        otherwise by file path. Never fabricates rows.
     """
     # A format word ("horizontal") left inside the free-text query is a FILTER, not a
     # thing to score — hoist it into `orientation` so it narrows rows instead of giving
@@ -304,12 +380,15 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
     if query:
         terms = [t.strip().lower() for t in query.replace(",", " ").split() if t.strip()]
 
-        # Vector layer: embed the query, cosine against rows that carry an embedding.
+        # Embed the query ONCE and reuse it for both the clip and event vector layers
+        # (returns None without an API key → both layers fall back to lexical).
+        query_vecs = embed_texts([query])
+        q = np.asarray(query_vecs[0], dtype=float) if query_vecs else None
+
+        # Clip vector layer: cosine against rows that carry a clip-level embedding.
         sim_by_id: dict[int, float] = {}
         rows_with_vec = [r for r in rows if r.get("embedding")]
-        query_vecs = embed_texts([query]) if rows_with_vec else None
-        if query_vecs and rows_with_vec:
-            q = np.asarray(query_vecs[0], dtype=float)
+        if q is not None and rows_with_vec:
             try:
                 matrix = np.asarray(
                     [json.loads(r["embedding"]) for r in rows_with_vec], dtype=float
@@ -320,19 +399,27 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
             except (ValueError, TypeError) as e:
                 logger.error(f"Cosine ranking failed, using lexical only: {e}")
 
-        # Combine the two signals per row with a reinforcing (noisy-OR) rule: a strong
-        # CALIBRATED cosine OR a strong lexical overlap each push relevance toward 1.0,
-        # and neither dilutes the other. Falls back to lexical alone when no vector
-        # exists (demo seed / no API key), so a genuinely relevant clip reads as relevant
-        # whether it was matched semantically, literally, or both.
+        # Event-aware layer: best temporal-event match per clip (empty when no events).
+        best_event = _best_event_by_path(
+            project_id, {r["file_path"] for r in rows}, terms, q)
+
+        # Combine clip + event signals with a reinforcing (noisy-OR) rule: a strong hit in
+        # the clip's own tags OR in one of its moments each push relevance toward 1.0, and
+        # neither dilutes the other.
         for r in rows:
             lex = _lexical_score(r, terms)
             vec = sim_by_id.get(id(r))
-            if vec is not None:
-                vec_cal = _calibrate_cosine(vec)
-                rel = 1.0 - (1.0 - vec_cal) * (1.0 - lex)
+            rel_clip = (1.0 - (1.0 - _calibrate_cosine(vec)) * (1.0 - lex)
+                        ) if vec is not None else lex
+            ev = best_event.get(r["file_path"])
+            if ev is not None:
+                rel = 1.0 - (1.0 - rel_clip) * (1.0 - ev["relevance"])
+                r["matched_event"] = {
+                    "start_seconds": ev["start_seconds"], "end_seconds": ev["end_seconds"],
+                    "action": ev["action"], "relevance": round(ev["relevance"], 4),
+                }
             else:
-                rel = lex
+                rel = rel_clip
             scored.append((r, rel))
 
         scored.sort(key=lambda pair: (pair[1] if pair[1] is not None else 0.0),
@@ -346,6 +433,103 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
         r.pop("embedding", None)
         r["relevance"] = round(rel, 4) if rel is not None else None
         r["group_size"] = group_size(r.get("people_count"))
+        r["suggestion"] = _suggestion(rel)
+        candidates.append(r)
+    return candidates
+
+
+# ── Event-level (temporal) retrieval — "find the MOMENT", not just the clip ─────
+
+# Columns pulled for every event candidate: the event's own timing/action fields plus a
+# little parent-clip context (path, shot type, orientation) for the UI/Selection. The
+# event embedding is fetched for cosine ranking then stripped from the returned dict.
+_EVENT_SELECT = (
+    "e.event_id, e.shot_id, e.file_path, e.event_order, "
+    "e.start_seconds, e.end_seconds, e.duration_seconds, "
+    "e.action, e.state_change, e.subjects, e.keywords, e.embedding, "
+    "s.shot_type AS shot_type, s.orientation AS orientation, "
+    "s.duration_seconds AS clip_duration"
+)
+
+
+def _event_lexical_score(row: dict, terms: list[str]) -> float:
+    """Saturating lexical overlap between query terms and an event's action/keywords."""
+    if not terms:
+        return 0.0
+    haystack = (f"{row.get('action') or ''} {row.get('keywords') or ''} "
+                f"{row.get('state_change') or ''} {row.get('subjects') or ''}").lower()
+    hits = sum(1 for t in set(terms) if t and t in haystack)
+    denom = min(_LEXICAL_TARGET_HITS, len(set(terms)))
+    return min(1.0, hits / denom) if denom else 0.0
+
+
+def search_events(project_id, *, keywords: str = None, shot_type: str = None,
+                  orientation: str = None, top_k: int = 20) -> list[dict]:
+    """Retrieve temporal EVENTS (moments) matching a query, scoped to a project.
+
+    The moment-level primitive backing the SELECTION stage (Selection queries a clip's
+    events to cut to a precise moment). It is NOT a Search-stage user mode — Search always
+    returns clips (see :func:`hybrid_search`, which uses events only to improve clip
+    recall). Instead of whole clips, this ranks individual ``clip_events`` and returns the
+    parent clip PLUS the exact in/out timecodes of each event, which Selection/Delivery
+    trim to verbatim.
+
+    Ranking mirrors ``hybrid_search`` (shared ``_score_events``): a query embedding
+    cosine-matched against per-event embeddings, combined (noisy-OR) with lexical overlap
+    on the event's action/keywords. Falls back to lexical alone when no embeddings/API key.
+
+    Args:
+        project_id: Project whose events to search.
+        keywords: Free-text moment query. Omit for an unranked chronological listing.
+        shot_type / orientation: Optional parent-clip filters.
+        top_k: Maximum number of events to return.
+
+    Returns:
+        A list of event candidate dicts (event timing + action + parent-clip context +
+        ``relevance`` + ``suggestion``), ranked by relevance when a query is given, else
+        by (file_path, event_order). Never fabricates — no events yields an empty list.
+    """
+    keywords, orientation = hoist_orientation(keywords, orientation)
+
+    clauses = ["e.project_id = :pid"]
+    params: dict = {"pid": project_id}
+    orient = _normalise_orientation(orientation)
+    if orient:
+        clauses.append("s.orientation = :orient")
+        params["orient"] = orient
+    if shot_type:
+        clauses.append("s.shot_type LIKE :stype")
+        params["stype"] = f"%{shot_type.strip().lower()}%"
+    where = " AND ".join(clauses)
+    query_sql = (f"SELECT {_EVENT_SELECT} FROM clip_events e "
+                 f"JOIN shots s ON s.shot_id = e.shot_id "
+                 f"WHERE {where} ORDER BY e.file_path, e.event_order")
+
+    with _engine.begin() as conn:
+        rows = [dict(r._mapping) for r in conn.execute(_sql(query_sql), params)]
+    if not rows:
+        return []
+
+    query = (keywords or "").strip()
+    if query:
+        terms = [t.strip().lower() for t in query.replace(",", " ").split() if t.strip()]
+        query_vecs = embed_texts([query])
+        q = np.asarray(query_vecs[0], dtype=float) if query_vecs else None
+        scored = _score_events(rows, terms, q)
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+    else:
+        scored = [(r, None) for r in rows]
+
+    candidates = []
+    for r, rel in scored[:top_k]:
+        r.pop("embedding", None)
+        subj = r.get("subjects")
+        if isinstance(subj, str) and subj:
+            try:
+                r["subjects"] = json.loads(subj)
+            except (ValueError, TypeError):
+                pass
+        r["relevance"] = round(rel, 4) if rel is not None else None
         r["suggestion"] = _suggestion(rel)
         candidates.append(r)
     return candidates

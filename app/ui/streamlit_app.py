@@ -96,7 +96,11 @@ def _pid(project_id):
 
 
 def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str):
-    """③ Selection — returns (narration_text, structured_plan_or_None)."""
+    """③ Selection — returns (narration_text, structured_plan_or_None).
+
+    The Selection Agent decides for itself, from the editing intent, whether to build a
+    whole-clip timeline or a moment-precise one (trimmed to detected event boundaries).
+    """
     return _orch().run_selection(intent, selected_paths, project_id, user_id)
 
 
@@ -112,14 +116,16 @@ def load_bin(project_id):
 
 
 def do_search(query: str, project_id: str):
-    """② Search — rank/mark matches via the orchestrator's Search stage.
+    """② Search — rank/mark matching CLIPS via the orchestrator's Search stage.
 
-    Delegates to ``run_search`` (the same query understanding + hybrid recall the Search
-    Agent uses), then marks 🟡 suggested / ⚪ neutral in the Bin. Never touches selection.
+    Delegates to ``run_search`` (the same query understanding + event-aware clip recall
+    the Search Agent uses), then marks 🟡 suggested / ⚪ neutral clips in the Bin. The unit
+    is always the whole clip; a match driven by a moment inside a clip carries a
+    ``matched_event`` hint shown as the card's reason. Never touches selection.
     """
     candidates = _orch().run_search(query, project_id)
     st.session_state.suggested = {
-        c["file_path"]: c["relevance"]
+        c["file_path"]: c.get("relevance")
         for c in candidates if c.get("suggestion") in ("suggested", "neutral")
     }
     st.session_state.search_results = candidates
@@ -153,11 +159,16 @@ def _thumb(c):
 
 
 def _reason(c, tier: str) -> str:
-    """A short 'why' for a search card: the clip's own vision description, so the editor
-    reads what the shot actually SHOWS rather than a bag of keywords. Falls back to the
-    keyword tags, then a generic note, when no description was recorded."""
+    """A short 'why' for a search card. When a MOMENT inside the clip drove the match
+    (event-aware recall), lead with that moment — it explains why this clip surfaced.
+    Otherwise fall back to the clip's own vision description, then keyword tags, so the
+    editor reads what the shot actually SHOWS rather than a bag of keywords."""
     if tier == "low":
         return "weak semantic match"
+    ev = c.get("matched_event")
+    if ev and (ev.get("action") or "").strip():
+        span = f"{ev.get('start_seconds', 0):.0f}–{ev.get('end_seconds', 0):.0f}s"
+        return f"contains: {ev['action'].strip()} (~{span})"
     desc = (c.get("description") or "").strip()
     if desc:
         return desc
@@ -354,9 +365,11 @@ def main():
                            help="Ingest Agent — scan, vision-tag, embed, catalogue")
     st.divider()
 
-    # ② Search — decision cards
+    # ② Search — decision cards (always clip-level; choosing a moment is Selection's job)
     st.subheader("② Search")
-    st.caption("Ranks matches (🟡 suggested · ⚪ neutral · 🔴 low). ➕ ticks the clip in the Media Pool.")
+    st.caption("Finds matching clips (🟡 suggested · ⚪ neutral · 🔴 low). Recall is "
+               "event-aware — a clip surfaces when a moment inside it matches, shown as the "
+               "card's reason. ➕ ticks the clip in the Media Pool.")
 
     if locked:
         st.info("🔒 Locked — run Ingest first.")
@@ -379,7 +392,8 @@ def main():
 
     # ③ Selection
     st.subheader("③ Selection")
-    st.caption("State your editing intent. Orchestrates your ticked clips into a timeline.")
+    st.caption("State your editing intent. Orchestrates your ticked clips into a timeline — "
+               "the agent cuts to precise event moments when your intent calls for it.")
     selected_paths = [c["file_path"] for c in st.session_state.bin_shots
                       if st.session_state.get(_bin_key(c["file_path"]))]
     have_sel = bool(selected_paths)
@@ -400,7 +414,10 @@ def main():
         plan = st.session_state.get("last_timeline_plan")
         if plan:
             n_steps = len(plan.get("segments", []))
-            if plan.get("mode") == "timed":
+            if plan.get("mode") == "events":
+                st.caption(f"🎯 EVENTS MODE · trimmed to {n_steps} detected moment(s) · "
+                           f"{plan.get('total_seconds')}s total")
+            elif plan.get("mode") == "timed":
                 st.caption(f"⏱️ TIMED MODE · target {plan.get('target_seconds')}s · "
                            f"actual {plan.get('total_seconds')}s · {n_steps} steps")
             elif plan.get("mode") == "trim":
@@ -477,7 +494,8 @@ def main():
         if intent_text.strip():
             with st.spinner("Selection Agent is orchestrating the edit..."):
                 try:
-                    response, plan = run_selection(intent_text.strip(), selected_paths, project_id, user_id)
+                    response, plan = run_selection(
+                        intent_text.strip(), selected_paths, project_id, user_id)
                     # Render inline in the Selection section + keep a debug-log copy.
                     st.session_state.selection_output = response
                     st.session_state.messages.append({

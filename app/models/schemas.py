@@ -69,6 +69,69 @@ class VisionTags(BaseModel):
     )
 
 
+class EventTags(BaseModel):
+    """Action-oriented tags for ONE temporal segment (event) of a clip.
+
+    This is the "what HAPPENS" layer, distinct from :class:`VisionTags` (the "what is
+    IN the frame" layer). The model is shown several frames spanning a KNOWN time window
+    IN ORDER and asked to describe the ACTION and the CHANGE across them — verbs, not
+    just nouns. The window's start/end seconds are supplied by ingest from real FFmpeg
+    scene boundaries, so the model never invents timecodes; it only describes what
+    happens inside a window it is told about.
+
+    As with VisionTags: every field carries an explicit Field(description=...) and none is
+    named 'description' (the schema-echo bug). Prefer empty/'unknown' over a guess.
+    """
+    action: str = Field(
+        default="",
+        description="One factual verb-led sentence describing what HAPPENS across the "
+                    "frames in order (e.g. 'a person walks in from the left and sits "
+                    "down'). Describe motion/action, not a static caption.",
+    )
+    subjects: list[str] = Field(
+        default_factory=list,
+        description="The entities that DO or UNDERGO the action (people, vehicles, "
+                    "objects). Not every visible object — only the ones involved in what "
+                    "happens.",
+    )
+    state_change: str = Field(
+        default="",
+        description="What is DIFFERENT between the first and last frame (position, "
+                    "presence, framing, activity). Empty if nothing changes / a single "
+                    "held moment.",
+    )
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="Short lowercase searchable action/event tags an editor would use to "
+                    "find this MOMENT (verbs and event nouns: 'kick-off', 'celebration', "
+                    "'entrance', 'handshake'). No invented proper nouns.",
+    )
+
+
+class ClipEvent(BaseModel):
+    """One persisted temporal event: a segment of a clip with a real start/end.
+
+    Mirrors a ``clip_events`` row. ``start_seconds``/``end_seconds`` are against the
+    SOURCE clip and come from FFmpeg scene boundaries (never model-guessed), so an event
+    can be trimmed to VERBATIM by Selection/Delivery via the existing in/out machinery.
+    Unknown extra keys are ignored so a partial DB row validates without fabrication.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    event_id: Optional[int] = None
+    shot_id: Optional[int] = None
+    file_path: str
+    event_order: int = 0
+    start_seconds: float = 0.0
+    end_seconds: float = 0.0
+    duration_seconds: float = 0.0
+    action: str = ""
+    state_change: str = ""
+    subjects: list[str] = Field(default_factory=list)
+    keywords: str = ""
+    relevance: Optional[float] = None
+
+
 class TransitionSuggestion(BaseModel):
     """Transition suggestion between two shots."""
     from_shot_id: int
@@ -237,6 +300,7 @@ class IngestResult(BaseModel):
     indexed_count: int = 0
     reused_count: int = 0
     unreadable_count: int = 0
+    event_count: int = 0
     truncated: bool = False
     message: str = ""
     warnings: list[str] = Field(default_factory=list)

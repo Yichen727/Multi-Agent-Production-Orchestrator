@@ -246,3 +246,66 @@ def plan_segments(clips: list[dict], target_seconds: float | None,
         "validation_errors": validation_errors,
         "segments": segments,
     }
+
+
+def plan_event_segments(events: list[dict], labels: list[str] | None = None) -> dict:
+    """Build a timeline plan from ORDERED temporal events (moment-precise trims).
+
+    This is the event-based counterpart to :func:`plan_segments`: instead of a per-clip
+    head/tail trim or a proportional allocation, each segment's in/out points are the
+    event's OWN measured ``start_seconds``/``end_seconds`` — so the timeline cuts to the
+    exact moment the action happens. Order is preserved exactly (event 0 = step 1).
+
+    Each event dict needs ``file_path``, ``start_seconds`` and ``end_seconds`` (and
+    ideally ``shot_id`` and the parent ``source_duration``/``clip_duration``). A segment
+    whose range is empty or falls outside the known source length is flagged invalid
+    (``valid: False``) rather than silently dropped, so Delivery refuses it.
+
+    Returns the same plan shape as ``plan_segments`` with ``mode='events'``.
+    """
+    segments = []
+    for i, e in enumerate(events):
+        in_p = max(0.0, float(e.get("start_seconds") or 0.0))
+        out_p = float(e.get("end_seconds") or 0.0)
+        src = float(e.get("source_duration") or e.get("clip_duration") or 0.0)
+        dur = round(max(0.0, out_p - in_p), 3)
+
+        valid = True
+        validation_error = None
+        if dur <= 0:
+            valid, validation_error = False, (
+                f"event range is empty ({in_p:g}s–{out_p:g}s)")
+        elif src > 0 and out_p > src + 1e-6:
+            valid, validation_error = False, (
+                f"event out-point {out_p:g}s exceeds source length {src:g}s")
+
+        segments.append({
+            "order": i + 1,
+            "shot_id": e.get("shot_id"),
+            "file_path": e.get("file_path"),
+            "name": Path(e.get("file_path") or "").name,
+            "label": (labels[i] if labels and i < len(labels) else
+                      (e.get("action") or "")[:60]),
+            "importance": 1.0,
+            "source_duration": round(src, 3),
+            "in_point": round(in_p, 3),
+            "out_point": round(out_p, 3),
+            "duration": dur,
+            "valid": valid,
+            "validation_error": validation_error,
+        })
+
+    validation_errors = [
+        {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
+        for s in segments if not s["valid"]
+    ]
+    return {
+        "mode": "events",
+        "target_seconds": None,
+        "head_trim": 0.0,
+        "tail_trim": 0.0,
+        "total_seconds": round(sum(s["duration"] for s in segments), 3),
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
+        "segments": segments,
+    }

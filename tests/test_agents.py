@@ -657,5 +657,183 @@ def test_compile_project_versions_exports(tmp_path):
         Path(r["json_path"]).unlink(missing_ok=True)
 
 
+# ── Tier 2: temporal event-based ingestion (events, windows, moment search) ────
+
+
+def test_clip_events_table_exists():
+    """The event-based ingestion layer added a clip_events table."""
+    tables = db.run("SELECT name FROM sqlite_master WHERE type='table';")
+    assert "clip_events" in tables
+
+
+def test_event_tags_schema():
+    """EventTags is action-oriented, has no 'description' echo field, all documented."""
+    from app.models.schemas import EventTags
+    for field in ("action", "subjects", "state_change", "keywords"):
+        assert field in EventTags.model_fields
+    assert "description" not in EventTags.model_fields  # avoid the schema-echo bug
+    for name, info in EventTags.model_fields.items():
+        assert info.description, f"{name} must carry an explicit Field(description=...)"
+
+
+def test_clip_events_round_trip_and_cascade():
+    """Events write/read by parent file, and cascade-delete when shots are replaced."""
+    from app.services.database_service import (
+        replace_project_shots, replace_project_events, get_catalogued_events, _engine,
+    )
+    from sqlalchemy import text
+    replace_project_shots(66, [
+        {"file_path": "/ev/a.mov", "duration_seconds": 20.0, "orientation": "landscape"},
+    ])
+    try:
+        n = replace_project_events(66, [
+            {"file_path": "/ev/a.mov", "event_order": 1, "start_seconds": 0.0,
+             "end_seconds": 5.0, "duration_seconds": 5.0, "action": "a person walks in",
+             "subjects": ["person"], "keywords": "entrance,walk-in"},
+            {"file_path": "/ev/a.mov", "event_order": 2, "start_seconds": 5.0,
+             "end_seconds": 12.0, "duration_seconds": 7.0, "action": "sits and talks",
+             "subjects": ["person"], "keywords": "sit,dialogue"},
+        ])
+        assert n == 2
+        grouped = get_catalogued_events(66)
+        assert len(grouped["/ev/a.mov"]) == 2
+        assert grouped["/ev/a.mov"][0]["event_order"] == 1
+        # Replacing the shots cascade-clears the events (FK ON DELETE CASCADE).
+        replace_project_shots(66, [
+            {"file_path": "/ev/a.mov", "duration_seconds": 20.0, "orientation": "landscape"}])
+        assert get_catalogued_events(66) == {}
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 66"))
+
+
+def test_replace_events_skips_orphans():
+    """An event whose file has no catalogued shot is skipped, never orphaned."""
+    from app.services.database_service import (
+        replace_project_shots, replace_project_events, _engine,
+    )
+    from sqlalchemy import text
+    replace_project_shots(68, [{"file_path": "/ev/real.mov", "duration_seconds": 4.0}])
+    try:
+        n = replace_project_events(68, [
+            {"file_path": "/ev/real.mov", "event_order": 1, "start_seconds": 0.0,
+             "end_seconds": 2.0, "duration_seconds": 2.0, "action": "x"},
+            {"file_path": "/ev/ghost.mov", "event_order": 1, "start_seconds": 0.0,
+             "end_seconds": 2.0, "duration_seconds": 2.0, "action": "orphan"},
+        ])
+        assert n == 1  # the orphan (no parent shot) was skipped
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 68"))
+
+
+def test_get_events_by_ids_is_project_scoped():
+    """An event id never resolves across projects (mirrors shot/file isolation)."""
+    from app.services.database_service import (
+        replace_project_shots, replace_project_events, get_events_by_ids,
+        get_catalogued_events, _engine,
+    )
+    from sqlalchemy import text
+    replace_project_shots(69, [{"file_path": "/ev/p69.mov", "duration_seconds": 10.0}])
+    try:
+        replace_project_events(69, [
+            {"file_path": "/ev/p69.mov", "event_order": 1, "start_seconds": 0.0,
+             "end_seconds": 3.0, "duration_seconds": 3.0, "action": "y"}])
+        an_id = get_catalogued_events(69)["/ev/p69.mov"][0]["event_id"]
+        got = get_events_by_ids(69, [an_id])          # its own project sees it
+        assert got and got[an_id]["source_duration"] == 10.0
+        assert get_events_by_ids(1, [an_id]) == {}    # project 1 cannot see it
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 69"))
+
+
+def test_build_event_windows_segments_and_caps():
+    """Scene cuts become windows; long scenes subdivide; the count is capped."""
+    from app.services.ffmpeg_service import build_event_windows
+    windows = build_event_windows(30.0, [5.0, 8.0], long_scene_seconds=8.0)
+    assert windows[0] == (0.0, 5.0)           # first scene kept whole
+    assert (5.0, 8.0) in windows              # short middle scene kept whole
+    assert windows[-1][1] == 30.0             # coverage reaches clip end
+    assert any(w[0] >= 8.0 for w in windows[2:])  # long final scene subdivided
+    # Cap: one 100s scene subdivides to many windows, then down-samples to <= cap.
+    capped = build_event_windows(100.0, [], max_events=4, long_scene_seconds=8.0)
+    assert 1 <= len(capped) <= 4
+    # Unknown duration → no windows (caller falls back to whole-clip analysis).
+    assert build_event_windows(0.0, [5.0]) == []
+
+
+def test_plan_event_segments_uses_event_bounds():
+    """EVENTS MODE trims each segment to the event's own in/out, order preserved."""
+    from app.services.timeline_service import plan_event_segments
+    events = [
+        {"file_path": "/f/a.mov", "shot_id": 1, "start_seconds": 10.0,
+         "end_seconds": 14.0, "source_duration": 30.0, "action": "the goal"},
+        {"file_path": "/f/b.mov", "shot_id": 2, "start_seconds": 0.0,
+         "end_seconds": 3.0, "clip_duration": 8.0, "action": "crowd roar"},
+    ]
+    plan = plan_event_segments(events)
+    assert plan["mode"] == "events"
+    assert [s["order"] for s in plan["segments"]] == [1, 2]
+    assert plan["segments"][0]["in_point"] == 10.0
+    assert plan["segments"][0]["out_point"] == 14.0
+    assert plan["segments"][0]["duration"] == 4.0
+    assert plan["total_seconds"] == 7.0
+    assert plan["valid"] is True
+
+
+def test_plan_event_segments_flags_out_of_range():
+    """An event out-point beyond the source length is flagged invalid, not clamped."""
+    from app.services.timeline_service import plan_event_segments
+    plan = plan_event_segments([{"file_path": "/f/a.mov", "start_seconds": 0.0,
+                                 "end_seconds": 99.0, "source_duration": 10.0}])
+    assert plan["valid"] is False and plan["segments"][0]["valid"] is False
+
+
+def test_search_events_ranks_moments_lexically():
+    """search_events returns ranked moments with timecodes + parent-clip context."""
+    from app.services.database_service import (
+        replace_project_shots, replace_project_events, _engine,
+    )
+    from app.services.retrieval_service import search_events
+    from sqlalchemy import text
+    replace_project_shots(67, [{"file_path": "/ev/match.mov", "duration_seconds": 30.0,
+                                "orientation": "landscape", "shot_type": "wide_shot"}])
+    try:
+        replace_project_events(67, [
+            {"file_path": "/ev/match.mov", "event_order": 1, "start_seconds": 0.0,
+             "end_seconds": 5.0, "duration_seconds": 5.0,
+             "action": "players walk onto the pitch", "keywords": "entrance,walk-on"},
+            {"file_path": "/ev/match.mov", "event_order": 2, "start_seconds": 10.0,
+             "end_seconds": 14.0, "duration_seconds": 4.0,
+             "action": "striker scores a goal and celebrates",
+             "keywords": "goal,celebration,score"},
+        ])
+        res = search_events(67, keywords="goal celebration")
+        assert res, "expected at least one moment"
+        top = res[0]
+        assert "goal" in (top.get("keywords") or "")          # the scoring moment ranked first
+        assert top["start_seconds"] == 10.0 and top["end_seconds"] == 14.0  # timecodes
+        assert top["shot_type"] == "wide_shot"                # parent-clip context joined
+        assert "suggestion" in top
+    finally:
+        with _engine.begin() as c:
+            c.execute(text("DELETE FROM shots WHERE project_id = 67"))
+
+
+def test_selection_agent_owns_event_tools():
+    """Selection Agent gains event inspection + moment-precise timeline planning."""
+    pytest.importorskip("langgraph")
+    from app.agents.selection_agent import selection_tools
+    names = {t.name for t in selection_tools}
+    assert {"get_clip_events", "plan_moment_timeline"} <= names
+
+
+def test_ingest_result_carries_event_count():
+    """IngestResult records how many temporal events were indexed (additive field)."""
+    from app.models.schemas import IngestResult
+    assert "event_count" in IngestResult.model_fields
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

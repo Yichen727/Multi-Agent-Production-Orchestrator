@@ -132,18 +132,25 @@ def _pid(project_id) -> int:
         return project_id
 
 
-def _extract_plan(messages) -> dict | None:
-    """Pull the structured timeline plan from the ``plan_timeline`` TOOL output.
+# Timeline-planning tools whose ToolMessage carries the structured plan Delivery consumes.
+# Both the clip-level planner and the event/moment-precise planner emit the same fenced
+# ```json plan shape, so the extractor accepts either (audit H-03).
+_PLAN_TOOLS = (None, "plan_timeline", "plan_moment_timeline")
 
-    Reads the plan out of the plan_timeline ToolMessage — the tool's own output, which
-    the model cannot rewrite — rather than scraping the assistant's prose. So the model
-    reformatting its narration can never corrupt or hide the plan Delivery receives
-    (audit H-03). Returns the most recent structured plan, or ``None`` if none was produced.
+
+def _extract_plan(messages) -> dict | None:
+    """Pull the structured timeline plan from a planning TOOL output.
+
+    Reads the plan out of the plan_timeline / plan_moment_timeline ToolMessage — the
+    tool's own output, which the model cannot rewrite — rather than scraping the
+    assistant's prose. So the model reformatting its narration can never corrupt or hide
+    the plan Delivery receives (audit H-03). Returns the most recent structured plan, or
+    ``None`` if none was produced.
     """
     for m in reversed(messages):
         if not isinstance(m, ToolMessage):
             continue
-        if getattr(m, "name", None) not in (None, "plan_timeline"):
+        if getattr(m, "name", None) not in _PLAN_TOOLS:
             continue
         content = m.content if isinstance(m.content, str) else ""
         for match in re.findall(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL):
@@ -182,7 +189,11 @@ def run_search(query: str, project_id) -> list[dict]:
 
     Runs the query through the shared query understanding (orientation hoist + synonym
     expansion) and ``hybrid_search`` so the UI's direct search and the Search Agent's
-    tool behave identically. Returns candidate dicts; never ranks a "best" clip.
+    tool behave identically. Retrieval is CLIP-level: the returned unit is always a whole
+    clip (choosing a moment within it is Selection's job). Recall is event-aware inside
+    ``hybrid_search`` — a clip surfaces when a moment inside it matches — but that only
+    ranks clips and attaches a ``matched_event`` hint; it never returns a moment.
+    Never ranks a "best" clip.
     """
     residual, orientation = hoist_orientation(query, None)
     expanded = expand_query(residual) if residual and residual.strip() else None
@@ -195,17 +206,27 @@ def run_selection(intent: str, selected_paths: list[str],
     """③ Selection — invoke the Selection sub-agent on the curated clips.
 
     Returns ``(narration, structured_plan | None)``. The structured plan is read from the
-    plan_timeline tool output (audit H-03), never from the model's prose.
+    planning tool's output (audit H-03), never from the model's prose.
+
+    The agent DECIDES for itself, from the editing intent, whether to build a whole-clip
+    timeline (``plan_timeline`` — head/tail/timed/full) or a MOMENT-PRECISE one
+    (``get_clip_events`` → ``plan_moment_timeline``, trimming to exact event boundaries).
+    An intent that targets specific moments ("a 30s celebration reel") steers it to the
+    event path; there is no separate UI switch.
     """
     clip_list = "\n".join(f"- {p}" for p in selected_paths)
     message = (
         f"My editing intent: {intent}\n\n"
         f"The editor has selected these clips for the edit (work ONLY with these):\n{clip_list}\n\n"
-        "Fetch their details, decide the order and each clip's importance, then call "
-        "plan_timeline (passing my editing-intent text so it can detect any target "
-        "duration). The timeline's structure, pacing and number of steps are driven by my "
-        "intent — do NOT assume a fixed narrative arc. For each step explain why the clip "
-        "sits there, how it connects to the previous clip, and what it does for the pacing."
+        "Fetch their details and decide the order and each clip's importance. Then plan "
+        "the timeline: if my intent targets specific MOMENTS (a particular action/beat), "
+        "inspect the clips' temporal events with get_clip_events and call "
+        "plan_moment_timeline with the chosen event_ids in order (trims to the exact "
+        "moment); otherwise call plan_timeline (passing my editing-intent text so it can "
+        "detect any target duration). The timeline's structure, pacing and number of steps "
+        "are driven by my intent — do NOT assume a fixed narrative arc. For each step "
+        "explain why the clip sits there, how it connects to the previous clip, and what "
+        "it does for the pacing."
     )
     state = _base_state(project_id, {
         "messages": [HumanMessage(content=message)],

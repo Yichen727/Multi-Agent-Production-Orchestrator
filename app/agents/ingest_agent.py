@@ -33,14 +33,16 @@ from app.models.schemas import IngestResult
 from app.services.openai_service import llm, embed_texts
 from app.services.database_service import (
     db, replace_project_shots, get_catalogued_paths, get_catalogued_shots,
+    replace_project_events, get_catalogued_events,
 )
 from app.services.ffmpeg_service import (
     generate_proxy, get_video_duration, check_ffmpeg_installed,
     check_ffprobe_installed, probe_video_metadata, detect_scene_count,
     detect_scene_cut_times, choose_frame_count,
     extract_scene_representative_frames_b64, extract_sample_frames_b64,
+    build_event_windows, extract_frames_in_window_b64,
 )
-from app.services.vision_service import analyze_frames
+from app.services.vision_service import analyze_frames, analyze_event
 from app.utils.logger import get_logger
 
 logger = get_logger("ingest_agent")
@@ -233,6 +235,88 @@ def generate_proxy_for_file(file_path: str) -> str:
 # can't hang the agent or run up an unbounded API bill.
 _MAX_INGEST_FILES = 200
 
+# Temporal event extraction bounds (Tier 2). Each event window is a separate GPT-5.4
+# call, so the per-clip window count and the frames per window are both capped to keep
+# ingest cost/latency bounded on long or busy clips.
+_MAX_EVENTS_PER_CLIP = 12
+_FRAMES_PER_EVENT = 3
+
+
+# Columns copied verbatim when REUSING a previously-analysed clip's events (write
+# contract for replace_project_events, minus the ids it resolves itself).
+_EVENT_REUSE_COLUMNS = (
+    "file_path", "event_order", "start_seconds", "end_seconds", "duration_seconds",
+    "action", "state_change", "subjects", "keywords", "embedding",
+)
+
+
+def _event_semantic_text(action: str | None, state_change: str | None,
+                         keywords: str) -> str:
+    """Assemble the per-event text that gets embedded for moment-level search.
+
+    Combines the action sentence, the state change, and the event keywords. Returns ""
+    when there is nothing real to embed so no vector is stored (never an empty string).
+    """
+    parts = []
+    if action:
+        parts.append(action)
+    if state_change:
+        parts.append(state_change)
+    if keywords:
+        parts.append(keywords.replace(",", " "))
+    return ". ".join(parts).strip()
+
+
+def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> list[dict]:
+    """Extract ordered temporal events for one clip (the 'what happens' layer).
+
+    Segments the clip into event windows (scene cuts + long-scene sub-division), sends
+    several ordered frames per window to GPT-5.4, and returns event dicts ready for
+    ``replace_project_events`` — each with a real start/end, an action description, and
+    its own semantic embedding. Only windows the model actually described are kept; a
+    window that fails analysis is skipped rather than stored as a fabricated event.
+    """
+    windows = build_event_windows(duration, cut_times, max_events=_MAX_EVENTS_PER_CLIP)
+    if not windows:
+        return []
+    events: list[dict] = []
+    order = 0
+    for (start, end) in windows:
+        frames = extract_frames_in_window_b64(path, start, end, count=_FRAMES_PER_EVENT)
+        if not frames:
+            continue
+        tags = analyze_event(frames, start_seconds=start, end_seconds=end,
+                             clip_duration=duration)
+        if tags is None:
+            continue
+        kws = [k for k in (s.strip().lower() for s in tags.keywords) if k and k != "unknown"]
+        keywords = ",".join(dict.fromkeys(kws))
+        action = (tags.action or "").strip()
+        state_change = (tags.state_change or "").strip()
+        # Skip an empty event — the model saw the frames but reported nothing usable.
+        if not action and not keywords:
+            continue
+        order += 1
+        embedding = None
+        sem = _event_semantic_text(action, state_change, keywords)
+        if sem:
+            vecs = embed_texts([sem])
+            if vecs:
+                embedding = json.dumps(vecs[0])
+        events.append({
+            "file_path": path,
+            "event_order": order,
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "duration_seconds": round(max(0.0, end - start), 3),
+            "action": action or None,
+            "state_change": state_change or None,
+            "subjects": tags.subjects or [],
+            "keywords": keywords,
+            "embedding": embedding,
+        })
+    return events
+
 
 def _find_video_files(scan_dir: Path) -> tuple[list[Path], bool]:
     """Bounded, single-pass, symlink-safe walk for supported video files.
@@ -343,7 +427,7 @@ def _can_reuse(cached: dict, mtime: float | None, size: int | None) -> bool:
 @tool
 def ingest_footage(directory: str = None, project_id: int = 1,
                    analyze_content: bool = True, generate_proxies: bool = False,
-                   force_reanalyze: bool = False,
+                   analyze_events: bool = True, force_reanalyze: bool = False,
                    state: Annotated[dict, InjectedState] = None) -> str:
     """Run the ingest pipeline on a directory and (re)build the catalogue.
 
@@ -362,7 +446,11 @@ def ingest_footage(directory: str = None, project_id: int = 1,
       4. VISION TAGGING (if analyze_content) — GPT-5.4 watches sampled frames and
          returns a description, shot type, objects, searchable keywords, and an
          approximate people count.
-      5. (optional) PROXY generation for each clip.
+      5. TEMPORAL EVENT EXTRACTION (if analyze_events) — the clip is split into event
+         windows (scene cuts + long-scene sub-division) and GPT-5.4 describes WHAT
+         HAPPENS in each (action + change), stored as ordered ``clip_events`` with real
+         start/end timecodes and their own embeddings for moment-level search.
+      6. (optional) PROXY generation for each clip.
     The merged results (reused + freshly analysed) REPLACE the project's catalogue,
     so files deleted from disk drop out too.
 
@@ -375,6 +463,8 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         project_id: Project to (re)build the catalogue for.
         analyze_content: Run GPT-5.4 Vision tagging on sampled frames (default True).
         generate_proxies: Also generate a low-res proxy per clip (slow; default False).
+        analyze_events: Extract temporal 'what happens' events per clip (default True;
+            requires analyze_content / an API key — skipped otherwise).
         force_reanalyze: Ignore the cache and re-analyse every file (default False).
 
     Returns:
@@ -416,7 +506,11 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         return msg
 
     cache = {} if force_reanalyze else get_catalogued_shots(project_id)
+    events_cache = {} if force_reanalyze else get_catalogued_events(project_id)
     do_vision = analyze_content and bool(settings.OPENAI_API_KEY)
+    do_events = do_vision and analyze_events
+    all_events: list[dict] = []      # temporal events across all clips (reused + fresh)
+    clips_with_events = 0            # clips that carry at least one event
     rows: list[dict] = []
     orientation_counts = {"portrait": 0, "landscape": 0, "square": 0, "unknown": 0}
     unreadable = 0
@@ -450,6 +544,13 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             orientation_counts[row.get("orientation") or "unknown"] = (
                 orientation_counts.get(row.get("orientation") or "unknown", 0) + 1
             )
+            # Carry this clip's previously-extracted events forward unchanged (no new
+            # per-window GPT-5.4 calls), so a re-ingest keeps the temporal layer intact.
+            cached_events = events_cache.get(path) or []
+            if cached_events:
+                for ev in cached_events:
+                    all_events.append({c: ev.get(c) for c in _EVENT_REUSE_COLUMNS})
+                clips_with_events += 1
             continue
 
         # ── Analyse path: new or changed file ──────────────────────────────────
@@ -556,7 +657,18 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             "audio_bit_depth": meta.get("audio_bit_depth"),
         })
 
+        # Temporal event extraction — the 'what happens' layer. Runs only on readable
+        # clips with a known duration; degrades to no events (never fabricated) otherwise.
+        if do_events and meta["ok"] and meta["duration_seconds"] > 0:
+            clip_events = _build_clip_events(path, meta["duration_seconds"], cut_times)
+            if clip_events:
+                all_events.extend(clip_events)
+                clips_with_events += 1
+
     count = replace_project_shots(project_id, rows)
+    # Persist the temporal events AFTER the shots exist (they resolve their shot_id from
+    # the freshly written shots; replace_project_shots cascade-cleared the old events).
+    events_indexed = replace_project_events(project_id, all_events)
     analysed = count - reused
     logger.info(f"Ingested {count} file(s) into project {project_id} from {scan_dir} "
                 f"({reused} reused, {analysed} analysed, {unreadable} unreadable)")
@@ -597,6 +709,11 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             f"{even_sampled} via adaptive even sampling; "
             f"{frames_sent} frame(s) sent to the vision model."
         )
+    if do_events:
+        summary += (
+            f"\nTemporal events — extracted {events_indexed} 'what happens' event(s) "
+            f"across {clips_with_events} clip(s) for moment-level search."
+        )
     elif analyze_content:
         summary += "\nVision tagging skipped (no OPENAI_API_KEY)."
     else:
@@ -610,8 +727,8 @@ def ingest_footage(directory: str = None, project_id: int = 1,
 
     _record_ingest_result(IngestResult(
         status=status, project_id=project_id, indexed_count=count,
-        reused_count=reused, unreadable_count=unreadable, truncated=False,
-        message=headline, warnings=warnings,
+        reused_count=reused, unreadable_count=unreadable, event_count=events_indexed,
+        truncated=False, message=headline, warnings=warnings,
     ))
     return summary
 

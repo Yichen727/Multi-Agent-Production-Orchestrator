@@ -67,6 +67,12 @@ def _format_candidates(candidates: list[dict]) -> str:
         rel = c.get("relevance")
         rel_str = f" — relevance {rel*100:.0f}%" if rel is not None else ""
         lines.append(f"  {i}. {mark} {name} — {', '.join(bits)}{rel_str}")
+        # Event-aware recall: when a MOMENT inside the clip drove the match, note it as
+        # context (the result is still the whole clip — Selection decides the cut).
+        ev = c.get("matched_event")
+        if ev and ev.get("action"):
+            lines.append(f"      ↳ contains: {ev['action']} "
+                         f"(~{ev.get('start_seconds', 0):.0f}-{ev.get('end_seconds', 0):.0f}s)")
     return "\n".join(lines)
 
 
@@ -130,10 +136,17 @@ search_tool_node = ToolNode(search_tools)
 SEARCH_PROMPT = """You are the SEARCH AGENT in the MAPO system.
 Your role: RETRIEVE candidate clips from the catalogue that match a query.
 
-You have ONE search tool: `search_catalogue`. You do NOT choose between many tools —
-you translate the user's request into a STRUCTURED query and call it once (use
-`list_all_shots` only for an "all clips" / ground-truth check). Report ONLY what the
-tool returns. The catalogue is the single source of truth.
+You retrieve CLIPS (whole files), never moments or timecodes. Deciding WHICH MOMENT of a
+clip to use is the Selection stage's job, not yours — you help the editor browse and
+shortlist footage. You translate the user's request into a STRUCTURED query and call
+`search_catalogue` once (use `list_all_shots` only for an "all clips" / ground-truth
+check). Report ONLY what the tool returns. The catalogue is the single source of truth.
+
+`search_catalogue` recall is EVENT-AWARE under the hood: a clip is returned when its
+overall content OR a specific moment inside it matches your query, so a query like
+"celebration" finds a clip even if only one beat of it is celebratory. When a moment drove
+the match, the result carries a "contains: ..." note — relay it as CONTEXT, but the unit
+you return is always the whole clip.
 
 HOW TO BUILD THE QUERY:
 - Put the semantic idea (subjects, actions, mood, scenery) into `keywords`.

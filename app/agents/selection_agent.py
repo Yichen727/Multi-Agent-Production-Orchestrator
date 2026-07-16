@@ -30,10 +30,14 @@ from sqlalchemy import text as _sql
 
 from app.models.state import ProductionState
 from app.services.openai_service import llm
-from app.services.database_service import db
+from app.services.database_service import (
+    db, get_catalogued_events, get_events_by_ids,
+)
 from app.services.catalogue_resolver import resolve_ordered
 from app.services.retrieval_service import group_size
-from app.services.timeline_service import parse_target_duration, plan_segments
+from app.services.timeline_service import (
+    parse_target_duration, plan_segments, plan_event_segments,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger("selection_agent")
@@ -207,6 +211,112 @@ def plan_timeline(ordered_identifiers: str, importance: str = None,
 
 
 @tool
+def get_clip_events(identifiers: str,
+                    state: Annotated[dict, InjectedState] = None) -> str:
+    """List the temporal EVENTS (what happens, with timecodes) inside curated clips.
+
+    Use this to see the ordered moments within the editor's curated clips — each event's
+    in/out timecodes, the action, and its keywords — so you can build a MOMENT-precise
+    timeline (e.g. keep only "the goal" from a long clip) rather than trimming by
+    head/tail seconds. Resolution is scoped to the current project.
+
+    Args:
+        identifiers: Comma-separated shot IDs and/or file names/paths for the clips whose
+            events you want to inspect.
+
+    Returns:
+        For each resolved clip, its ordered events as ``event_id · start–end · action``,
+        so you can pass the chosen event_ids IN ORDER to `plan_moment_timeline`.
+    """
+    project_id = _pid_from_state(state)
+    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
+    rows, problems = resolve_ordered(project_id, tokens)
+    if not rows:
+        return "No matching catalogued clips for those identifiers in this project."
+    events_by_file = get_catalogued_events(project_id)
+    lines = []
+    for r in rows:
+        fp = r.get("file_path")
+        name = fp.split("/")[-1].split("\\")[-1] if fp else "?"
+        evs = events_by_file.get(fp) or []
+        if not evs:
+            lines.append(f"{name}: no temporal events extracted (clip not event-analysed).")
+            continue
+        lines.append(f"{name} (shot_id {r.get('shot_id')}) — {len(evs)} event(s):")
+        for e in evs:
+            action = (e.get("action") or e.get("keywords") or "").strip()
+            lines.append(f"  • event {e.get('event_id')}: "
+                         f"{e.get('start_seconds', 0):.1f}s–{e.get('end_seconds', 0):.1f}s "
+                         f"— {action}")
+    if problems:
+        lines.append("\nCould not resolve (nothing fabricated):")
+        lines += [f"  • {t}: {r}" for t, r in problems]
+    return "\n".join(lines)
+
+
+@tool
+def plan_moment_timeline(ordered_event_ids: str,
+                         state: Annotated[dict, InjectedState] = None) -> str:
+    """Build a MOMENT-precise timeline from ordered temporal events (segments for Delivery).
+
+    The event-based counterpart to `plan_timeline`: instead of trimming clips by
+    head/tail seconds or a proportional allocation, each segment is trimmed to an EVENT's
+    own measured in/out timecodes — so the edit cuts to the exact moment the action
+    happens. Get the event_ids from `get_clip_events` (or the Search stage's
+    `search_moments`).
+
+    Args:
+        ordered_event_ids: Comma-separated event IDs IN TIMELINE ORDER (first = step 1).
+            This exact order is preserved — never re-sorted. Each id must belong to the
+            current project.
+
+    Returns:
+        A readable step list plus a fenced ```json block with the structured plan
+        (mode 'events', per-segment in/out timecodes) that Delivery compiles verbatim.
+    """
+    project_id = _pid_from_state(state)
+    raw = [t.strip() for t in (ordered_event_ids or "").split(",") if t.strip()]
+    ids: list[int] = []
+    bad: list[str] = []
+    for t in raw:
+        try:
+            ids.append(int(t))
+        except ValueError:
+            bad.append(t)
+    if bad:
+        return ("Cannot plan — these are not valid event IDs (use get_clip_events to find "
+                "them): " + ", ".join(bad))
+    if not ids:
+        return "No event IDs given — nothing to plan."
+
+    found = get_events_by_ids(project_id, ids)
+    missing = [i for i in ids if i not in found]
+    if missing:
+        # Never silently drop an unknown/other-project event — the order IS the edit.
+        return ("Cannot plan the timeline — these event IDs are not in this project "
+                "(nothing was fabricated or dropped): "
+                + ", ".join(str(m) for m in missing))
+
+    ordered_events = [found[i] for i in ids]   # preserve the caller's exact order
+    plan = plan_event_segments(ordered_events)
+
+    lines = [f"🎬 Timeline plan — EVENTS MODE ({plan['total_seconds']:g}s total, "
+             f"trimmed to {len(plan['segments'])} moment(s))", ""]
+    for s in plan["segments"]:
+        lines.append(
+            f"  {s['order']}. {s['name']} — {s['in_point']:.1f}s–{s['out_point']:.1f}s "
+            f"({s['duration']:.1f}s)"
+            + (f" · {s['label']}" if s.get("label") else ""))
+    if not plan.get("valid", True):
+        bad_segs = plan.get("validation_errors", [])
+        lines += ["", (f"⛔ {len(bad_segs)} segment(s) are INVALID and will block export "
+                       "— fix or drop them:")]
+        lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad_segs]
+    lines += ["", "```json", json.dumps(plan), "```"]
+    return "\n".join(lines)
+
+
+@tool
 def generate_delivery_summary(
         state: Annotated[dict, InjectedState] = None) -> str:
     """Generate a text summary of the current project for delivery handoff.
@@ -236,7 +346,9 @@ Status: Ready for review
 
 selection_tools = [
     get_candidate_details,
+    get_clip_events,
     plan_timeline,
+    plan_moment_timeline,
     generate_delivery_summary,
 ]
 
@@ -296,6 +408,15 @@ WORKFLOW:
    Optional free-form step labels ("cold open", "hero moment", "outro") may help the
    editor, but are never a required fixed set.
 
+   MOMENT-PRECISE ALTERNATIVE (event-based) — when the edit is about specific MOMENTS
+   inside clips (keep only "the goal", "the celebration", "the entrance"), not whole
+   clips: call `get_clip_events` on the curated clips to see each clip's ordered events
+   (with in/out timecodes and actions), then call `plan_moment_timeline` with the chosen
+   event_ids IN ORDER. This trims each segment to the EXACT event boundary rather than by
+   head/tail seconds. Use `plan_timeline` for whole-clip / head-tail / timed edits, and
+   `plan_moment_timeline` for moment-precise edits. Both produce the same structured plan
+   that Delivery compiles verbatim.
+
 ANTI-HALLUCINATION: only ever place clips that a tool actually returned in this
 conversation. NEVER invent file names, shot IDs, durations, or metadata — the real
 lengths and trims come only from `plan_timeline`. When an attribute is
@@ -304,7 +425,7 @@ guessing the missing field. If no candidates resolve, say so instead of fabricat
 
 OUTPUT FORMAT — an ordered edit timeline, NOT a score ranking. For EVERY step explain
 (a) why the clip sits at this position, (b) how it connects to the previous clip, and
-(c) what it does for the overall pacing/rhythm:
+(c) what it does for the overall pacing/rhythm: 
 
     🎬 Proposed Edit Timeline — <your one-line read of the intent + the structure chosen>
 

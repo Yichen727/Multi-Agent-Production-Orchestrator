@@ -8,6 +8,7 @@ the database is empty, so a real ingest is never clobbered by the demo data on t
 launch. Tests point ``METADATA_DB_PATH`` at ``:memory:`` for isolation.
 """
 
+import json
 import sqlite3
 from pathlib import Path
 from sqlalchemy import create_engine, text as sql_text
@@ -72,6 +73,34 @@ _SCHEMA_DDL = """
         CREATE INDEX IF NOT EXISTS idx_shots_orientation ON shots(orientation);
         CREATE INDEX IF NOT EXISTS idx_shots_shot_type ON shots(shot_type);
         CREATE INDEX IF NOT EXISTS idx_shots_duration ON shots(duration_seconds);
+
+        -- Temporal event-based ingestion (Tier 2): one shots row (a physical file) has
+        -- MANY clip_events rows — the ordered "what happens" segments inside it, each with
+        -- a real start/end (from FFmpeg scene boundaries) and its own semantic embedding.
+        -- ON DELETE CASCADE means replace_project_shots' DELETE of a project's shots also
+        -- clears its events (foreign_keys=ON would otherwise reject the delete); ingest
+        -- re-inserts the events (reused + freshly analysed) right after.
+        CREATE TABLE IF NOT EXISTS clip_events (
+            event_id INTEGER PRIMARY KEY,
+            project_id INTEGER,
+            shot_id INTEGER,
+            file_path TEXT NOT NULL,
+            event_order INTEGER,
+            start_seconds REAL,
+            end_seconds REAL,
+            duration_seconds REAL,
+            action TEXT,
+            state_change TEXT,
+            subjects TEXT,
+            keywords TEXT,
+            embedding TEXT,
+            FOREIGN KEY (shot_id) REFERENCES shots(shot_id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id) REFERENCES projects(project_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_project ON clip_events(project_id);
+        CREATE INDEX IF NOT EXISTS idx_events_shot ON clip_events(shot_id);
+        CREATE INDEX IF NOT EXISTS idx_events_file ON clip_events(file_path);
 
         CREATE TABLE IF NOT EXISTS quality_assessments (
             assessment_id INTEGER PRIMARY KEY,
@@ -306,3 +335,115 @@ def get_catalogued_shots(project_id: int) -> dict:
             {"pid": project_id},
         )
         return {row._mapping["file_path"]: dict(row._mapping) for row in result}
+
+
+# ── Temporal events (Tier 2: event-based ingestion) ────────────────────────────
+
+# Columns accepted by replace_project_events, in the order the table expects. shot_id is
+# resolved from the (project_id, file_path) of the freshly written shots, so callers pass
+# file_path and need not know the autoincremented id.
+_EVENT_COLUMNS = (
+    "project_id", "shot_id", "file_path", "event_order",
+    "start_seconds", "end_seconds", "duration_seconds",
+    "action", "state_change", "subjects", "keywords", "embedding",
+)
+
+
+def replace_project_events(project_id: int, events: list[dict]) -> int:
+    """Replace the temporal events for a project with a freshly built set.
+
+    Each event dict carries a ``file_path`` (its parent clip); the parent ``shot_id`` is
+    looked up from the shots table for this project at write time, so events stay linked
+    even though ``replace_project_shots`` reassigns shot ids on every rebuild. Call this
+    AFTER ``replace_project_shots`` (which cascade-deletes the old events). Events whose
+    file has no catalogued shot are skipped rather than orphaned.
+
+    Args:
+        project_id: Project whose events are being (re)built.
+        events: Ordered event dicts (keys a subset of ``_EVENT_COLUMNS`` minus the
+            resolved ``shot_id``); ``subjects`` may be a list (stored as JSON text).
+
+    Returns:
+        The number of event rows inserted.
+    """
+    from sqlalchemy import text as _sql
+
+    placeholders = ", ".join(f":{c}" for c in _EVENT_COLUMNS)
+    columns = ", ".join(_EVENT_COLUMNS)
+    insert_sql = _sql(f"INSERT INTO clip_events ({columns}) VALUES ({placeholders})")
+
+    with _engine.begin() as conn:
+        shot_ids = {
+            row._mapping["file_path"]: row._mapping["shot_id"]
+            for row in conn.execute(
+                _sql("SELECT shot_id, file_path FROM shots WHERE project_id = :pid"),
+                {"pid": project_id},
+            )
+        }
+        # Cascade may already have cleared these when shots were replaced; make the
+        # rebuild idempotent regardless of call order.
+        conn.execute(_sql("DELETE FROM clip_events WHERE project_id = :pid"),
+                     {"pid": project_id})
+        inserted = 0
+        for ev in events:
+            fp = ev.get("file_path")
+            sid = shot_ids.get(fp)
+            if sid is None:
+                continue  # no parent shot for this file — never orphan an event
+            params = {c: ev.get(c) for c in _EVENT_COLUMNS}
+            params["project_id"] = project_id
+            params["shot_id"] = sid
+            subj = params.get("subjects")
+            if isinstance(subj, (list, tuple)):
+                params["subjects"] = json.dumps(list(subj))
+            conn.execute(insert_sql, params)
+            inserted += 1
+
+    return inserted
+
+
+def get_events_by_ids(project_id: int, event_ids: list[int]) -> dict:
+    """Return events (by id) for a project, keyed by event_id, with source duration.
+
+    Scoped to ``project_id`` so an event id can never resolve across projects. Each value
+    carries the event fields plus the parent clip's ``source_duration`` (for in/out
+    range validation). Ids not found simply do not appear in the result.
+    """
+    from sqlalchemy import text as _sql
+
+    if not event_ids:
+        return {}
+    ids = [int(i) for i in event_ids]
+    placeholders = ", ".join(f":id{i}" for i in range(len(ids)))
+    params = {f"id{i}": v for i, v in enumerate(ids)}
+    params["pid"] = project_id
+    with _engine.begin() as conn:
+        result = conn.execute(
+            _sql(f"SELECT e.*, s.duration_seconds AS source_duration "
+                 f"FROM clip_events e JOIN shots s ON s.shot_id = e.shot_id "
+                 f"WHERE e.project_id = :pid AND e.event_id IN ({placeholders})"),
+            params,
+        )
+        return {row._mapping["event_id"]: dict(row._mapping) for row in result}
+
+
+def get_catalogued_events(project_id: int) -> dict:
+    """Return existing events for a project, grouped by parent file path.
+
+    Each value is the ordered list of that clip's event dicts. The Ingest Agent uses
+    this to REUSE events for unchanged clips (skipping the per-segment GPT-5.4 calls),
+    mirroring how ``get_catalogued_shots`` lets it reuse clip-level analysis.
+    """
+    from sqlalchemy import text as _sql
+
+    grouped: dict[str, list[dict]] = {}
+    with _engine.begin() as conn:
+        result = conn.execute(
+            _sql("SELECT * FROM clip_events WHERE project_id = :pid "
+                 "ORDER BY file_path, event_order"),
+            {"pid": project_id},
+        )
+        for row in result:
+            d = dict(row._mapping)
+            grouped.setdefault(d["file_path"], []).append(d)
+    return grouped
