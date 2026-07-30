@@ -22,6 +22,7 @@ fields no agent wrote, and the UI never resumed it), so it has been removed rath
 left as a misleading no-op.
 """
 
+import hashlib
 import json
 import re
 
@@ -51,6 +52,7 @@ from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
 )
 from app.services.retrieval_service import hybrid_search, expand_query, hoist_orientation
+from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger("orchestrator")
@@ -132,6 +134,15 @@ def _pid(project_id) -> int:
         return project_id
 
 
+def _qhash(query: str) -> str:
+    """A stable short digest of a query, so each distinct search gets its OWN agent thread.
+
+    Repeated identical queries reuse one checkpoint thread; different queries stay isolated,
+    so one search's message history cannot bleed into the next (the Search stage is
+    stateless per query, unlike the once-per-session Ingest/Selection/Delivery stages)."""
+    return hashlib.md5((query or "").encode("utf-8")).hexdigest()[:8]
+
+
 # Timeline-planning tools whose ToolMessage carries the structured plan Delivery consumes.
 # Both the clip-level planner and the event/moment-precise planner emit the same fenced
 # ```json plan shape, so the extractor accepts either (audit H-03).
@@ -163,6 +174,36 @@ def _extract_plan(messages) -> dict | None:
     return None
 
 
+# Search tools whose ToolMessage carries the structured candidate list the UI renders.
+_SEARCH_TOOLS = (None, "search_catalogue", "list_all_shots")
+
+
+def _extract_candidates(messages) -> list[dict] | None:
+    """Pull the structured candidate list from the search TOOL output.
+
+    Mirrors ``_extract_plan``: reads the fenced ```json array the ``search_catalogue`` /
+    ``list_all_shots`` ToolMessage carries (the tool's OWN output, which the model cannot
+    rewrite), so the model reformatting its narration can never corrupt or hide the
+    candidates the UI renders. Returns the most recent list (possibly empty, when the
+    search genuinely matched nothing), or ``None`` when the agent never ran a search tool —
+    in which case ``run_search`` falls back to deterministic direct retrieval.
+    """
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) not in _SEARCH_TOOLS:
+            continue
+        content = m.content if isinstance(m.content, str) else ""
+        for match in re.findall(r"```json\s*(\[.*?\])\s*```", content, re.DOTALL):
+            try:
+                obj = json.loads(match)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, list):
+                return obj
+    return None
+
+
 # ── The four pipeline stages (the ONE real orchestration path) ─────────────────
 
 
@@ -184,21 +225,51 @@ def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
     return result["messages"][-1].content, get_last_ingest_result()
 
 
-def run_search(query: str, project_id) -> list[dict]:
-    """② Search — hybrid retrieval (retrieval only), the same path the Search agent uses.
+def _search_direct(query: str, project_id) -> list[dict]:
+    """Deterministic retrieval — query understanding (orientation hoist + synonym
+    expansion) feeding ``hybrid_search`` directly, with no LLM agent in the loop.
 
-    Runs the query through the shared query understanding (orientation hoist + synonym
-    expansion) and ``hybrid_search`` so the UI's direct search and the Search Agent's
-    tool behave identically. Retrieval is CLIP-level: the returned unit is always a whole
-    clip (choosing a moment within it is Selection's job). Recall is event-aware inside
-    ``hybrid_search`` — a clip surfaces when a moment inside it matches — but that only
-    ranks clips and attaches a ``matched_event`` hint; it never returns a moment.
-    Never ranks a "best" clip.
+    This is the fallback the Search stage uses when the Search Agent is unavailable
+    (no API key), errors, or completes a turn without actually searching — so the UI
+    always receives candidates.
     """
     residual, orientation = hoist_orientation(query, None)
     expanded = expand_query(residual) if residual and residual.strip() else None
     return hybrid_search(_pid(project_id), keywords=expanded or None,
                          orientation=orientation)
+
+
+def run_search(query: str, project_id, user_id="editor") -> list[dict]:
+    """② Search — invoke the Search sub-agent to retrieve candidate clips.
+
+    The Search Agent translates the natural-language query into a structured
+    ``search_catalogue`` call; the structured candidate list is read back from that tool's
+    ToolMessage (via ``_extract_candidates``), NOT from the model's prose, so the UI
+    receives the exact ``hybrid_search`` rows it renders. Retrieval stays CLIP-level: the
+    returned unit is always a whole clip (choosing a moment within it is Selection's job).
+    Recall is event-aware inside ``hybrid_search`` — a clip surfaces when a moment inside
+    it matches, attached as a ``matched_event`` hint — but it never returns a moment and
+    never ranks a "best" clip.
+
+    Degrades gracefully (audit-consistent with the rest of the system): with no API key,
+    an agent error, or an agent turn that never searched, it falls back to the
+    deterministic ``_search_direct`` path so the UI always gets results.
+    """
+    if settings.OPENAI_API_KEY:
+        try:
+            config = {"configurable": {
+                "thread_id": f"mapo-search-{user_id}-{project_id}-{_qhash(query)}",
+                "user_id": user_id,
+            }}
+            state = _base_state(project_id, {"messages": [HumanMessage(content=query)]})
+            result = search_agent.invoke(state, config=config)
+            candidates = _extract_candidates(result["messages"])
+            if candidates is not None:
+                return candidates
+            logger.warning("Search agent produced no structured result; using direct search.")
+        except Exception as e:  # keep the UI responsive on any agent/LLM failure
+            logger.warning(f"Search agent failed ({e}); using direct search.")
+    return _search_direct(query, project_id)
 
 
 def run_selection(intent: str, selected_paths: list[str],

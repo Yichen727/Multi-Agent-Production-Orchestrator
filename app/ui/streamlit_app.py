@@ -115,15 +115,16 @@ def load_bin(project_id):
     st.session_state.bin_shots = hybrid_search(_pid(project_id), top_k=1000)
 
 
-def do_search(query: str, project_id: str):
+def do_search(query: str, project_id: str, user_id: str):
     """② Search — rank/mark matching CLIPS via the orchestrator's Search stage.
 
-    Delegates to ``run_search`` (the same query understanding + event-aware clip recall
-    the Search Agent uses), then marks 🟡 suggested / ⚪ neutral clips in the Bin. The unit
-    is always the whole clip; a match driven by a moment inside a clip carries a
-    ``matched_event`` hint shown as the card's reason. Never touches selection.
+    Delegates to ``run_search``, which invokes the Search Agent (falling back to direct
+    hybrid retrieval when the LLM is unavailable), then marks 🟡 suggested / ⚪ neutral
+    clips in the Bin. The unit is always the whole clip; a match driven by a moment inside
+    a clip carries a ``matched_event`` hint shown as the card's reason. Never touches
+    selection.
     """
-    candidates = _orch().run_search(query, project_id)
+    candidates = _orch().run_search(query, project_id, user_id)
     st.session_state.suggested = {
         c["file_path"]: c.get("relevance")
         for c in candidates if c.get("suggestion") in ("suggested", "neutral")
@@ -380,7 +381,7 @@ def main():
     with s1:
         if st.button("🔍 Search", use_container_width=True, disabled=locked):
             if search_text.strip():
-                do_search(search_text, project_id)
+                do_search(search_text, project_id, user_id)
             else:
                 st.warning("Enter a search query first.")
     with s2:

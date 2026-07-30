@@ -10,6 +10,7 @@ The LLM's only job here is to translate the user's request into a STRUCTURED que
 (keywords + optional filters); it no longer picks between many tools.
 """
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -76,6 +77,19 @@ def _format_candidates(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _render(candidates: list[dict]) -> str:
+    """Return the readable candidate list for the LLM PLUS a machine-readable JSON block.
+
+    The fenced ```json array carries the exact ``hybrid_search`` rows. The orchestrator
+    reads the candidates back from THIS tool output (via ``_extract_candidates``), not from
+    the model's prose — so the UI receives the real structured candidates (relevance,
+    suggestion, matched_event, ...) it renders, and the model reformatting its narration
+    can never corrupt them. Mirrors how ``plan_timeline`` emits its structured plan.
+    """
+    text = _format_candidates(candidates)
+    return text + "\n\n```json\n" + json.dumps(candidates, default=str) + "\n```"
+
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 
 
@@ -110,7 +124,7 @@ def search_catalogue(keywords: str = None, shot_type: str = None,
         orientation=orientation, people=people,
         min_duration=min_duration, max_duration=max_duration,
     )
-    return _format_candidates(candidates)
+    return _render(candidates)
 
 
 @tool
@@ -120,7 +134,7 @@ def list_all_shots(state: Annotated[dict, InjectedState] = None) -> str:
     Useful when the query asks for "all clips" or to see exactly what is catalogued.
     Scoped to the current project.
     """
-    return _format_candidates(hybrid_search(_pid_from_state(state), top_k=200))
+    return _render(hybrid_search(_pid_from_state(state), top_k=200))
 
 
 # ── Agent Assembly ───────────────────────────────────────────────────────────
