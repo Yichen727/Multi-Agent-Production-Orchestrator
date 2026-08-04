@@ -150,41 +150,52 @@ def probe_video_metadata(input_path: str) -> dict:
             "has_audio": has_audio, "ok": True, **audio_meta}
 
 
-def detect_scene_cut_times(input_path: str, threshold: float = 0.4,
-                           timeout: int = 120) -> list[float]:
-    """Detect the TIMESTAMPS (seconds) of shot/scene cuts using FFmpeg.
+# ── Scene / shot-boundary detection ───────────────────────────────────────────
+#
+# Scene detection decodes EVERY frame, and measured on this project's 1080p footage the
+# DECODE is ~97% of the wall clock (2.50s of a 2.54s run on a 95s clip); the scene filter
+# itself costs +0.04s. Two consequences worth recording, because both are counter-intuitive:
+#
+#  * Pre-scaling the frames (scale=320 before the scene filter) does NOT speed this up —
+#    it was measured 15-25% SLOWER, since swscale runs per decoded frame and there was no
+#    filter cost to save. It also changed none of the detected cuts. Don't reintroduce it.
+#  * Throughput is ~30-44x realtime at 1080p here, so the old flat 120s cap was generous
+#    for short clips. It only bit on genuinely long or high-resolution sources (4K runs
+#    roughly 4x slower per frame), where it truncated the scan — see detect_scene_cuts.
+#
+# So the timeout scales with the source duration rather than being a flat 120s, and a
+# truncated scan now keeps what it found instead of discarding it.
+_SCENE_TIMEOUT_BASE = 60.0        # slack for process start-up / container parsing
+_SCENE_TIMEOUT_PER_SECOND = 0.5   # extra budget per second of source (very conservative)
+_SCENE_TIMEOUT_MAX = 900.0        # never let one clip hold ingest longer than this
 
-    Runs the ``select='gt(scene,threshold)',showinfo`` filter and parses the
-    ``pts_time:`` of every selected (cut) frame out of stderr. This is real (if
-    coarse) shot-boundary detection — no content is fabricated. The timestamps
-    let ingest sample one representative frame per detected scene instead of a
-    fixed set of evenly-spaced frames.
 
-    Args:
-        input_path: Path to the video file.
-        threshold: Scene-change sensitivity (0-1; higher = fewer cuts).
-        timeout: Hard cap in seconds so a long clip can't hang ingest.
+def scene_detection_timeout(duration_seconds: float | None) -> int:
+    """Pick a scene-detection timeout (seconds) proportional to the source length.
 
-    Returns:
-        Sorted list of cut timestamps in seconds. Empty when FFmpeg is
-        unavailable, detection failed, or no cuts were found.
+    A flat cap is wrong in both directions: too tight for a long clip (the scan gets
+    killed mid-way) and needlessly loose for a 5-second one. Falls back to a fixed
+    budget when the duration is unknown.
     """
-    if not check_ffmpeg_installed():
-        return []
-    cmd = [
-        "ffmpeg", "-hide_banner", "-nostats",
-        "-i", str(input_path),
-        "-filter:v", f"select='gt(scene,{threshold})',showinfo",
-        "-an", "-f", "null", "-",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except (subprocess.SubprocessError, OSError) as e:
-        logger.error(f"Scene detection failed for {input_path}: {e}")
-        return []
-    # showinfo prints one line per selected (cut) frame, each with 'pts_time:<sec>'.
+    if not duration_seconds or duration_seconds <= 0:
+        return int(_SCENE_TIMEOUT_BASE * 2)
+    budget = _SCENE_TIMEOUT_BASE + float(duration_seconds) * _SCENE_TIMEOUT_PER_SECOND
+    return int(max(_SCENE_TIMEOUT_BASE, min(budget, _SCENE_TIMEOUT_MAX)))
+
+
+def _decode_stream(value) -> str:
+    """Coerce captured subprocess output (str | bytes | None) to str."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _parse_cut_times(stderr: str) -> list[float]:
+    """Parse ``showinfo``'s ``pts_time:<sec>`` lines into sorted cut timestamps."""
     times: list[float] = []
-    for m in re.finditer(r"pts_time:([0-9]+\.?[0-9]*)", result.stderr):
+    for m in re.finditer(r"pts_time:([0-9]+\.?[0-9]*)", stderr or ""):
         try:
             times.append(float(m.group(1)))
         except ValueError:
@@ -192,31 +203,122 @@ def detect_scene_cut_times(input_path: str, threshold: float = 0.4,
     return sorted(times)
 
 
-def detect_scene_count(input_path: str, threshold: float = 0.4,
-                       timeout: int = 120) -> int:
-    """Count shot/scene cuts in a clip (compatibility wrapper).
+def detect_scene_cuts(input_path: str, threshold: float = 0.4,
+                      timeout: int | None = None,
+                      duration_seconds: float | None = None) -> dict:
+    """Detect shot/scene cuts, reporting whether the scan actually COMPLETED.
 
-    Backed by :func:`detect_scene_cut_times`; the number of distinct shots is
-    cuts + 1. Kept for callers that only need the count.
+    Runs the ``select='gt(scene,threshold)',showinfo`` filter and parses the ``pts_time:``
+    of every selected (cut) frame. This is real (if coarse) shot-boundary detection — no
+    content is fabricated.
+
+    A timed-out scan KEEPS the cuts it already found (they are real measurements) and
+    flags itself incomplete, rather than discarding them and reporting "no cuts" — the
+    latter used to make a long clip look like a single continuous shot.
 
     Args:
         input_path: Path to the video file.
         threshold: Scene-change sensitivity (0-1; higher = fewer cuts).
-        timeout: Hard cap in seconds so a long clip can't hang ingest.
+        timeout: Hard cap in seconds. ``None`` derives one from ``duration_seconds``.
+        duration_seconds: Source duration, used to size the timeout.
+
+    Returns:
+        Dict with keys:
+          ``ran`` — detection produced usable output (False if FFmpeg is missing, the file
+            is unreadable, or it errored before finding anything);
+          ``complete`` — the whole clip was scanned (False on timeout or a mid-file error);
+          ``cut_times`` — sorted cut timestamps in seconds (possibly partial);
+          ``scene_count`` — distinct shots, ``len(cut_times) + 1``; 0 when not ``ran``,
+            and a LOWER BOUND when ``complete`` is False.
+
+    On an incomplete scan the cuts are trustworthy up to ``max(cut_times)``; nothing is
+    known about the clip beyond that point.
+    """
+    blank = {"ran": False, "complete": False, "cut_times": [], "scene_count": 0}
+    if not check_ffmpeg_installed():
+        return blank
+
+    limit = int(timeout) if timeout else scene_detection_timeout(duration_seconds)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(input_path),
+        "-map", "0:v:0",   # first video stream only (skip cover art / extra streams)
+        "-filter:v", f"select='gt(scene,{threshold})',showinfo",
+        "-an", "-sn", "-dn", "-f", "null", "-",
+    ]
+    # NOTE: don't add "-progress pipe:1" hoping to learn how far the scan got. `select`
+    # only forwards the frames it PICKS, so the reported out_time is the timestamp of the
+    # last detected cut, not of the last decoded frame — it measures nothing new (measured,
+    # not assumed: a fully scanned 95.4s clip reported out_time 88.88s == its last cut).
+
+    complete = True
+    returncode = 0
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+        stderr, returncode = result.stderr, result.returncode
+    except subprocess.TimeoutExpired as e:
+        # e.stderr holds everything FFmpeg printed before the kill. Returning [] here (the
+        # old behaviour) threw away a scan that may have been 95% finished, and the clip
+        # was then catalogued as a single continuous shot.
+        stderr, complete = _decode_stream(e.stderr), False
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.error(f"Scene detection failed for {input_path}: {e}")
+        return blank
+
+    cut_times = _parse_cut_times(stderr)
+
+    if returncode != 0:
+        # Distinguish "never got going" (bad path, no video stream) from "died part-way
+        # through a real file" — the latter's cuts are genuine measurements worth keeping.
+        if not cut_times:
+            logger.error(f"Scene detection failed for {input_path} "
+                         f"(ffmpeg exit {returncode}): {(stderr or '').strip()[-300:]}")
+            return blank
+        complete = False
+        logger.warning(f"Scene detection ended early for {input_path} (ffmpeg exit "
+                       f"{returncode}); keeping the {len(cut_times)} cut(s) found.")
+    elif not complete:
+        covered = f"up to {max(cut_times):.1f}s" if cut_times else "no cuts yet"
+        logger.warning(
+            f"Scene detection timed out after {limit}s for {input_path} ({covered}). "
+            f"Keeping the {len(cut_times)} cut(s) found so far; the rest of the clip is "
+            "unanalysed, so the scene count is a lower bound."
+        )
+
+    # No cuts but FFmpeg ran fine → the clip is a single continuous shot.
+    return {"ran": True, "complete": complete, "cut_times": cut_times,
+            "scene_count": len(cut_times) + 1 if cut_times else 1}
+
+
+def detect_scene_cut_times(input_path: str, threshold: float = 0.4,
+                           timeout: int | None = None,
+                           duration_seconds: float | None = None) -> list[float]:
+    """Detect the TIMESTAMPS (seconds) of shot/scene cuts (thin wrapper).
+
+    Returns just the cut list from :func:`detect_scene_cuts`. Prefer that function when
+    you also need to know whether the scan completed — an empty list here is ambiguous
+    (no cuts, FFmpeg missing, or a failure).
+
+    Returns:
+        Sorted list of cut timestamps in seconds, possibly partial on timeout.
+    """
+    return detect_scene_cuts(input_path, threshold, timeout, duration_seconds)["cut_times"]
+
+
+def detect_scene_count(input_path: str, threshold: float = 0.4,
+                       timeout: int | None = None,
+                       duration_seconds: float | None = None) -> int:
+    """Count shot/scenes in a clip (compatibility wrapper).
 
     Returns:
         Estimated number of shots (>= 1) when detection ran, or 0 if FFmpeg is
-        unavailable.
+        unavailable / detection failed. A timed-out scan yields a LOWER BOUND.
     """
-    if not check_ffmpeg_installed():
-        return 0
-    cuts = detect_scene_cut_times(input_path, threshold, timeout)
-    # No cuts but FFmpeg ran fine → the clip is a single continuous shot.
-    return len(cuts) + 1 if cuts else 1
+    return detect_scene_cuts(input_path, threshold, timeout, duration_seconds)["scene_count"]
 
 
 def choose_frame_count(duration_seconds: float, scene_count: int = None,
-                       min_frames: int = 3, max_frames: int = 12) -> int:
+                       min_frames: int = 3, max_frames: int = 24) -> int:
     """Pick how many frames to sample for vision tagging, adaptively.
 
     A fixed 3-frame sample under-represents long or multi-scene clips. This
@@ -357,6 +459,38 @@ def extract_scene_representative_frames_b64(
     return frames, sampled
 
 
+# Sentinel scene index for a window that already spans a real scene cut, so the
+# cap-merging step never treats it as "cheap to merge again" (see _merge_windows_to_cap).
+_SPANS_A_CUT = -1
+
+
+def _merge_windows_to_cap(windows: list[list], cap: int) -> list[list]:
+    """Merge adjacent windows until at most ``cap`` remain, preserving full coverage.
+
+    Each round merges the ONE adjacent pair that costs the least information:
+      1. pairs inside the SAME continuous shot first — they were only an arbitrary
+         sub-division of one scene, so re-joining them loses no real boundary;
+      2. only when none is left, pairs across a real scene cut, choosing the shortest
+         combined span so long distinct shots survive as events of their own.
+
+    Windows are ``[start, end, scene_index]`` lists; the result still tiles the clip in
+    order with no gaps.
+    """
+    work = [list(w) for w in windows]
+    while len(work) > cap:
+        best_i, best_key = 0, None
+        for i in range(len(work) - 1):
+            a, b = work[i], work[i + 1]
+            intra = a[2] == b[2] and a[2] != _SPANS_A_CUT
+            key = (0 if intra else 1, b[1] - a[0])
+            if best_key is None or key < best_key:
+                best_i, best_key = i, key
+        a, b = work[best_i], work[best_i + 1]
+        scene = a[2] if a[2] == b[2] else _SPANS_A_CUT
+        work[best_i:best_i + 2] = [[a[0], b[1], scene]]
+    return work
+
+
 def build_event_windows(duration_seconds: float, cut_times: list[float],
                         max_events: int = 12, min_event_seconds: float = 1.0,
                         long_scene_seconds: float = 8.0) -> list[tuple[float, float]]:
@@ -372,15 +506,17 @@ def build_event_windows(duration_seconds: float, cut_times: list[float],
     Args:
         duration_seconds: Clip duration from probe.
         cut_times: Scene-cut timestamps from :func:`detect_scene_cut_times`.
-        max_events: Hard cap on windows per clip (bounds per-clip Vision cost). When more
-            windows would be produced they are uniformly down-sampled, preserving spread.
+        max_events: Cap on windows per clip (bounds per-clip Vision cost). When more
+            windows would be produced, adjacent ones are MERGED down to the cap — never
+            dropped — so the clip stays completely covered (see below).
         min_event_seconds: Windows shorter than this are merged into the previous one so a
             noisy cut can't spawn a sub-second "event".
         long_scene_seconds: A scene longer than this is sub-divided.
 
     Returns:
-        Ordered, non-overlapping ``(start, end)`` tuples covering the clip. Empty when the
-        duration is unknown/zero (caller then falls back to whole-clip analysis).
+        Ordered, non-overlapping ``(start, end)`` tuples that TILE the clip end to end.
+        Empty when the duration is unknown/zero (caller then falls back to whole-clip
+        analysis).
     """
     if not duration_seconds or duration_seconds <= 0:
         return []
@@ -389,7 +525,9 @@ def build_event_windows(duration_seconds: float, cut_times: list[float],
     valid_cuts = sorted(t for t in (cut_times or []) if t and 0.0 < t < dur)
     boundaries = [0.0] + valid_cuts + [dur]
 
-    windows: list[tuple[float, float]] = []
+    # Windows carry their originating scene index so the cap step can tell an arbitrary
+    # sub-division of one long shot from a real cut boundary.
+    windows: list[list] = []
     for i in range(len(boundaries) - 1):
         start, end = boundaries[i], boundaries[i + 1]
         span = end - start
@@ -400,26 +538,34 @@ def build_event_windows(duration_seconds: float, cut_times: list[float],
             parts = max(2, int(round(span / long_scene_seconds)))
             step = span / parts
             for p in range(parts):
-                windows.append((round(start + p * step, 3),
-                                round(start + (p + 1) * step, 3)))
+                windows.append([round(start + p * step, 3),
+                                round(start + (p + 1) * step, 3), i])
         else:
-            windows.append((round(start, 3), round(end, 3)))
+            windows.append([round(start, 3), round(end, 3), i])
 
     # Merge windows shorter than the floor into the previous one (avoid noise events).
-    merged: list[tuple[float, float]] = []
+    merged: list[list] = []
     for w in windows:
         if merged and (w[1] - w[0]) < min_event_seconds:
-            merged[-1] = (merged[-1][0], w[1])
+            merged[-1][1] = w[1]
+            if merged[-1][2] != w[2]:
+                merged[-1][2] = _SPANS_A_CUT
         else:
-            merged.append(w)
+            merged.append(list(w))
 
-    # Cap the count: uniformly down-sample windows while preserving order + spread.
+    # Cap the count by MERGING adjacent windows, never by dropping them. Dropping left
+    # holes in the clip's timeline: a moment inside a discarded window became both
+    # unsearchable (no event embedding) and un-cuttable (no in/out for Selection), while
+    # the ingest summary still reported success. Merging keeps a complete ordered tiling
+    # and only coarsens the granularity.
     cap = max(1, max_events)
     if len(merged) > cap:
-        step = len(merged) / cap
-        merged = [merged[int(k * step)] for k in range(cap)]
+        before = len(merged)
+        merged = _merge_windows_to_cap(merged, cap)
+        logger.info(f"Event windows: merged {before} → {len(merged)} to fit the "
+                    f"{cap}-event budget (full temporal coverage preserved).")
 
-    return merged
+    return [(w[0], w[1]) for w in merged]
 
 
 def extract_frames_in_window_b64(input_path: str, start: float, end: float,

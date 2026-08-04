@@ -18,6 +18,10 @@ class Settings:
     LLM_MODEL_FALLBACK: str = os.getenv("LLM_MODEL_FALLBACK", "gpt-5.4-mini")
     VISION_MODEL: str = os.getenv("VISION_MODEL", "gpt-5.4")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    # How many times a vision call may be attempted before the clip/event is left
+    # unclassified. A dropped clip loses its tags AND its embedding, so a retry is the
+    # cheapest way to buy catalogue coverage; 1 disables retrying.
+    VISION_MAX_ATTEMPTS: int = int(os.getenv("VISION_MAX_ATTEMPTS", "3"))
 
     # LangSmith
     LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")

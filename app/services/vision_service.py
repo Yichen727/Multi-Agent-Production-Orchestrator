@@ -9,6 +9,8 @@ fields at their defaults rather than invent content, and it does NOT attempt to
 identify *who* a person is — only that people are present and roughly how many.
 """
 
+import time
+
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.config import settings
@@ -17,6 +19,92 @@ from app.services.openai_service import get_llm
 from app.utils.logger import get_logger
 
 logger = get_logger("vision_service")
+
+
+# ── Retry policy ──────────────────────────────────────────────────────────────
+#
+# A single transient failure used to cost a clip its ENTIRE semantic layer: no tags AND
+# no embedding, which makes it invisible to vector search rather than merely under-tagged.
+# That is the most expensive failure mode in ingest, so the call is retried.
+_RETRY_BACKOFF_SECONDS = (1.0, 4.0)
+
+# Errors that will fail identically on every retry — retrying a bad key on 200 clips just
+# burns time. Matched against the exception text (provider exception types vary).
+_PERMANENT_ERROR_MARKERS = (
+    "invalid_api_key", "authentication", "unauthorized", "401",
+    "permission", "model_not_found", "does not exist",
+)
+
+
+def _is_permanent(err: Exception) -> bool:
+    """True when retrying ``err`` cannot possibly help (auth / unknown model)."""
+    text = str(err).lower()
+    return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
+
+
+def _reduce_frames(frames_b64: list[str]) -> list[str]:
+    """Halve a frame set, keeping temporal order plus the first and last frame.
+
+    The final retry goes out with this reduced set: it also clears failures caused by
+    too many images in one request (context limits / provider per-request caps), which a
+    plain retry would hit again.
+    """
+    if len(frames_b64) <= 2:
+        return frames_b64
+    keep = sorted({*range(0, len(frames_b64), 2), len(frames_b64) - 1})
+    return [frames_b64[i] for i in keep]
+
+
+def _image_content(instruction: str, frames_b64: list[str]) -> list[dict]:
+    """Build the multimodal message content: the instruction then the frames, in order."""
+    content: list[dict] = [{"type": "text", "text": instruction}]
+    for b64 in frames_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        })
+    return content
+
+
+def _invoke_vision(schema, system_prompt: str, instruction: str,
+                   frames_b64: list[str], label: str):
+    """Invoke the vision model with retries, returning a validated ``schema`` or None.
+
+    Retries transient failures (network, rate limit, structured-output parse) with
+    backoff; the last attempt uses a reduced frame set. Returns ``None`` once every
+    attempt is exhausted or the error is permanent, so the caller still leaves the
+    fields unclassified rather than fabricating them.
+    """
+    attempts = max(1, settings.VISION_MAX_ATTEMPTS)
+    try:
+        vlm = get_llm(model=settings.VISION_MODEL).with_structured_output(schema)
+    except Exception as e:
+        # Client construction (bad model name / config) must still return None: callers
+        # rely on this never raising, so a failure leaves fields unclassified.
+        logger.error(f"{label} could not initialise the vision model: {e}")
+        return None
+
+    for attempt in range(1, attempts + 1):
+        # Final attempt: fewer frames, in case the request size was the problem.
+        frames = _reduce_frames(frames_b64) if attempt == attempts and attempts > 1 \
+            else frames_b64
+        try:
+            return vlm.invoke([
+                SystemMessage(system_prompt),
+                HumanMessage(content=_image_content(instruction, frames)),
+            ])
+        except Exception as e:  # network / model / parsing — degrade gracefully
+            if _is_permanent(e):
+                logger.error(f"{label} failed permanently (not retrying): {e}")
+                return None
+            if attempt == attempts:
+                logger.error(f"{label} failed after {attempts} attempt(s): {e}")
+                return None
+            delay = _RETRY_BACKOFF_SECONDS[min(attempt - 1, len(_RETRY_BACKOFF_SECONDS) - 1)]
+            logger.warning(f"{label} attempt {attempt}/{attempts} failed ({e}); "
+                           f"retrying in {delay}s.")
+            time.sleep(delay)
+    return None
 
 
 _VISION_SYSTEM = """You are a video footage tagger for a post-production catalogue.
@@ -99,11 +187,12 @@ def analyze_frames(frames_b64: list[str], duration_seconds: float | None = None,
 
     Returns:
         A ``VisionTags`` instance, or ``None`` if vision analysis is unavailable
-        (no API key, no frames) or the call failed — callers should then leave the
-        shot's semantic fields unclassified rather than fabricate them.
+        (no API key, no frames) or every attempt failed — callers should then leave
+        the shot's semantic fields unclassified rather than fabricate them.
 
-    The extra arguments are optional, so the legacy ``analyze_frames(frames_b64)``
-    call still works unchanged.
+    Transient failures are retried (see :func:`_invoke_vision`). The extra arguments
+    are optional, so the legacy ``analyze_frames(frames_b64)`` call still works
+    unchanged.
     """
     if not settings.OPENAI_API_KEY:
         logger.warning("No OPENAI_API_KEY — skipping vision analysis.")
@@ -115,20 +204,8 @@ def analyze_frames(frames_b64: list[str], duration_seconds: float | None = None,
         frames_b64, duration_seconds, scene_count, sampled_timestamps,
         sampling_strategy,
     )
-
-    content = [{"type": "text", "text": instruction}]
-    for b64 in frames_b64:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-        })
-
-    try:
-        vlm = get_llm(model=settings.VISION_MODEL).with_structured_output(VisionTags)
-        return vlm.invoke([SystemMessage(_VISION_SYSTEM), HumanMessage(content=content)])
-    except Exception as e:  # network / model / parsing — degrade gracefully
-        logger.error(f"Vision analysis failed: {e}")
-        return None
+    return _invoke_vision(VisionTags, _VISION_SYSTEM, instruction, frames_b64,
+                          "Clip vision analysis")
 
 
 # ── Event-level (temporal) analysis: "what HAPPENS", not "what is in frame" ─────
@@ -171,8 +248,9 @@ def analyze_event(frames_b64: list[str], start_seconds: float | None = None,
 
     Returns:
         An ``EventTags`` instance, or ``None`` when vision is unavailable (no key/frames)
-        or the call fails — the caller then leaves the event's action fields unclassified
-        rather than fabricating them.
+        or every attempt failed — the caller then leaves the event's action fields
+        unclassified rather than fabricating them. Transient failures are retried (see
+        :func:`_invoke_vision`).
     """
     if not settings.OPENAI_API_KEY:
         logger.warning("No OPENAI_API_KEY — skipping event analysis.")
@@ -189,16 +267,7 @@ def analyze_event(frames_b64: list[str], start_seconds: float | None = None,
     instruction = ("Describe what HAPPENS across these frames, in order. Return only what "
                    "you can see.\n\nContext (guidance only):\n" + "\n".join(ctx))
 
-    content = [{"type": "text", "text": instruction}]
-    for b64 in frames_b64:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-        })
-
-    try:
-        vlm = get_llm(model=settings.VISION_MODEL).with_structured_output(EventTags)
-        return vlm.invoke([SystemMessage(_EVENT_SYSTEM), HumanMessage(content=content)])
-    except Exception as e:  # network / model / parsing — degrade gracefully
-        logger.error(f"Event analysis failed: {e}")
-        return None
+    window = (f"{start_seconds:.1f}-{end_seconds:.1f}s"
+              if start_seconds is not None and end_seconds is not None else "window")
+    return _invoke_vision(EventTags, _EVENT_SYSTEM, instruction, frames_b64,
+                          f"Event analysis ({window})")

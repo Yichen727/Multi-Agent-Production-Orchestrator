@@ -37,8 +37,8 @@ from app.services.database_service import (
 )
 from app.services.ffmpeg_service import (
     generate_proxy, get_video_duration, check_ffmpeg_installed,
-    check_ffprobe_installed, probe_video_metadata, detect_scene_count,
-    detect_scene_cut_times, choose_frame_count,
+    check_ffprobe_installed, probe_video_metadata, detect_scene_cuts,
+    choose_frame_count,
     extract_scene_representative_frames_b64, extract_sample_frames_b64,
     build_event_windows, extract_frames_in_window_b64,
 )
@@ -235,11 +235,24 @@ def generate_proxy_for_file(file_path: str) -> str:
 # can't hang the agent or run up an unbounded API bill.
 _MAX_INGEST_FILES = 200
 
-# Temporal event extraction bounds (Tier 2). Each event window is a separate GPT-5.4
-# call, so the per-clip window count and the frames per window are both capped to keep
-# ingest cost/latency bounded on long or busy clips.
-_MAX_EVENTS_PER_CLIP = 12
+# Temporal event extraction bounds. Each event window is a separate GPT-5.4 call, so the
+# per-clip window count is budgeted — but the budget SCALES WITH DURATION instead of being
+# a flat 12: a fixed cap forced a long clip's windows to be coarsened far more than a short
+# one's, for no reason other than the constant. Windows over budget are merged (never
+# dropped) by build_event_windows, so coverage is always complete; the budget only sets
+# how fine the granularity gets.
+_MIN_EVENTS_PER_CLIP = 12        # floor, so even a short clip gets a usable event layer
+_MAX_EVENTS_PER_CLIP = 40        # ceiling, so one long clip can't dominate the API bill
+_SECONDS_PER_EVENT = 6.0         # target event granularity
 _FRAMES_PER_EVENT = 3
+
+
+def _event_budget(duration_seconds: float | None) -> int:
+    """How many event windows this clip's duration justifies (clamped to the bounds)."""
+    if not duration_seconds or duration_seconds <= 0:
+        return _MIN_EVENTS_PER_CLIP
+    want = int(round(float(duration_seconds) / _SECONDS_PER_EVENT))
+    return max(_MIN_EVENTS_PER_CLIP, min(want, _MAX_EVENTS_PER_CLIP))
 
 
 # Columns copied verbatim when REUSING a previously-analysed clip's events (write
@@ -270,16 +283,22 @@ def _event_semantic_text(action: str | None, state_change: str | None,
 def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> list[dict]:
     """Extract ordered temporal events for one clip (the 'what happens' layer).
 
-    Segments the clip into event windows (scene cuts + long-scene sub-division), sends
-    several ordered frames per window to GPT-5.4, and returns event dicts ready for
-    ``replace_project_events`` — each with a real start/end, an action description, and
-    its own semantic embedding. Only windows the model actually described are kept; a
-    window that fails analysis is skipped rather than stored as a fabricated event.
+    Segments the clip into event windows (scene cuts + long-scene sub-division, budgeted
+    by :func:`_event_budget`), sends several ordered frames per window to GPT-5.4, and
+    returns event dicts ready for ``replace_project_events`` — each with a real start/end,
+    an action description, and its own semantic embedding. Only windows the model actually
+    described are kept; a window that fails analysis is skipped rather than stored as a
+    fabricated event.
+
+    All of the clip's event embeddings are fetched in ONE batched call (the embeddings API
+    is batch-native) rather than one call per event.
     """
-    windows = build_event_windows(duration, cut_times, max_events=_MAX_EVENTS_PER_CLIP)
+    windows = build_event_windows(duration, cut_times,
+                                  max_events=_event_budget(duration))
     if not windows:
         return []
     events: list[dict] = []
+    pending: list[tuple[int, str]] = []   # (index in events, text to embed)
     order = 0
     for (start, end) in windows:
         frames = extract_frames_in_window_b64(path, start, end, count=_FRAMES_PER_EVENT)
@@ -297,12 +316,6 @@ def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> li
         if not action and not keywords:
             continue
         order += 1
-        embedding = None
-        sem = _event_semantic_text(action, state_change, keywords)
-        if sem:
-            vecs = embed_texts([sem])
-            if vecs:
-                embedding = json.dumps(vecs[0])
         events.append({
             "file_path": path,
             "event_order": order,
@@ -313,8 +326,23 @@ def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> li
             "state_change": state_change or None,
             "subjects": tags.subjects or [],
             "keywords": keywords,
-            "embedding": embedding,
+            "embedding": None,
         })
+        sem = _event_semantic_text(action, state_change, keywords)
+        if sem:
+            pending.append((len(events) - 1, sem))
+
+    # One embedding call for the whole clip's events.
+    if pending:
+        vecs = embed_texts([text for _, text in pending])
+        if vecs and len(vecs) == len(pending):
+            for (idx, _), vec in zip(pending, vecs):
+                events[idx]["embedding"] = json.dumps(vec)
+        elif vecs:
+            # Never risk pairing a vector with the wrong event — store none instead.
+            logger.error(f"Event embedding count mismatch for {path} "
+                         f"({len(pending)} text(s) → {len(vecs)} vector(s)); "
+                         "storing no event vectors for this clip.")
     return events
 
 
@@ -520,6 +548,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
     scene_sampled = 0        # clips whose frames came from scene midpoints
     even_sampled = 0         # clips that fell back to adaptive even sampling
     frames_sent = 0          # total frames sent to the vision model
+    scene_incomplete = 0     # clips whose scene detection timed out (partial cut list)
 
     for f in found:
         path = str(f)
@@ -559,11 +588,25 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             unreadable += 1
         orientation_counts[meta["orientation"]] = orientation_counts.get(meta["orientation"], 0) + 1
 
-        # Shot/scene cut detection (only meaningful for readable clips). We keep
-        # the cut TIMESTAMPS so vision sampling can hit one frame per scene.
-        cut_times = detect_scene_cut_times(path) if meta["ok"] else []
-        scene_count = (len(cut_times) + 1) if cut_times else (
-            detect_scene_count(path) if meta["ok"] else 0)
+        # Shot/scene cut detection (only meaningful for readable clips) — ONE decode
+        # pass. The previous version re-ran the entire detection via detect_scene_count()
+        # whenever no cuts were found, doubling the cost of exactly the clips (single
+        # continuous shots, and anything that timed out) where it added nothing. We keep
+        # the cut TIMESTAMPS so vision sampling can hit one frame per scene, and the
+        # timeout is now sized from the real duration.
+        scene_info = (detect_scene_cuts(path, duration_seconds=meta["duration_seconds"])
+                      if meta["ok"] else None)
+        cut_times = scene_info["cut_times"] if scene_info else []
+        scene_count = scene_info["scene_count"] if scene_info else 0
+        if scene_info and scene_info["ran"] and not scene_info["complete"]:
+            # A partial scan is kept (the cuts it found are real), but the tail has no
+            # detected boundaries — say so instead of passing it off as a full scan.
+            scene_incomplete += 1
+            covered = (f"up to {max(cut_times):.0f}s of {meta['duration_seconds']:.0f}s"
+                       if cut_times else "no cuts at all")
+            logger.warning(f"{f.name}: scene detection ended early, covering {covered}; "
+                           f"kept {len(cut_times)} cut(s). Event boundaries past that point "
+                           "fall back to even sub-division.")
 
         # Vision tagging from sampled frames.
         shot_type = "unclassified"
@@ -689,6 +732,12 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         warnings.append(f"{unreadable} file(s) could not be probed and were stored as 'unknown'")
     if do_vision and tagged < analysed:
         warnings.append(f"{analysed - tagged} newly analysed clip(s) were not vision-tagged")
+    if scene_incomplete:
+        warnings.append(
+            f"{scene_incomplete} clip(s) hit the scene-detection timeout — their cut list "
+            "covers only the analysed head, so scene_count is a lower bound and later "
+            "event boundaries are evenly sub-divided rather than cut-aligned"
+        )
 
     breakdown = ", ".join(f"{k}: {v}" for k, v in orientation_counts.items() if v)
     headline = {
@@ -722,6 +771,9 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         summary += f"\nGenerated {proxies} proxy file(s)."
     if unreadable:
         summary += f"\n({unreadable} file(s) could not be probed and were stored as 'unknown'.)"
+    if scene_incomplete:
+        summary += (f"\n({scene_incomplete} clip(s) hit the scene-detection timeout — the "
+                    "cuts found were kept, but their scene count is a lower bound.)")
     if status != "failure":
         summary += "\nFootage indexed and ready for search."
 

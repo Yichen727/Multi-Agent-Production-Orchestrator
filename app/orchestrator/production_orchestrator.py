@@ -25,6 +25,7 @@ left as a misleading no-op.
 import hashlib
 import json
 import re
+import uuid
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -119,10 +120,33 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
     return state
 
 
-def _config(stage: str, user_id, project_id) -> dict:
-    """A per-stage runnable config with a stable thread id and the user id."""
+def _config(stage: str, user_id, project_id, tag: str | None = None) -> dict:
+    """A per-INVOCATION runnable config: a FRESH thread id plus the user id.
+
+    Every stage call gets its own checkpointer thread. Each stage invocation is already
+    self-contained — ``_base_state`` seeds ``messages`` with the one HumanMessage carrying
+    everything the agent needs — so there is nothing to gain from replaying an earlier
+    run's history, and two concrete things to lose:
+
+      * A CORRUPTED history is replayed forever. When a tool call raises (the parallel
+        ToolNode threads hitting the shared-SQLite race, for example), the checkpoint keeps
+        the assistant message whose ``tool_calls`` never got their ToolMessages. Re-running
+        the stage on that same thread re-sends that history and OpenAI rejects the whole
+        request: "An assistant message with 'tool_calls' must be followed by tool messages
+        responding to each 'tool_call_id'". The stage then stays broken until the process
+        restarts, even though the original bug is gone.
+      * History grows without bound. Re-running Selection with a new intent used to append
+        to the previous run's transcript — stale timelines in context, and the token bill
+        for them.
+
+    ``tag`` is an optional human-readable discriminator (e.g. a query digest) kept in the
+    thread id for log/debug traceability only; it never makes two invocations share a
+    thread.
+    """
+    parts = [p for p in ("mapo", stage, str(user_id), str(project_id), tag,
+                         uuid.uuid4().hex[:12]) if p]
     return {"configurable": {
-        "thread_id": f"mapo-{stage}-{user_id}-{project_id}",
+        "thread_id": "-".join(parts),
         "user_id": user_id,
     }}
 
@@ -135,11 +159,11 @@ def _pid(project_id) -> int:
 
 
 def _qhash(query: str) -> str:
-    """A stable short digest of a query, so each distinct search gets its OWN agent thread.
+    """A stable short digest of a query, used only to LABEL that search's agent thread.
 
-    Repeated identical queries reuse one checkpoint thread; different queries stay isolated,
-    so one search's message history cannot bleed into the next (the Search stage is
-    stateless per query, unlike the once-per-session Ingest/Selection/Delivery stages)."""
+    Every stage invocation already gets its own thread (see ``_config``), so this is a
+    debugging aid — it makes a search's checkpoint thread identifiable in the logs — not
+    the isolation mechanism."""
     return hashlib.md5((query or "").encode("utf-8")).hexdigest()[:8]
 
 
@@ -257,10 +281,7 @@ def run_search(query: str, project_id, user_id="editor") -> list[dict]:
     """
     if settings.OPENAI_API_KEY:
         try:
-            config = {"configurable": {
-                "thread_id": f"mapo-search-{user_id}-{project_id}-{_qhash(query)}",
-                "user_id": user_id,
-            }}
+            config = _config("search", user_id, project_id, _qhash(query))
             state = _base_state(project_id, {"messages": [HumanMessage(content=query)]})
             result = search_agent.invoke(state, config=config)
             candidates = _extract_candidates(result["messages"])

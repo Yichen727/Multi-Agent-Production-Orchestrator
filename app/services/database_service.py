@@ -11,7 +11,7 @@ launch. Tests point ``METADATA_DB_PATH`` at ``:memory:`` for isolation.
 import json
 import sqlite3
 from pathlib import Path
-from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy import create_engine, event, text as sql_text
 from sqlalchemy.pool import StaticPool
 from langchain_community.utilities.sql_database import SQLDatabase
 from app.config import settings
@@ -179,6 +179,24 @@ def _migrate_shot_columns(connection) -> None:
     connection.commit()
 
 
+def _apply_pragmas(connection, *, in_memory: bool) -> None:
+    """Set the connection PRAGMAs (audit H-08) on a raw sqlite3 connection.
+
+    Applied to EVERY connection (bootstrap and pooled), while no transaction is open —
+    ``PRAGMA journal_mode`` / ``foreign_keys`` cannot change inside one, and both are
+    per-connection settings, so a pooled connection that skipped them would silently
+    lose FK enforcement (and with it the ``clip_events`` ON DELETE CASCADE).
+      - ``foreign_keys=ON`` — actually enforce the declared FK relationships.
+      - ``busy_timeout`` — wait rather than fail immediately under brief write contention.
+      - ``journal_mode=WAL`` — concurrent readers + one writer (file databases only; WAL
+        is not applicable to ``:memory:`` and is skipped there).
+    """
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    if not in_memory:
+        connection.execute("PRAGMA journal_mode = WAL")
+
+
 def _create_engine(db_target: str):
     """Open a SQLite database, ensure the schema, and seed demo data if empty.
 
@@ -186,23 +204,26 @@ def _create_engine(db_target: str):
         db_target: A filesystem path for a persistent catalogue, or ':memory:' for an
             ephemeral one (used by tests).
 
-    A single shared connection is kept alive via StaticPool — correct for the app's
-    single-process model and required for an in-memory database to persist for the
-    life of the process.
+    THREAD SAFETY (why a file catalogue is NOT StaticPool): LangGraph's ``ToolNode``
+    executes an assistant turn's parallel tool calls in a THREAD POOL, so two catalogue
+    queries can run at the same instant (e.g. Selection calling ``get_candidate_details``
+    and ``get_clip_events`` together on a large curated set). A single shared DBAPI
+    connection cannot serve them concurrently: their cursor traffic interleaves and a row
+    ends up read against another statement's column metadata, surfacing as
+    ``IndexError: tuple index out of range`` deep inside SQLAlchemy. So a FILE database is
+    opened through SQLAlchemy's normal pool — every checkout gets its OWN sqlite3
+    connection (WAL already allows concurrent readers alongside one writer), and the pool
+    guarantees a connection is only ever used by one thread at a time.
 
-    Connection PRAGMAs (audit H-08) are set BEFORE the schema/seed runs, while no
-    transaction is open (``PRAGMA journal_mode`` / ``foreign_keys`` cannot change inside
-    one):
-      - ``foreign_keys=ON`` — actually enforce the declared FK relationships.
-      - ``busy_timeout`` — wait rather than fail immediately under brief write contention.
-      - ``journal_mode=WAL`` — concurrent readers + one writer (file databases only; WAL
-        is not applicable to ``:memory:`` and is skipped there).
+    ``:memory:`` keeps the single-shared-connection StaticPool: an in-memory database
+    exists only for the life of the connection that created it, so a per-checkout pool
+    would hand out empty databases. That path is for the (single-threaded) tests.
     """
+    in_memory = db_target == ":memory:"
+
+    # Bootstrap connection: PRAGMAs, then schema + first-run seed.
     connection = sqlite3.connect(db_target, check_same_thread=False)
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    if db_target != ":memory:":
-        connection.execute("PRAGMA journal_mode = WAL")
+    _apply_pragmas(connection, in_memory=in_memory)
     connection.executescript(_SCHEMA_DDL)
     _migrate_shot_columns(connection)
 
@@ -216,12 +237,27 @@ def _create_engine(db_target: str):
 
     connection.commit()
 
+    if in_memory:
+        return create_engine(
+            "sqlite://",
+            creator=lambda: connection,
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+
+    # File catalogue: hand the bootstrap connection back and let the pool open one
+    # connection per checkout (see THREAD SAFETY above). check_same_thread=False because
+    # a pooled connection may be reused by a different thread on a later checkout.
+    connection.close()
     engine = create_engine(
-        "sqlite://",
-        creator=lambda: connection,
-        poolclass=StaticPool,
+        f"sqlite+pysqlite:///{Path(db_target).resolve().as_posix()}",
         connect_args={"check_same_thread": False},
     )
+
+    @event.listens_for(engine, "connect")
+    def _set_pragmas(dbapi_connection, _record):  # every NEW pooled connection
+        _apply_pragmas(dbapi_connection, in_memory=False)
+
     return engine
 
 

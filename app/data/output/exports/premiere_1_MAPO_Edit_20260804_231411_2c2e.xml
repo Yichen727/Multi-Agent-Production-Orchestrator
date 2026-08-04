@@ -2,16 +2,16 @@
 <!DOCTYPE xmeml>
 <xmeml version="5">
   <sequence id="sequence-1">
-    <name>the big game.</name>
-    <duration>1331</duration>
+    <name>MAPO Edit</name>
+    <duration>1612</duration>
     <rate>
-      <timebase>30</timebase>
-      <ntsc>TRUE</ntsc>
+      <timebase>25</timebase>
+      <ntsc>FALSE</ntsc>
     </rate>
     <timecode>
       <rate>
-        <timebase>30</timebase>
-        <ntsc>TRUE</ntsc>
+        <timebase>25</timebase>
+        <ntsc>FALSE</ntsc>
       </rate>
       <string>00:00:00:00</string>
       <frame>0</frame>
@@ -22,8 +22,8 @@
         <format>
           <samplecharacteristics>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
             <width>1920</width>
             <height>1080</height>
@@ -31,34 +31,34 @@
         </format>
         <track>
           <clipitem id="clipitem-v1">
-            <name>IMG_6905.MOV</name>
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>259</duration>
+            <duration>137</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
             <start>0</start>
-            <end>259</end>
-            <in>0</in>
-            <out>259</out>
+            <end>137</end>
+            <in>1438</in>
+            <out>1575</out>
             <comments>
-              <mastercomment1>A soccer player runs on from the sideline and heads onto the</mastercomment1>
+              <mastercomment1>A smartphone rotates from a close-up of its rear cameras to </mastercomment1>
             </comments>
             <file id="file-1">
-              <name>IMG_6905.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6905.MOV</pathurl>
+              <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung_ifa2025_60sec_16x9_v05a-final_v1%20%281080p%29.mp4</pathurl>
               <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
               </rate>
-              <duration>259</duration>
+              <duration>1575</duration>
               <media>
                 <video>
                   <samplecharacteristics>
                     <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
                     </rate>
                     <width>1920</width>
                     <height>1080</height>
@@ -66,7 +66,7 @@
                 </video>
                 <audio>
                   <samplecharacteristics>
-                    <samplerate>44100</samplerate>
+                    <samplerate>48000</samplerate>
                     <depth>16</depth>
                   </samplecharacteristics>
                   <channelcount>2</channelcount>
@@ -87,42 +87,42 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v2">
-            <name>IMG_6852.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>79</duration>
+            <duration>128</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>259</start>
-            <end>338</end>
-            <in>0</in>
-            <out>79</out>
+            <start>137</start>
+            <end>265</end>
+            <in>1115</in>
+            <out>1243</out>
             <comments>
-              <mastercomment1>Players crowd the goalmouth as the ball comes across the fac</mastercomment1>
+              <mastercomment1>A seated man looks down at and manipulates a foldable smartp</mastercomment1>
             </comments>
             <file id="file-2">
-              <name>IMG_6852.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6852.MOV</pathurl>
+              <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung_9x16_one_shot_challenge_english_clean_v2%20%281080p%29.mp4</pathurl>
               <rate>
-                <timebase>28</timebase>
-                <ntsc>TRUE</ntsc>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
               </rate>
-              <duration>79</duration>
+              <duration>1243</duration>
               <media>
                 <video>
                   <samplecharacteristics>
                     <rate>
-                      <timebase>28</timebase>
-                      <ntsc>TRUE</ntsc>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
                     </rate>
-                    <width>1920</width>
-                    <height>1080</height>
+                    <width>1080</width>
+                    <height>1920</height>
                   </samplecharacteristics>
                 </video>
                 <audio>
                   <samplecharacteristics>
-                    <samplerate>44100</samplerate>
+                    <samplerate>48000</samplerate>
                     <depth>16</depth>
                   </samplecharacteristics>
                   <channelcount>2</channelcount>
@@ -143,34 +143,34 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v3">
-            <name>IMG_6856.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>195</duration>
+            <duration>172</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>338</start>
-            <end>533</end>
-            <in>0</in>
-            <out>195</out>
+            <start>265</start>
+            <end>437</end>
+            <in>1239</in>
+            <out>1411</out>
             <comments>
-              <mastercomment1>A player in blue and red sends the ball across the goalmouth</mastercomment1>
+              <mastercomment1>A person holds up a flip phone showing a translation app, th</mastercomment1>
             </comments>
             <file id="file-3">
-              <name>IMG_6856.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6856.MOV</pathurl>
+              <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung__found_in_translation_v1%20%281080p%29.mp4</pathurl>
               <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
               </rate>
-              <duration>195</duration>
+              <duration>1411</duration>
               <media>
                 <video>
                   <samplecharacteristics>
                     <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
                     </rate>
                     <width>1920</width>
                     <height>1080</height>
@@ -178,7 +178,7 @@
                 </video>
                 <audio>
                   <samplecharacteristics>
-                    <samplerate>44100</samplerate>
+                    <samplerate>48000</samplerate>
                     <depth>16</depth>
                   </samplecharacteristics>
                   <channelcount>2</channelcount>
@@ -199,48 +199,21 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v4">
-            <name>IMG_6874.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>170</duration>
+            <duration>484</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>533</start>
-            <end>703</end>
+            <start>437</start>
+            <end>921</end>
             <in>0</in>
-            <out>170</out>
+            <out>484</out>
             <comments>
-              <mastercomment1>A shot goes into the goal as the goalkeeper dives, and the c</mastercomment1>
+              <mastercomment1>A man sits holding a phone to his ear, and the view cuts to </mastercomment1>
             </comments>
-            <file id="file-4">
-              <name>IMG_6874.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6874.MOV</pathurl>
-              <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
-              </rate>
-              <duration>170</duration>
-              <media>
-                <video>
-                  <samplecharacteristics>
-                    <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
-                    </rate>
-                    <width>1920</width>
-                    <height>1080</height>
-                  </samplecharacteristics>
-                </video>
-                <audio>
-                  <samplecharacteristics>
-                    <samplerate>44100</samplerate>
-                    <depth>16</depth>
-                  </samplecharacteristics>
-                  <channelcount>2</channelcount>
-                </audio>
-              </media>
-            </file>
+            <file id="file-3"/>
             <link>
               <linkclipref>clipitem-v4</linkclipref>
               <mediatype>video</mediatype>
@@ -255,48 +228,21 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v5">
-            <name>IMG_6898.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>205</duration>
+            <duration>131</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>703</start>
-            <end>908</end>
-            <in>0</in>
-            <out>205</out>
+            <start>921</start>
+            <end>1052</end>
+            <in>590</in>
+            <out>721</out>
             <comments>
-              <mastercomment1>A player in a striped kit advances the ball toward goal and </mastercomment1>
+              <mastercomment1>A person holds a smartphone showing a photo, swipes or circl</mastercomment1>
             </comments>
-            <file id="file-5">
-              <name>IMG_6898.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6898.MOV</pathurl>
-              <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
-              </rate>
-              <duration>205</duration>
-              <media>
-                <video>
-                  <samplecharacteristics>
-                    <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
-                    </rate>
-                    <width>1920</width>
-                    <height>1080</height>
-                  </samplecharacteristics>
-                </video>
-                <audio>
-                  <samplecharacteristics>
-                    <samplerate>44100</samplerate>
-                    <depth>16</depth>
-                  </samplecharacteristics>
-                  <channelcount>2</channelcount>
-                </audio>
-              </media>
-            </file>
+            <file id="file-3"/>
             <link>
               <linkclipref>clipitem-v5</linkclipref>
               <mediatype>video</mediatype>
@@ -311,48 +257,21 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v6">
-            <name>IMG_6919.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>231</duration>
+            <duration>191</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>908</start>
-            <end>1139</end>
-            <in>461</in>
-            <out>692</out>
+            <start>1052</start>
+            <end>1243</end>
+            <in>1508</in>
+            <out>1699</out>
             <comments>
-              <mastercomment1>The stadium scoreboard holds on a full-time 4-1 display whil</mastercomment1>
+              <mastercomment1>A hand interacts with a phone screen showing a street photo,</mastercomment1>
             </comments>
-            <file id="file-6">
-              <name>IMG_6919.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6919.MOV</pathurl>
-              <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
-              </rate>
-              <duration>692</duration>
-              <media>
-                <video>
-                  <samplecharacteristics>
-                    <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
-                    </rate>
-                    <width>1920</width>
-                    <height>1080</height>
-                  </samplecharacteristics>
-                </video>
-                <audio>
-                  <samplecharacteristics>
-                    <samplerate>44100</samplerate>
-                    <depth>16</depth>
-                  </samplecharacteristics>
-                  <channelcount>2</channelcount>
-                </audio>
-              </media>
-            </file>
+            <file id="file-2"/>
             <link>
               <linkclipref>clipitem-v6</linkclipref>
               <mediatype>video</mediatype>
@@ -367,48 +286,21 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-v7">
-            <name>IMG_6921.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>192</duration>
+            <duration>212</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>1139</start>
-            <end>1331</end>
-            <in>193</in>
-            <out>385</out>
+            <start>1243</start>
+            <end>1455</end>
+            <in>1699</in>
+            <out>1911</out>
             <comments>
-              <mastercomment1>Fans wave large flags in the stands while a raised fist pump</mastercomment1>
+              <mastercomment1>A hand holds up a phone showing a street photo, then the dis</mastercomment1>
             </comments>
-            <file id="file-7">
-              <name>IMG_6921.MOV</name>
-              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/IMG_6921.MOV</pathurl>
-              <rate>
-                <timebase>30</timebase>
-                <ntsc>TRUE</ntsc>
-              </rate>
-              <duration>385</duration>
-              <media>
-                <video>
-                  <samplecharacteristics>
-                    <rate>
-                      <timebase>30</timebase>
-                      <ntsc>TRUE</ntsc>
-                    </rate>
-                    <width>1920</width>
-                    <height>1080</height>
-                  </samplecharacteristics>
-                </video>
-                <audio>
-                  <samplecharacteristics>
-                    <samplerate>44100</samplerate>
-                    <depth>16</depth>
-                  </samplecharacteristics>
-                  <channelcount>2</channelcount>
-                </audio>
-              </media>
-            </file>
+            <file id="file-2"/>
             <link>
               <linkclipref>clipitem-v7</linkclipref>
               <mediatype>video</mediatype>
@@ -422,22 +314,80 @@
               <clipindex>7</clipindex>
             </link>
           </clipitem>
+          <clipitem id="clipitem-v8">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>88</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1455</start>
+            <end>1543</end>
+            <in>2139</in>
+            <out>2227</out>
+            <comments>
+              <mastercomment1>A person holds up a smartphone showing translated text, then</mastercomment1>
+            </comments>
+            <file id="file-3"/>
+            <link>
+              <linkclipref>clipitem-v8</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-8</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v9">
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>69</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1543</start>
+            <end>1612</end>
+            <in>2233</in>
+            <out>2302</out>
+            <comments>
+              <mastercomment1>Holds on a black end card with the word 'SAMSUNG' centered n</mastercomment1>
+            </comments>
+            <file id="file-2"/>
+            <link>
+              <linkclipref>clipitem-v9</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-9</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+          </clipitem>
         </track>
       </video>
       <audio>
         <track>
           <clipitem id="clipitem-a1-1">
-            <name>IMG_6905.MOV</name>
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>259</duration>
+            <duration>137</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
             <start>0</start>
-            <end>259</end>
-            <in>0</in>
-            <out>259</out>
+            <end>137</end>
+            <in>1438</in>
+            <out>1575</out>
             <file id="file-1"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
@@ -457,17 +407,17 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-2">
-            <name>IMG_6852.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>79</duration>
+            <duration>128</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>259</start>
-            <end>338</end>
-            <in>0</in>
-            <out>79</out>
+            <start>137</start>
+            <end>265</end>
+            <in>1115</in>
+            <out>1243</out>
             <file id="file-2"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
@@ -487,17 +437,17 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-3">
-            <name>IMG_6856.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>195</duration>
+            <duration>172</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>338</start>
-            <end>533</end>
-            <in>0</in>
-            <out>195</out>
+            <start>265</start>
+            <end>437</end>
+            <in>1239</in>
+            <out>1411</out>
             <file id="file-3"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
@@ -517,18 +467,18 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-4">
-            <name>IMG_6874.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>170</duration>
+            <duration>484</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>533</start>
-            <end>703</end>
+            <start>437</start>
+            <end>921</end>
             <in>0</in>
-            <out>170</out>
-            <file id="file-4"/>
+            <out>484</out>
+            <file id="file-3"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
               <trackindex>1</trackindex>
@@ -547,18 +497,18 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-5">
-            <name>IMG_6898.MOV</name>
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>205</duration>
+            <duration>131</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>703</start>
-            <end>908</end>
-            <in>0</in>
-            <out>205</out>
-            <file id="file-5"/>
+            <start>921</start>
+            <end>1052</end>
+            <in>590</in>
+            <out>721</out>
+            <file id="file-3"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
               <trackindex>1</trackindex>
@@ -577,18 +527,18 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-6">
-            <name>IMG_6919.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>231</duration>
+            <duration>191</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>908</start>
-            <end>1139</end>
-            <in>461</in>
-            <out>692</out>
-            <file id="file-6"/>
+            <start>1052</start>
+            <end>1243</end>
+            <in>1508</in>
+            <out>1699</out>
+            <file id="file-2"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
               <trackindex>1</trackindex>
@@ -607,18 +557,18 @@
             </link>
           </clipitem>
           <clipitem id="clipitem-a1-7">
-            <name>IMG_6921.MOV</name>
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
             <enabled>TRUE</enabled>
-            <duration>192</duration>
+            <duration>212</duration>
             <rate>
-              <timebase>30</timebase>
-              <ntsc>TRUE</ntsc>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
             </rate>
-            <start>1139</start>
-            <end>1331</end>
-            <in>193</in>
-            <out>385</out>
-            <file id="file-7"/>
+            <start>1243</start>
+            <end>1455</end>
+            <in>1699</in>
+            <out>1911</out>
+            <file id="file-2"/>
             <sourcetrack>
               <mediatype>audio</mediatype>
               <trackindex>1</trackindex>
@@ -634,6 +584,66 @@
               <mediatype>audio</mediatype>
               <trackindex>1</trackindex>
               <clipindex>7</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-8">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>88</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1455</start>
+            <end>1543</end>
+            <in>2139</in>
+            <out>2227</out>
+            <file id="file-3"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v8</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-8</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-9">
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>69</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1543</start>
+            <end>1612</end>
+            <in>2233</in>
+            <out>2302</out>
+            <file id="file-2"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v9</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-9</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
             </link>
           </clipitem>
         </track>
