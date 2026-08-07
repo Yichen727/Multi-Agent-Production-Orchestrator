@@ -94,8 +94,8 @@ def _render(candidates: list[dict]) -> str:
 
 
 @tool
-def search_catalogue(keywords: str = None, shot_type: str = None,
-                     orientation: str = None, people: int = None,
+def search_catalogue(keywords: str = None, core_keywords: str = None,
+                     shot_type: str = None, orientation: str = None, people: int = None,
                      min_duration: float = None, max_duration: float = None,
                      state: Annotated[dict, InjectedState] = None) -> str:
     """Unified hybrid search over the catalogue — the ONE search tool.
@@ -105,10 +105,14 @@ def search_catalogue(keywords: str = None, shot_type: str = None,
     query implies; leave the rest as None.
 
     Args:
-        keywords: Free-text semantic query — the subjects/actions/mood/scenery the
-            user is after (e.g. "energetic crowd celebration"). Comma- or space-
-            separated. This drives semantic recall, so expand the user's term into a
-            generous set of English synonyms and related words.
+        core_keywords: The things the USER LITERALLY ASKED FOR, translated to English —
+            the entities/subjects/actions themselves, comma-separated, NO synonyms
+            (user says "手机" or "phone" → "phone"). Matching these counts as strong
+            evidence, so putting a synonym here would overstate a match. Always fill
+            this whenever the request has any content component.
+        keywords: The FULL retrieval term set — ``core_keywords`` PLUS your synonym
+            expansion (e.g. "phone, mobile phone, smartphone, cellphone"). Comma-
+            separated. Expansion widens recall only; it can never certify a match.
         shot_type: e.g. wide_shot, close_up, establishing, medium_shot, aerial.
         orientation: 'portrait' | 'landscape' | 'square' (vertical/horizontal ok).
         people: Minimum number of people visible (use for "clips with people").
@@ -120,7 +124,8 @@ def search_catalogue(keywords: str = None, shot_type: str = None,
         and a grounded relevance %. Retrieval only — never a "best" pick.
     """
     candidates = hybrid_search(
-        _pid_from_state(state), keywords=keywords, shot_type=shot_type,
+        _pid_from_state(state), keywords=keywords or core_keywords,
+        core_keywords=core_keywords, shot_type=shot_type,
         orientation=orientation, people=people,
         min_duration=min_duration, max_duration=max_duration,
     )
@@ -163,7 +168,10 @@ the match, the result carries a "contains: ..." note — relay it as CONTEXT, bu
 you return is always the whole clip.
 
 HOW TO BUILD THE QUERY:
-- Put the semantic idea (subjects, actions, mood, scenery) into `keywords`.
+- Put the user's OWN terms (translated to English, no synonyms) into `core_keywords`,
+  and those same terms PLUS your expansion into `keywords`. Both, every time there is a
+  content component — the system scores a core-term match far higher than a synonym
+  match, so mislabelling a synonym as core inflates relevance.
 - Put hard constraints into their OWN arguments: orientation, shot_type, people,
   min_duration / max_duration. Leave everything else as None.
 - STRUCTURED WORDS ARE NOT KEYWORDS. Orientation words (horizontal/landscape,
@@ -172,21 +180,30 @@ HOW TO BUILD THE QUERY:
   and NEVER also place them in `keywords`. Putting them in `keywords` produces a
   misleadingly low relevance %, because they don't appear in the clip's content tags.
 - If the request is ONLY a format constraint (e.g. "find all horizontal shots"), call
-  the tool with just that argument (orientation="horizontal") and NO `keywords`. Those
-  results have no relevance % — that is correct; every returned clip fully matches.
+  the tool with just that argument (orientation="horizontal") and NO keywords. Those
+  results come back at 100% — correct, because orientation and duration are MEASURED
+  facts, so every returned clip matches exactly.
+- Content relevance never reaches 100%: tags come from a vision model that can be wrong,
+  so a strong content match tops out around 95%. Never present a % as certainty.
 
-KEYWORDS EXPANSION — MANDATORY, FOR ANY TOPIC:
-Retrieval matches semantics AND text, but the catalogue is tagged in English with one
-wording out of many. So NEVER pass the user's raw word alone. For any concept the user
-names — any category — expand `keywords` into a comma-separated set that includes:
-  1. the term translated to English,
-  2. close synonyms,
-  3. broader/related terms and typical co-occurring words,
-  4. common singular/plural and spelling variants.
-Examples of the FORMAT only (not an allow-list):
-  - "海" / "sea" → sea,ocean,water,beach,coast,waves,shore
-  - "城市" / "city" → city,urban,buildings,street,skyline,downtown
-A generous expansion only helps both the vector and lexical layers.
+KEYWORDS EXPANSION — MANDATORY, BUT DISCIPLINED:
+The catalogue is tagged in English with one wording out of many, so never search the
+user's raw word alone — but expansion is a RECALL device, not a licence to drift.
+Every term you add to `keywords` must be able to REPLACE a core term: a synonym, an
+alternative name, a spelling/singular-plural variant, or a specific type of it.
+  - CONCRETE things (objects, people, places): synonyms and sub-types ONLY. Never widen
+    them to a category, a context, or things that merely appear nearby.
+      "手机" / "phone" → core: phone | keywords: phone, mobile phone, smartphone,
+      cellphone, telephone
+      WRONG: device, gadget, electronics, technology, communication, screen — and NEVER
+      a word that merely CONTAINS the core word with another meaning (microphone,
+      headphone, earphone).
+  - ABSTRACT ideas (mood, atmosphere, weather, scenery, activity) MAY widen to closely
+    related terms:
+      "celebration" → core: celebration | keywords: celebration, party, cheering,
+      applause, festival
+An over-broad expansion does real damage: it pulls in unrelated footage and makes it
+look like a strong match.
 
 ANTI-HALLUCINATION RULES:
 - NEVER invent file names, shot IDs, numbers, or relevance figures. Every clip you list

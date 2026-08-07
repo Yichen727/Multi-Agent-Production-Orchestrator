@@ -53,7 +53,8 @@ from app.agents.selection_agent import (
 from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
 )
-from app.services.retrieval_service import hybrid_search, expand_query, hoist_orientation
+from app.services.retrieval_service import (hybrid_search, expand_query_terms,
+                                            hoist_orientation)
 from app.services.timeline_service import MODE_CLIP, MODE_MOMENT
 from app.services.premiere_export_service import normalise_aspect_label
 from app.config import settings
@@ -263,9 +264,11 @@ def _search_direct(query: str, project_id) -> list[dict]:
     always receives candidates.
     """
     residual, orientation = hoist_orientation(query, None)
-    expanded = expand_query(residual) if residual and residual.strip() else None
-    return hybrid_search(_pid(project_id), keywords=expanded or None,
-                         orientation=orientation)
+    core, related = (expand_query_terms(residual)
+                     if residual and residual.strip() else ("", ""))
+    keywords = ", ".join(t for t in (core, related) if t)
+    return hybrid_search(_pid(project_id), keywords=keywords or None,
+                         core_keywords=core or None, orientation=orientation)
 
 
 def run_search(query: str, project_id, user_id="editor") -> list[dict]:

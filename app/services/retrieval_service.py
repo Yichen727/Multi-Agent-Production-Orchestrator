@@ -8,9 +8,14 @@ the old set of fragmented per-attribute SQL tools with one function that combine
     2. VECTOR SEMANTIC RECALL — when a free-text ``keywords`` query is given and the
        filtered rows carry embeddings (written at ingest), the query is embedded and
        ranked by cosine similarity against them.
-    3. LEXICAL FALLBACK — when embeddings are unavailable (no API key, or the demo
-       seed which has no vectors), it degrades to keyword/description substring
-       scoring rather than returning nothing.
+    3. LEXICAL OVERLAP — WHOLE-WORD (never substring) matching of the query terms
+       against a row's keywords/description, tiered by whether a term is the user's own
+       or came from synonym expansion. It also carries retrieval alone when embeddings
+       are unavailable (no API key, or the demo seed which has no vectors).
+
+Relevance is tiered by how trustworthy the evidence is: ffprobe-MEASURED constraints
+(orientation, duration) can report a full 1.0, while anything derived from the vision
+model's tags caps below that — see the evidence-tier constants below.
 
 Both the Search Agent's ``search_catalogue`` tool and the Streamlit curation UI call
 ``hybrid_search`` directly, so retrieval behaves identically whether driven by the LLM
@@ -19,6 +24,8 @@ the catalogue.
 """
 
 import json
+import re
+from typing import NamedTuple
 
 import numpy as np
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -53,6 +60,33 @@ _NEUTRAL_THRESHOLD = 0.30
 _COSINE_FLOOR = 0.18
 _COSINE_CEIL = 0.55
 
+# ── Evidence tiers ─────────────────────────────────────────────────────────────
+# A free-text query carries TWO tiers of evidence (see ``QueryTerms``):
+#   CORE    — what the user literally asked for, translated to English.
+#   RELATED — synonyms/variants added by query expansion.
+# Expansion is a RECALL device: it must be able to SURFACE a clip, but it must never be
+# able to certify one, because a synonym set is looser than the user's own word. So a
+# core-term hit scores far above a synonym hit, and synonym-only evidence is capped.
+_CORE_LEXICAL_SCORE = 0.9        # every core term matched = STRONG evidence, not proof
+_RELATED_LEXICAL_CEILING = 0.6   # related-term-only text evidence caps here
+_RELATED_VEC_DAMP = 0.9          # the expanded query's cosine is worth slightly less
+
+# Ceiling on any relevance derived from INFERRED metadata (keywords, description,
+# shot_type, people_count — and the embedding, which is computed FROM that same text).
+# Those signals are not independent witnesses: one vision mis-tag (a microphone tagged
+# `phone`) inflates the lexical AND the vector layer at once, so no amount of internal
+# agreement can certify a content match. Content relevance therefore measures the strength
+# of the CATALOGUE's evidence, never ground truth — the editor's eyes are the last check.
+#
+# MEASURED constraints are exempt: orientation / duration come from ffprobe, not from a
+# model, so a row that passes them matches EXACTLY and is reported as a full 1.0.
+_MAX_INFERRED_RELEVANCE = 0.95
+
+
+def _finalise_inferred(relevance: float) -> float:
+    """Clamp a content-derived relevance into the reportable band [0, 0.95]."""
+    return max(0.0, min(_MAX_INFERRED_RELEVANCE, relevance))
+
 
 def _calibrate_cosine(cos: float) -> float:
     """Map a raw text-embedding-3-small cosine onto a calibrated [0,1] relevance.
@@ -71,33 +105,75 @@ def _calibrate_cosine(cos: float) -> float:
 # into retrieval keywords. This is what the LLM-driven Search agent does in its prompt;
 # it is factored out here so the UI's DIRECT (non-LLM) search path gets the same
 # translation + synonym expansion instead of embedding a raw foreign-language sentence.
+# The reply is deliberately SPLIT into the two evidence tiers (CORE / RELATED) so the
+# scorer can tell the user's own words apart from the expansion, and the expansion itself
+# is CONSTRAINED: a concrete entity must never be broadened into its category or its
+# surroundings, because "phone → device, technology, communication" is exactly what drags
+# an unrelated microphone clip into a phone search.
 _EXPAND_INSTRUCTION = (
-    "You expand a video-search query into English retrieval keywords. Given the user's "
-    "query in ANY language, output ONLY a comma-separated list of lowercase English "
-    "terms: translate the core visual concepts to English, then add close synonyms, "
-    "broader/related terms, and common singular/plural variants. Drop filler words "
-    "(please, find, show, video, clip, footage). No sentences, no explanation — just "
-    "the comma-separated terms."
+    "You turn a video-search query into English retrieval terms.\n"
+    "Answer in EXACTLY two lines, nothing else:\n"
+    "CORE: <the things the user literally asked for, translated to English — the "
+    "entities, subjects and actions themselves. Lowercase, comma-separated, NO synonyms.>\n"
+    "RELATED: <up to 8 lowercase comma-separated alternative terms the catalogue might "
+    "use INSTEAD of a core term. May be empty.>\n"
+    "\n"
+    "Rules for RELATED:\n"
+    "- Every related term must be able to REPLACE a core term: a synonym, an alternative "
+    "name, a spelling / singular-plural variant, or a specific type of it. "
+    "phone -> mobile phone, smartphone, cellphone, telephone.\n"
+    "- NEVER broaden a concrete object, person or place into its category, its context, "
+    "or things that merely appear near it. phone -> device, gadget, electronics, "
+    "technology, communication, call, screen is WRONG.\n"
+    "- NEVER emit a term that merely CONTAINS a core word with a different meaning. "
+    "phone -> microphone, headphone, earphone is WRONG.\n"
+    "- ABSTRACT concepts (mood, atmosphere, weather, scenery, activity) MAY be broadened "
+    "to closely related terms: celebration -> party, cheering, applause, festival.\n"
+    "- Drop filler words (please, find, show, video, clip, footage)."
 )
 
 
-def expand_query(raw_query: str) -> str:
-    """Translate + expand a natural-language query into English retrieval keywords.
+def _parse_expansion(text: str) -> tuple[str, str]:
+    """Read the expander's two-line CORE:/RELATED: reply, tolerating a stray format."""
+    core = related = ""
+    for line in text.splitlines():
+        low = line.strip().lower()
+        if low.startswith("core:"):
+            core = line.split(":", 1)[1].strip()
+        elif low.startswith("related:"):
+            related = line.split(":", 1)[1].strip()
+    if not core and not related:
+        # The model ignored the format. Treat everything it said as RELATED — unlabelled
+        # output is never promoted to core (strong) evidence.
+        related = " ".join(text.split())
+    return core, related
 
-    Returns a comma-separated English keyword string. Falls back to the raw query
-    unchanged when the query is empty or the LLM is unavailable (no API key / error),
-    so search still runs — it just does not benefit from expansion.
+
+def expand_query_terms(raw_query: str) -> tuple[str, str]:
+    """Translate + expand a natural-language query into ``(core, related)`` term strings.
+
+    ``core`` holds the user's OWN terms in English — the strong evidence a strict match is
+    measured against; ``related`` holds the constrained synonym expansion, which serves
+    recall only. Both are comma-separated. Falls back to ``(raw_query, "")`` when the query
+    is empty or the LLM is unavailable (no API key / error), so search still runs — it just
+    does not benefit from expansion.
     """
     q = (raw_query or "").strip()
     if not q:
-        return q
+        return "", ""
     try:
         resp = llm_fast.invoke([SystemMessage(_EXPAND_INSTRUCTION), HumanMessage(q)])
-        expanded = (resp.content or "").strip()
-        return expanded or q
+        core, related = _parse_expansion(resp.content or "")
+        return (core or q), related
     except Exception as e:  # no key / network / model — degrade to the raw query
         logger.warning(f"Query expansion unavailable, using raw query: {e}")
-        return q
+        return q, ""
+
+
+def expand_query(raw_query: str) -> str:
+    """The full retrieval term set (core + related) for a query, comma-separated."""
+    core, related = expand_query_terms(raw_query)
+    return ", ".join(t for t in (core, related) if t) or (raw_query or "").strip()
 
 
 def group_size(people_count) -> str:
@@ -237,21 +313,127 @@ def _fetch_filtered(project_id, shot_type, orientation, people,
         return [dict(r._mapping) for r in rows]
 
 
-# A clip that matches this many distinct query terms is considered a full lexical hit.
-# Using a small saturating target (rather than a fraction of ALL terms) means a
-# GENEROUS synonym expansion no longer dilutes the score — matching ~3 strong terms
-# scores 1.0 whether the query had 3 synonyms or 30.
+# A row that matches this many distinct RELATED terms saturates that tier. Using a small
+# saturating target (rather than a fraction of ALL terms) means a GENEROUS synonym
+# expansion no longer dilutes the score — matching ~3 terms saturates whether the query
+# carried 3 synonyms or 30.
 _LEXICAL_TARGET_HITS = 3
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
-def _lexical_score(row: dict, terms: list[str]) -> float:
-    """Saturating lexical overlap between the query terms and a row's tags (0–1)."""
+
+class QueryTerms(NamedTuple):
+    """A parsed query split into its two evidence tiers (see the constants at the top)."""
+
+    core: tuple[str, ...]      # the user's own terms, in English
+    related: tuple[str, ...]   # the constrained synonym expansion
+
+    def __bool__(self) -> bool:
+        return bool(self.core or self.related)
+
+
+def _singular(word: str) -> str:
+    """Crude singulariser so a 'phones' query still matches a 'phone' tag, and vice versa.
+
+    Applied to BOTH sides of every comparison, so even an imperfect stem matches
+    consistently; it is deliberately conservative to avoid merging unrelated words.
+    """
+    if len(word) <= 3 or word.endswith(("ss", "us", "is")):
+        return word
+    if word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith(("shes", "ches", "xes", "zes", "ses")):
+        return word[:-2]
+    if word.endswith("s"):
+        return word[:-1]
+    return word
+
+
+def _tokenise(text: str) -> list[str]:
+    """Split text into normalised WORD tokens — the unit every lexical match is made on."""
+    return [_singular(w) for w in _WORD_RE.findall((text or "").lower())]
+
+
+def _term_matches(term: str, tokens: list[str]) -> bool:
+    """True when ``term`` occurs in ``tokens`` as a whole word / consecutive phrase.
+
+    Whole-word matching is what stops a query for "phone" scoring a clip tagged
+    "microphone" as a lexical hit: 'phone' IS inside the string "microphone", but it is
+    not one of its words. Substring containment is never a match here.
+    """
+    parts = _tokenise(term)
+    if not parts:
+        return False
+    if len(parts) == 1:
+        return parts[0] in tokens
+    n = len(parts)
+    return any(tokens[i:i + n] == parts for i in range(len(tokens) - n + 1))
+
+
+def _split_terms(text: str | None) -> list[str]:
+    """Parse a term string into deduplicated terms, dropping filler words.
+
+    Comma-separated input keeps each part as a PHRASE ("mobile phone"); a plain
+    whitespace query is split into individual words.
+    """
+    if not text or not text.strip():
+        return []
+    parts = text.split(",") if "," in text else text.split()
+    out: list[str] = []
+    for p in parts:
+        term = " ".join(w for w in _WORD_RE.findall(p.lower()) if w not in _FILLER_WORDS)
+        if term and term not in out:
+            out.append(term)
+    return out
+
+
+def parse_terms(keywords: str | None, core_keywords: str | None = None) -> QueryTerms:
+    """Split a query into CORE (the user's own words) and RELATED (the expansion).
+
+    ``keywords`` is the full term set; ``core_keywords`` marks which of those terms came
+    from the user. A term in both counts as core only, so nothing is scored twice. When
+    the caller cannot identify the core, every term is treated as related — and the
+    related-only CAP is then not applied (see ``_text_lexical_score``), so such callers
+    keep exactly the previous scoring behaviour.
+    """
+    core = _split_terms(core_keywords)
+    related = [t for t in _split_terms(keywords) if t not in core]
+    return QueryTerms(tuple(core), tuple(related))
+
+
+def _text_lexical_score(haystack: str, terms: QueryTerms) -> float:
+    """Two-tier lexical evidence for one text blob (0–1).
+
+    CORE coverage — the user's own words present as WHOLE words — is strong evidence and
+    scores up to ``_CORE_LEXICAL_SCORE``; RELATED terms saturate at the lower
+    ``_RELATED_LEXICAL_CEILING``. The tiers combine with ``max``, never a sum, so piling
+    on synonyms can never manufacture strong evidence.
+    """
     if not terms:
         return 0.0
-    haystack = f"{row.get('keywords') or ''} {row.get('description') or ''}".lower()
-    hits = sum(1 for t in set(terms) if t and t in haystack)
-    denom = min(_LEXICAL_TARGET_HITS, len(set(terms)))
-    return min(1.0, hits / denom) if denom else 0.0
+    tokens = _tokenise(haystack)
+    if not tokens:
+        return 0.0
+
+    core_score = 0.0
+    if terms.core:
+        hits = sum(1 for t in terms.core if _term_matches(t, tokens))
+        core_score = (hits / len(terms.core)) * _CORE_LEXICAL_SCORE
+
+    related_score = 0.0
+    if terms.related:
+        hits = sum(1 for t in terms.related if _term_matches(t, tokens))
+        denom = min(_LEXICAL_TARGET_HITS, len(terms.related))
+        ceiling = _RELATED_LEXICAL_CEILING if terms.core else 1.0
+        related_score = min(1.0, hits / denom) * ceiling
+
+    return max(core_score, related_score)
+
+
+def _lexical_score(row: dict, terms: QueryTerms) -> float:
+    """Lexical evidence from a CLIP's own tags."""
+    return _text_lexical_score(
+        f"{row.get('keywords') or ''} {row.get('description') or ''}", terms)
 
 
 def _suggestion(relevance: float | None) -> str:
@@ -284,35 +466,78 @@ def _fetch_project_events(project_id, wanted_paths: set) -> list[dict]:
         return [dict(r._mapping) for r in rows if r._mapping["file_path"] in wanted_paths]
 
 
-def _score_events(rows: list[dict], terms: list[str],
-                  query_vec) -> list[tuple[dict, float]]:
+def _embed_query(core_text: str, full_text: str):
+    """Embed the CORE query and the FULL expanded query in one batched call.
+
+    Keeping them apart matters twice over: the expanded string is an AVERAGE of many
+    synonyms, which both dilutes a true match on the user's own word and drags the vector
+    toward whatever the expansion added. Scoring then takes the best of the two (the
+    expansion slightly damped), so expansion can still rescue a synonym-only match without
+    getting to decide a strict one. Returns ``(core_vec | None, full_vec | None)``.
+    """
+    texts, keys = [], []
+    if core_text:
+        texts.append(core_text)
+        keys.append("core")
+    if full_text and full_text != core_text:
+        texts.append(full_text)
+        keys.append("full")
+    if not texts:
+        return None, None
+    vecs = embed_texts(texts)
+    if not vecs or len(vecs) != len(texts):
+        return None, None
+    by_key = {k: np.asarray(v, dtype=float) for k, v in zip(keys, vecs)}
+    return by_key.get("core"), by_key.get("full")
+
+
+def _vector_scores(rows: list[dict], q_core, q_full) -> dict[int, float]:
+    """CALIBRATED vector relevance per row (keyed by ``id(row)``), best of both queries.
+
+    Rows carrying no embedding are absent from the result, so the caller falls back to
+    lexical evidence for them rather than scoring them as a 0.0 mismatch.
+    """
+    rows_with_vec = [r for r in rows if r.get("embedding")]
+    if not rows_with_vec or (q_core is None and q_full is None):
+        return {}
+    try:
+        matrix = np.asarray(
+            [json.loads(r["embedding"]) for r in rows_with_vec], dtype=float)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Cosine ranking failed, using lexical only: {e}")
+        return {}
+
+    best: dict[int, float] = {}
+    for vec, damp in ((q_core, 1.0), (q_full, _RELATED_VEC_DAMP)):
+        if vec is None:
+            continue
+        for r, s in zip(rows_with_vec, _cosine(vec, matrix)):
+            cal = _calibrate_cosine(max(0.0, float(s))) * damp
+            if cal > best.get(id(r), -1.0):
+                best[id(r)] = cal
+    return best
+
+
+def _score_events(rows: list[dict], terms: QueryTerms,
+                  q_core, q_full) -> list[tuple[dict, float]]:
     """Score event rows against a query (vector cosine noisy-OR lexical), shared logic.
 
     Used both by ``search_events`` (Selection's moment primitive) and by
     ``hybrid_search``'s event-aware clip recall, so event scoring has ONE source of truth.
     Returns ``(row, relevance)`` pairs aligned to ``rows``.
     """
-    sim: dict[int, float] = {}
-    rows_with_vec = [r for r in rows if r.get("embedding")]
-    if query_vec is not None and rows_with_vec:
-        try:
-            matrix = np.asarray(
-                [json.loads(r["embedding"]) for r in rows_with_vec], dtype=float)
-            sims = _cosine(query_vec, matrix)
-            sim = {id(r): float(max(0.0, s)) for r, s in zip(rows_with_vec, sims)}
-        except (ValueError, TypeError) as e:
-            logger.error(f"Event cosine ranking failed, using lexical only: {e}")
+    sim = _vector_scores(rows, q_core, q_full)
     scored = []
     for r in rows:
         lex = _event_lexical_score(r, terms)
         vec = sim.get(id(r))
-        rel = (1.0 - (1.0 - _calibrate_cosine(vec)) * (1.0 - lex)) if vec is not None else lex
-        scored.append((r, rel))
+        rel = (1.0 - (1.0 - vec) * (1.0 - lex)) if vec is not None else lex
+        scored.append((r, _finalise_inferred(rel)))
     return scored
 
 
-def _best_event_by_path(project_id, wanted_paths: set, terms: list[str],
-                        query_vec) -> dict[str, dict]:
+def _best_event_by_path(project_id, wanted_paths: set, terms: QueryTerms,
+                        q_core, q_full) -> dict[str, dict]:
     """Best-matching temporal event per parent clip, for event-aware clip recall.
 
     Aggregates each clip's events to the single strongest match, so a clip whose OVERALL
@@ -323,7 +548,7 @@ def _best_event_by_path(project_id, wanted_paths: set, terms: list[str],
     if not rows:
         return {}
     best: dict[str, dict] = {}
-    for r, rel in _score_events(rows, terms, query_vec):
+    for r, rel in _score_events(rows, terms, q_core, q_full):
         fp = r["file_path"]
         cur = best.get(fp)
         if cur is None or rel > cur["relevance"]:
@@ -333,8 +558,8 @@ def _best_event_by_path(project_id, wanted_paths: set, terms: list[str],
     return best
 
 
-def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
-                  orientation: str = None, people: int = None,
+def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None,
+                  shot_type: str = None, orientation: str = None, people: int = None,
                   min_duration: float = None, max_duration: float = None,
                   top_k: int = 20) -> list[dict]:
     """Unified hybrid retrieval: SQL hard filters + EVENT-AWARE semantic/lexical recall.
@@ -347,10 +572,22 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
     beat is one event). The matched moment is attached as ``matched_event`` for preview
     context only — it never turns the result into a moment.
 
+    Relevance is TIERED by how trustworthy the evidence is. ffprobe-MEASURED constraints
+    (orientation, duration) are exact, so a pure structured filter reports 1.0 — every
+    surviving row genuinely matches. Everything content-related is INFERRED by the vision
+    model and caps at 0.95, with the user's own words (``core_keywords``) scoring far above
+    the synonym expansion and whole-word matching only, so "phone" never scores a clip
+    tagged "microphone".
+
     Args:
         project_id: Project whose catalogue to search.
-        keywords: Free-text semantic query (comma- or space-separated terms). Drives
-            the vector / lexical recall layer. Omit for a pure structured filter.
+        keywords: Free-text semantic query (comma- or space-separated terms) — the FULL
+            term set including synonym expansion. Drives the vector / lexical recall
+            layer. Omit for a pure structured filter.
+        core_keywords: The subset of ``keywords`` the USER actually asked for (their own
+            entities/actions, translated to English, no synonyms). Matching these is
+            strong evidence; matching only expanded synonyms is capped. Omit when the
+            caller cannot tell the two apart — scoring then behaves as it did before.
         shot_type: Filter by shot type (substring match).
         orientation: 'portrait' | 'landscape' | 'square' (synonyms vertical/horizontal).
         people: Minimum number of people visible.
@@ -368,6 +605,7 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
     # thing to score — hoist it into `orientation` so it narrows rows instead of giving
     # every clip a misleading relevance %. No-op once `orientation` is explicitly set.
     keywords, orientation = hoist_orientation(keywords, orientation)
+    orient = _normalise_orientation(orientation)
 
     rows = _fetch_filtered(project_id, shot_type, orientation, people,
                            min_duration, max_duration)
@@ -375,42 +613,31 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
         return []
 
     query = (keywords or "").strip()
-    scored: list[tuple[dict, float | None]] = []
+    core = (core_keywords or "").strip()
+    # (row, relevance, tiebreak) — the tiebreak is the raw semantic signal.
+    scored: list[tuple[dict, float | None, float]] = []
 
-    if query:
-        terms = [t.strip().lower() for t in query.replace(",", " ").split() if t.strip()]
+    if query or core:
+        terms = parse_terms(query, core)
 
-        # Embed the query ONCE and reuse it for both the clip and event vector layers
-        # (returns None without an API key → both layers fall back to lexical).
-        query_vecs = embed_texts([query])
-        q = np.asarray(query_vecs[0], dtype=float) if query_vecs else None
+        # Embed the query ONCE (core + expanded, batched) and reuse both vectors for the
+        # clip and event layers (None without an API key → both fall back to lexical).
+        q_core, q_full = _embed_query(core, query or core)
 
         # Clip vector layer: cosine against rows that carry a clip-level embedding.
-        sim_by_id: dict[int, float] = {}
-        rows_with_vec = [r for r in rows if r.get("embedding")]
-        if q is not None and rows_with_vec:
-            try:
-                matrix = np.asarray(
-                    [json.loads(r["embedding"]) for r in rows_with_vec], dtype=float
-                )
-                sims = _cosine(q, matrix)
-                sim_by_id = {id(r): float(max(0.0, s))
-                             for r, s in zip(rows_with_vec, sims)}
-            except (ValueError, TypeError) as e:
-                logger.error(f"Cosine ranking failed, using lexical only: {e}")
+        sim_by_id = _vector_scores(rows, q_core, q_full)
 
         # Event-aware layer: best temporal-event match per clip (empty when no events).
         best_event = _best_event_by_path(
-            project_id, {r["file_path"] for r in rows}, terms, q)
+            project_id, {r["file_path"] for r in rows}, terms, q_core, q_full)
 
         # Combine clip + event signals with a reinforcing (noisy-OR) rule: a strong hit in
-        # the clip's own tags OR in one of its moments each push relevance toward 1.0, and
-        # neither dilutes the other.
+        # the clip's own tags OR in one of its moments each push relevance up, and neither
+        # dilutes the other. The result is INFERRED evidence, so it caps below a full match.
         for r in rows:
             lex = _lexical_score(r, terms)
             vec = sim_by_id.get(id(r))
-            rel_clip = (1.0 - (1.0 - _calibrate_cosine(vec)) * (1.0 - lex)
-                        ) if vec is not None else lex
+            rel_clip = (1.0 - (1.0 - vec) * (1.0 - lex)) if vec is not None else lex
             ev = best_event.get(r["file_path"])
             if ev is not None:
                 rel = 1.0 - (1.0 - rel_clip) * (1.0 - ev["relevance"])
@@ -420,16 +647,30 @@ def hybrid_search(project_id, *, keywords: str = None, shot_type: str = None,
                 }
             else:
                 rel = rel_clip
-            scored.append((r, rel))
+            scored.append((r, _finalise_inferred(rel), vec or 0.0))
 
-        scored.sort(key=lambda pair: (pair[1] if pair[1] is not None else 0.0),
-                    reverse=True)
+        # Sort on relevance, breaking ties on the raw semantic signal: several clips can
+        # legitimately share a capped score (e.g. all strict core matches), and falling
+        # back to alphabetical file order there would be arbitrary.
+        scored.sort(key=lambda t: (t[1], t[2]), reverse=True)
     else:
-        # No free-text query — pure structured filter / list-all. Keep SQL order.
-        scored = [(r, None) for r in rows]
+        # No free-text query — the result reports the CONSTRAINTS, not content. Measured
+        # constraints (orientation/duration, from ffprobe) are exact, so every surviving
+        # row is a genuine 100% match. A vision-INFERRED constraint (shot_type, people) is
+        # only as good as the tag, so it caps. No constraints at all is a plain listing,
+        # which has no relevance to report (None) — keep SQL order.
+        inferred_filter = bool(shot_type) or people is not None
+        measured_filter = bool(orient) or min_duration is not None or max_duration is not None
+        if inferred_filter:
+            exact = _MAX_INFERRED_RELEVANCE
+        elif measured_filter:
+            exact = 1.0
+        else:
+            exact = None
+        scored = [(r, exact, 0.0) for r in rows]
 
     candidates = []
-    for r, rel in scored[:top_k]:
+    for r, rel, _tiebreak in scored[:top_k]:
         r.pop("embedding", None)
         r["relevance"] = round(rel, 4) if rel is not None else None
         r["group_size"] = group_size(r.get("people_count"))
@@ -452,19 +693,16 @@ _EVENT_SELECT = (
 )
 
 
-def _event_lexical_score(row: dict, terms: list[str]) -> float:
-    """Saturating lexical overlap between query terms and an event's action/keywords."""
-    if not terms:
-        return 0.0
-    haystack = (f"{row.get('action') or ''} {row.get('keywords') or ''} "
-                f"{row.get('state_change') or ''} {row.get('subjects') or ''}").lower()
-    hits = sum(1 for t in set(terms) if t and t in haystack)
-    denom = min(_LEXICAL_TARGET_HITS, len(set(terms)))
-    return min(1.0, hits / denom) if denom else 0.0
+def _event_lexical_score(row: dict, terms: QueryTerms) -> float:
+    """Two-tier lexical evidence from an EVENT's action/keywords (same rules as clips)."""
+    return _text_lexical_score(
+        f"{row.get('action') or ''} {row.get('keywords') or ''} "
+        f"{row.get('state_change') or ''} {row.get('subjects') or ''}", terms)
 
 
-def search_events(project_id, *, keywords: str = None, shot_type: str = None,
-                  orientation: str = None, top_k: int = 20) -> list[dict]:
+def search_events(project_id, *, keywords: str = None, core_keywords: str = None,
+                  shot_type: str = None, orientation: str = None,
+                  top_k: int = 20) -> list[dict]:
     """Retrieve temporal EVENTS (moments) matching a query, scoped to a project.
 
     The moment-level primitive backing the SELECTION stage (Selection queries a clip's
@@ -480,7 +718,11 @@ def search_events(project_id, *, keywords: str = None, shot_type: str = None,
 
     Args:
         project_id: Project whose events to search.
-        keywords: Free-text moment query. Omit for an unranked chronological listing.
+        keywords: Free-text moment query (full term set incl. expansion). Omit for an
+            unranked chronological listing.
+        core_keywords: The subset of ``keywords`` the user actually asked for — matching
+            these is strong evidence, matching only synonyms is capped (see
+            :func:`hybrid_search`).
         shot_type / orientation: Optional parent-clip filters.
         top_k: Maximum number of events to return.
 
@@ -511,11 +753,11 @@ def search_events(project_id, *, keywords: str = None, shot_type: str = None,
         return []
 
     query = (keywords or "").strip()
-    if query:
-        terms = [t.strip().lower() for t in query.replace(",", " ").split() if t.strip()]
-        query_vecs = embed_texts([query])
-        q = np.asarray(query_vecs[0], dtype=float) if query_vecs else None
-        scored = _score_events(rows, terms, q)
+    core = (core_keywords or "").strip()
+    if query or core:
+        terms = parse_terms(query, core)
+        q_core, q_full = _embed_query(core, query or core)
+        scored = _score_events(rows, terms, q_core, q_full)
         scored.sort(key=lambda pair: pair[1], reverse=True)
     else:
         scored = [(r, None) for r in rows]
