@@ -15,7 +15,11 @@ Selection model:
       ticks/unticks the whole pool in one click.
     - Search is a decision aid: it ranks matches into 🟡 suggested / ⚪ neutral /
       🔴 low and shows a reason + thumbnail; its ➕/➖ ticks/unticks the clip in the Bin.
-    - Selection orchestrates ONLY the ticked Bin clips into an edit timeline.
+    - Selection treats the ticked Bin clips as CANDIDATES and orchestrates them into an
+      edit timeline in one of two modes — 🎞️ Clip Assembly (complete clips, original
+      durations, no target duration) or 🎯 Moment Assembly (moments inside clips, with an
+      optional target duration). The agent decides what actually belongs. The Output
+      aspect ratio picked here is a delivery SPEC that rides along to ④.
     - Deliver compiles that timeline into a Premiere Pro–importable project (FCP7 XML),
       preserving clip order exactly — a pure export step, no re-editing.
 
@@ -32,6 +36,28 @@ st.set_page_config(page_title="MAPO", page_icon="🎬", layout="wide")
 
 SUGGESTION_MARK = {"suggested": "🟡", "neutral": "⚪", "low": "🔴"}
 _TIERS = [("suggested", "🟡 Suggested"), ("neutral", "⚪ Neutral"), ("low", "🔴 Low")]
+
+# The ONLY two editing modes the Selection stage exposes: label → (mode id, caption).
+# They differ in the UNIT of editing — whole clips vs moments inside clips. Duration
+# control is a property of Moment Assembly alone, not a mode of its own.
+EDITING_MODES = {
+    "🎞️ Clip Assembly": ("clip_assembly",
+                          "Combine complete clips — each keeps its original duration."),
+    "🎯 Moment Assembly": ("moment_assembly",
+                           "Extract meaningful moments from inside clips — target duration optional."),
+}
+
+_DURATION_STATUS = {
+    "on_target": "on target",
+    "under_target": "under target",
+    "over_target": "over target — kept for content",
+}
+
+# Output aspect ratio — an explicit OUTPUT SPEC the editor picks, never inferred from the
+# editing prompt. All five propagate identically (Selection → plan → Delivery). Delivery
+# scales clips to FIT the frame: aspect preserved, no cropping, no stretching —
+# letterbox/pillarbox where the source and target ratios differ.
+ASPECT_CHOICES = ["16:9", "9:16", "4:3", "3:4", "1:1"]
 
 
 # ── Selection state (Bin checkbox is the single source of truth) ────────────────
@@ -95,13 +121,20 @@ def _pid(project_id):
 # ── Backend calls (thin wrappers over the orchestrator stages) ─────────────────
 
 
-def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str):
+def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str,
+                  editing_mode: str = "clip_assembly", target_seconds: float | None = None,
+                  aspect_ratio: str = ""):
     """③ Selection — returns (narration_text, structured_plan_or_None).
 
-    The Selection Agent decides for itself, from the editing intent, whether to build a
-    whole-clip timeline or a moment-precise one (trimmed to detected event boundaries).
+    The editor picks the editing mode: CLIP ASSEMBLY (complete clips, original durations,
+    no target duration) or MOMENT ASSEMBLY (moments inside clips, optional target
+    duration), plus the OUTPUT ASPECT RATIO (a delivery spec that rides along the plan to
+    Delivery). Everything else — which candidates belong, the order, the pacing — is the
+    Selection Agent's editorial reasoning.
     """
-    return _orch().run_selection(intent, selected_paths, project_id, user_id)
+    return _orch().run_selection(intent, selected_paths, project_id, user_id,
+                                 editing_mode=editing_mode, target_seconds=target_seconds,
+                                 aspect_ratio=aspect_ratio)
 
 
 def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
@@ -391,10 +424,10 @@ def main():
     render_search_results()
     st.divider()
 
-    # ③ Selection
+    # ③ Selection — two editing modes, nothing else to configure
     st.subheader("③ Selection")
-    st.caption("State your editing intent. Orchestrates your ticked clips into a timeline — "
-               "the agent cuts to precise event moments when your intent calls for it.")
+    st.caption("Pick how to edit, then describe your intent. Your ticked clips are "
+               "CANDIDATES — the agent decides which ones belong, in what order, and why.")
     selected_paths = [c["file_path"] for c in st.session_state.bin_shots
                       if st.session_state.get(_bin_key(c["file_path"]))]
     have_sel = bool(selected_paths)
@@ -404,30 +437,74 @@ def main():
         st.info("Tick at least one clip in the Media Pool (left sidebar).")
     else:
         st.caption(f"{len(selected_paths)} clip(s) selected.")
-    intent_text = st.text_input("Editing intent", placeholder="e.g. Fast-paced 30s football promo",
-                                disabled=locked or not have_sel, key="intent")
+
+    sel_disabled = locked or not have_sel
+    mode_label = st.radio(
+        "Editing mode",
+        options=list(EDITING_MODES),
+        captions=[EDITING_MODES[k][1] for k in EDITING_MODES],
+        horizontal=True, disabled=sel_disabled, key="editing_mode_label")
+    is_moment = EDITING_MODES[mode_label][0] == "moment_assembly"
+
+    o1, o2 = st.columns([2, 2])
+    with o1:
+        aspect_ratio = st.selectbox(
+            "Output aspect ratio", options=ASPECT_CHOICES, index=0,
+            disabled=sel_disabled, key="aspect_ratio",
+            help="Delivery frame. Clips are scaled to FIT it with their own aspect kept — "
+                 "never stretched, never auto-cropped (letterbox/pillarbox where needed).")
+    with o2:
+        # Target Duration applies to MOMENT ASSEMBLY only — Clip Assembly keeps every
+        # clip's original length, so there is nothing to optimise. Default is N/A.
+        target_seconds = st.number_input(
+            "Target duration (seconds)", min_value=1.0, max_value=7200.0, step=5.0,
+            value=None, placeholder="N/A", format="%.0f",
+            disabled=sel_disabled or not is_moment, key="target_seconds",
+            help=("Optional. The agent selects the moments the intent needs first, then "
+                  "compresses the lower-value ones to fit — content is never dropped just "
+                  "to hit the number." if is_moment
+                  else "Not available in Clip Assembly — every clip keeps its full length."))
+    if not is_moment:
+        target_seconds = None
+    if not sel_disabled:
+        st.caption(f"Delivering at {aspect_ratio} · clips are scaled to fit "
+                   "(letterbox/pillarbox as needed — no cropping, no stretching).")
+
+    intent_text = st.text_input(
+        "Editing intent", key="intent", disabled=sel_disabled,
+        placeholder="e.g. Warm, unhurried travel vlog — atmosphere first, ending on the sunset",
+        help="Describe style, emotion, pacing and purpose — not technical operations.")
     run_select = st.button("🎬 Generate Edit Timeline", use_container_width=True,
-                           disabled=locked or not have_sel,
-                           help="Selection Agent — lays out an intent-driven timeline (no fixed arc)")
+                           disabled=sel_disabled,
+                           help="Selection Agent — an assistant editor: it curates, orders "
+                                "and explains (no fixed narrative arc)")
 
     # Selection output renders HERE, inside the Selection section.
     if st.session_state.get("selection_output"):
         plan = st.session_state.get("last_timeline_plan")
         if plan:
             n_steps = len(plan.get("segments", []))
-            if plan.get("mode") == "events":
-                st.caption(f"🎯 EVENTS MODE · trimmed to {n_steps} detected moment(s) · "
-                           f"{plan.get('total_seconds')}s total")
-            elif plan.get("mode") == "timed":
-                st.caption(f"⏱️ TIMED MODE · target {plan.get('target_seconds')}s · "
-                           f"actual {plan.get('total_seconds')}s · {n_steps} steps")
-            elif plan.get("mode") == "trim":
-                st.caption(f"✂️ TRIM MODE · first {plan.get('head_trim')}s + last "
-                           f"{plan.get('tail_trim')}s off each clip · "
-                           f"{plan.get('total_seconds')}s · {n_steps} steps")
+            if plan.get("mode") == "moment_assembly":
+                head = (f"🎯 MOMENT ASSEMBLY · {n_steps} moment(s) · "
+                        f"{plan.get('total_seconds')}s")
+                if plan.get("target_seconds"):
+                    head += (f" · target {plan.get('target_seconds')}s "
+                             f"({_DURATION_STATUS.get(plan.get('duration_status'), '')})")
+                comp = plan.get("compression") or {}
+                if comp.get("applied"):
+                    head += (f" · optimised −{comp.get('absorbed_seconds')}s across "
+                             f"{comp.get('trimmed_count')} lower-value moment(s)")
+                st.caption(head)
             else:
-                st.caption(f"🎞️ FULL CLIP MODE · {plan.get('total_seconds')}s · "
-                           f"{n_steps} steps (no trimming)")
+                st.caption(f"🎞️ CLIP ASSEMBLY · {n_steps} complete clip(s) · "
+                           f"{plan.get('total_seconds')}s (no trimming)")
+            if plan.get("aspect_ratio"):
+                st.caption(f"🖼️ Output frame {plan['aspect_ratio']} — Delivery scales each "
+                           "clip to fit; no source media is cropped or resized.")
+            dropped = plan.get("excluded") or []
+            if dropped:
+                st.caption(f"🗂️ {len(dropped)} candidate(s) held back as backup material — "
+                           "see the agent's reasoning below.")
         with st.container(border=True):
             st.markdown(st.session_state.selection_output)
     st.divider()
@@ -435,7 +512,8 @@ def main():
     # ④ Deliver — compile the timeline into a Premiere-importable project
     st.subheader("④ Deliver")
     st.caption("Compiles the edit timeline into a Premiere Pro–importable project "
-               "(FCP7 XML + JSON). Preserves clip order exactly — no re-editing.")
+               "(FCP7 XML + JSON) at the aspect ratio you chose in ③. Preserves clip order "
+               "exactly — no re-editing, and clips are scaled to fit, never cropped.")
     # H-04: Delivery needs the STRUCTURED plan (ordered segments) from Selection — not
     # merely some timeline text. Without a structured plan there is no defined edit order
     # to compile and NO media-pool-order fallback, so Deliver stays disabled.
@@ -448,7 +526,11 @@ def main():
                 "(Delivery compiles the ordered segments — there is no media-pool fallback).")
     else:
         st.caption(f"Timeline ready · {len(_plan['segments'])} segment(s) · "
-                   f"mode: {_plan.get('mode', 'full')}.")
+                   f"built by {_plan.get('mode', 'clip_assembly').replace('_', ' ')} · "
+                   f"{_plan.get('total_seconds')}s"
+                   + (f" · output frame {_plan['aspect_ratio']}"
+                      if _plan.get("aspect_ratio") else "")
+                   + ". Delivery exports it as-is.")
     seq_name = st.text_input("Sequence name", value="MAPO Edit",
                              disabled=locked or not have_plan, key="seq_name")
     run_deliver = st.button("📦 Export to Premiere (FCP7 XML)", use_container_width=True,
@@ -493,15 +575,20 @@ def main():
         st.rerun()
     elif run_select:
         if intent_text.strip():
+            mode_id = EDITING_MODES[mode_label][0]
             with st.spinner("Selection Agent is orchestrating the edit..."):
                 try:
                     response, plan = run_selection(
-                        intent_text.strip(), selected_paths, project_id, user_id)
+                        intent_text.strip(), selected_paths, project_id, user_id,
+                        editing_mode=mode_id, target_seconds=target_seconds,
+                        aspect_ratio=aspect_ratio)
                     # Render inline in the Selection section + keep a debug-log copy.
                     st.session_state.selection_output = response
                     st.session_state.messages.append({
                         "role": "user",
-                        "content": f"[Selection] intent: {intent_text.strip()} · {len(selected_paths)} clip(s)"})
+                        "content": (f"[Selection] {mode_label} · {aspect_ratio} · target "
+                                    f"{target_seconds or 'N/A'} · intent: {intent_text.strip()} "
+                                    f"· {len(selected_paths)} candidate clip(s)")})
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     # The STRUCTURED plan is the ONLY thing Delivery consumes (audit
                     # H-04): there is no Bin-order fallback. If Selection produced no

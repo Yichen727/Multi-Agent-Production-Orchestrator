@@ -7,7 +7,8 @@ exactly one specialised ReAct sub-agent (or, for Search, the retrieval service d
 
     ① run_ingest    → ingest_agent      (build the catalogue)
     ② run_search    → retrieval_service (hybrid recall — retrieval only)
-    ③ run_selection → selection_agent   (intent-driven edit timeline)
+    ③ run_selection → selection_agent   (intent-driven edit timeline; the editor picks
+                                         CLIP ASSEMBLY or MOMENT ASSEMBLY)
     ④ run_delivery  → delivery_agent     (compile the timeline → Premiere FCP7 XML)
 
 The Streamlit UI is a thin presentation layer that calls these functions in order; the
@@ -53,6 +54,8 @@ from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
 )
 from app.services.retrieval_service import hybrid_search, expand_query, hoist_orientation
+from app.services.timeline_service import MODE_CLIP, MODE_MOMENT
+from app.services.premiere_export_service import normalise_aspect_label
 from app.config import settings
 from app.utils.logger import get_logger
 
@@ -113,6 +116,7 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
         "footage_dir": "",
         "ingested_files": [], "shot_metadata": [], "search_results": [],
         "search_candidates": [], "selected_candidates": [], "selected_shots": [],
+        "editing_mode": "", "target_seconds": None, "aspect_ratio": "",
         "recommendations": [], "edit_timeline": None, "delivery_output": None,
     }
     if extra:
@@ -168,15 +172,16 @@ def _qhash(query: str) -> str:
 
 
 # Timeline-planning tools whose ToolMessage carries the structured plan Delivery consumes.
-# Both the clip-level planner and the event/moment-precise planner emit the same fenced
-# ```json plan shape, so the extractor accepts either (audit H-03).
-_PLAN_TOOLS = (None, "plan_timeline", "plan_moment_timeline")
+# There is one planner per user-facing editing mode — CLIP ASSEMBLY and MOMENT ASSEMBLY —
+# and both emit the same fenced ```json plan shape, so the extractor accepts either
+# (audit H-03) and Delivery compiles them identically.
+_PLAN_TOOLS = (None, "plan_clip_assembly", "plan_moment_assembly")
 
 
 def _extract_plan(messages) -> dict | None:
     """Pull the structured timeline plan from a planning TOOL output.
 
-    Reads the plan out of the plan_timeline / plan_moment_timeline ToolMessage — the
+    Reads the plan out of the plan_clip_assembly / plan_moment_assembly ToolMessage — the
     tool's own output, which the model cannot rewrite — rather than scraping the
     assistant's prose. So the model reformatting its narration can never corrupt or hide
     the plan Delivery receives (audit H-03). Returns the most recent structured plan, or
@@ -293,36 +298,102 @@ def run_search(query: str, project_id, user_id="editor") -> list[dict]:
     return _search_direct(query, project_id)
 
 
-def run_selection(intent: str, selected_paths: list[str],
-                  project_id, user_id) -> tuple[str, dict | None]:
+def _normalise_editing_mode(mode) -> str:
+    """Coerce a UI mode label ("Moment Assembly") to its canonical id, defaulting to clip."""
+    raw = str(mode or "").strip().lower().replace(" ", "_")
+    return MODE_MOMENT if raw == MODE_MOMENT else MODE_CLIP
+
+
+def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
+                  editing_mode: str = MODE_CLIP,
+                  target_seconds: float | None = None,
+                  aspect_ratio: str = "") -> tuple[str, dict | None]:
     """③ Selection — invoke the Selection sub-agent on the curated clips.
 
     Returns ``(narration, structured_plan | None)``. The structured plan is read from the
     planning tool's output (audit H-03), never from the model's prose.
 
-    The agent DECIDES for itself, from the editing intent, whether to build a whole-clip
-    timeline (``plan_timeline`` — head/tail/timed/full) or a MOMENT-PRECISE one
-    (``get_clip_events`` → ``plan_moment_timeline``, trimming to exact event boundaries).
-    An intent that targets specific moments ("a 30s celebration reel") steers it to the
-    event path; there is no separate UI switch.
+    The EDITOR chooses the mode in the UI — there are exactly two, and they differ only in
+    the unit of editing:
+
+      * ``clip_assembly`` — whole clips at their original length, no trimming and no
+        duration control (``target_seconds`` does not apply and is dropped here).
+      * ``moment_assembly`` — moments inside clips, with an OPTIONAL target duration
+        applied as an optimisation over the moments the agent already chose.
+
+    ``aspect_ratio`` is the editor's OUTPUT specification ("16:9", "9:16", "1:1" or a
+    "4:3", "3:4" or "1:1") — an explicit user input, never inferred from the intent.
+    Selection may let it influence WHICH footage it picks, but never modifies media; the
+    label is stamped onto the plan so Delivery can adapt the timeline to that frame. An
+    unusable value raises ``InvalidAspectRatio`` rather than silently delivering a
+    different frame than the one requested.
+
+    The mode, target and aspect ratio ride on state (``editing_mode`` / ``target_seconds``
+    / ``aspect_ratio``) as well as in the message, so the Selection tools enforce the
+    editor's choices rather than trusting the model to honour them.
     """
+    mode = _normalise_editing_mode(editing_mode)
+    aspect = normalise_aspect_label(aspect_ratio)   # raises on an unusable value
+    target = None
+    if mode == MODE_MOMENT:
+        try:
+            target = float(target_seconds) if target_seconds else None
+        except (TypeError, ValueError):
+            target = None
+        if target is not None and target <= 0:
+            target = None
+
     clip_list = "\n".join(f"- {p}" for p in selected_paths)
-    message = (
+    aspect_line = (
+        f"OUTPUT ASPECT RATIO: {aspect} — this is my delivery SPEC, not an editorial "
+        "instruction. You may prefer footage that suits this frame, but you must never "
+        "crop, resize or reframe any media; Delivery scales each clip to FIT the frame "
+        "with its aspect preserved (letterbox/pillarbox where needed).\n\n"
+    ) if aspect else ""
+    common = (
         f"My editing intent: {intent}\n\n"
-        f"The editor has selected these clips for the edit (work ONLY with these):\n{clip_list}\n\n"
-        "Fetch their details and decide the order and each clip's importance. Then plan "
-        "the timeline: if my intent targets specific MOMENTS (a particular action/beat), "
-        "inspect the clips' temporal events with get_clip_events and call "
-        "plan_moment_timeline with the chosen event_ids in order (trims to the exact "
-        "moment); otherwise call plan_timeline (passing my editing-intent text so it can "
-        "detect any target duration). The timeline's structure, pacing and number of steps "
-        "are driven by my intent — do NOT assume a fixed narrative arc. For each step "
-        "explain why the clip sits there, how it connects to the previous clip, and what "
-        "it does for the pacing."
+        f"These are the CANDIDATE clips I ticked in the UI (work ONLY within this set, but "
+        f"do NOT assume all of them belong in the edit):\n{clip_list}\n\n"
+        + aspect_line
     )
+    if mode == MODE_CLIP:
+        message = common + (
+            "EDITING MODE: CLIP ASSEMBLY — the unit of editing is the WHOLE CLIP. Every "
+            "clip you keep stays at its original duration; there is no trimming and no "
+            "target duration in this mode, so ignore any length wording in my intent.\n\n"
+            "Call get_candidate_details on the candidates, decide from my intent which "
+            "clips genuinely belong and in what order, then call plan_clip_assembly with "
+            "the kept clips IN ORDER and every dropped candidate in excluded_json (with "
+            "why it is out and how it could still be used). Structure, pacing and the "
+            "number of steps come from my intent — do NOT assume a fixed narrative arc. "
+            "For each step explain why the clip is in the edit, why it sits there, how it "
+            "connects to its neighbours, and what it does for the pacing."
+        )
+    else:
+        target_line = (f"TARGET DURATION: {target:g} seconds."
+                       if target else "TARGET DURATION: N/A — I did not set one.")
+        message = common + (
+            "EDITING MODE: MOMENT ASSEMBLY — the unit of editing is a MOMENT (temporal "
+            f"event) inside a clip.\n{target_line}\n\n"
+            "Call get_clip_events on ALL the candidate clips to see the moments available "
+            "with their real timecodes. SELECT FIRST, OPTIMISE SECOND: choose enough "
+            "meaningful moments to satisfy my intent before worrying about the clock. Rank "
+            "them by narrative contribution (not length), order them, then call "
+            "plan_moment_assembly with the event_ids IN ORDER, the importance weights"
+            + (", the target duration" if target else "")
+            + ", and any moments you rejected in excluded_json. If the planner reports it "
+            "is still over target after compressing, make an editorial decision rather "
+            "than cutting by length — a small overrun beats losing a key beat. For each "
+            "step explain why the moment is in the edit, why it sits there, how it "
+            "connects to its neighbours, and what it does for the pacing."
+        )
+
     state = _base_state(project_id, {
         "messages": [HumanMessage(content=message)],
         "selected_candidates": list(selected_paths),
+        "editing_mode": mode,
+        "target_seconds": target,
+        "aspect_ratio": aspect,
     })
     result = selection_agent.invoke(state, config=_config("select", user_id, project_id))
     return result["messages"][-1].content, _extract_plan(result["messages"])
@@ -336,18 +407,28 @@ def run_delivery(plan: dict, project_id, user_id,
     the explicit ordered segments the Selection Agent produced. There is NO fallback to
     the Bin/media-pool order — without a structured plan there is no defined edit order
     to compile, so this raises rather than invent one.
+
+    The plan also carries the editor's OUTPUT ASPECT RATIO. The compile tool reads it out
+    of the plan JSON itself (not from a model-supplied argument), so the delivery frame is
+    exactly the one the editor specified in the UI.
     """
     if not (plan and plan.get("segments")):
         raise ValueError(
             "Delivery requires a structured timeline plan (ordered segments) from "
             "Selection. Generate the edit timeline in ③ Selection first — there is no "
             "implicit media-pool-order fallback.")
+    aspect_note = (
+        f"\n\nThe plan's output aspect ratio is {plan['aspect_ratio']}; the tool reads it "
+        "from the JSON and scales each clip to fit that frame (aspect preserved, no crop, "
+        "no stretch). Do not override it."
+    ) if plan.get("aspect_ratio") else ""
     message = (
         f"Compile the timeline into a Premiere Pro project named '{sequence_name}'.\n\n"
         "The Selection Agent produced these STRUCTURED timeline segments. Call "
         "compile_timeline_segments with segments_json set to EXACTLY this JSON — do not "
         "re-order, add, drop, or re-time any segment:\n\n"
         f"{json.dumps(plan)}"
+        f"{aspect_note}"
     )
     state = _base_state(project_id, {
         "messages": [HumanMessage(content=message)],

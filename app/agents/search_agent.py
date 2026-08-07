@@ -84,7 +84,7 @@ def _render(candidates: list[dict]) -> str:
     reads the candidates back from THIS tool output (via ``_extract_candidates``), not from
     the model's prose — so the UI receives the real structured candidates (relevance,
     suggestion, matched_event, ...) it renders, and the model reformatting its narration
-    can never corrupt them. Mirrors how ``plan_timeline`` emits its structured plan.
+    can never corrupt them. Mirrors how the Selection planners emit their structured plan.
     """
     text = _format_candidates(candidates)
     return text + "\n\n```json\n" + json.dumps(candidates, default=str) + "\n```"

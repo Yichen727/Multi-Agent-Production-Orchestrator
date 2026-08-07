@@ -23,12 +23,16 @@ Design rules honoured here (see CLAUDE.md):
         V1  → main video footage
         A1  → ambient / original audio (present when the clip has audio)
         A2  → optional secondary / crowd audio (only when a 2nd audio stream exists)
+    - OUTPUT ASPECT RATIO is adapted here, non-destructively: the sequence raster is set
+      to the ratio the editor asked for and each clip is SCALED TO FIT it with its own
+      aspect preserved — never stretched, never auto-cropped. See the aspect section below.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +52,214 @@ DEFAULT_HEIGHT = 1080
 # Tolerance (seconds) when comparing an explicit out-point against the measured source
 # duration — absorbs float rounding so a legitimately full-length trim isn't rejected.
 _RANGE_EPS = 1e-3
+
+
+# ── Output aspect ratio (the delivery SPEC, shared with the Selection stage) ────
+#
+# The output aspect ratio is an explicit USER INPUT chosen in the Selection UI (16:9,
+# 9:16, 4:3, 3:4 or 1:1) — an OUTPUT SPECIFICATION, never inferred from the editing prompt
+# and never an editorial intention. It travels unchanged through the pipeline
+# (Selection → timeline plan → Delivery) and it is DELIVERY that adapts the timeline to
+# it, here.
+#
+# The parsing + fit helpers live in this module (rather than a service of their own)
+# because the frame geometry IS the compiler's job; the Selection stage imports only
+# ``parse_aspect_ratio`` / ``describe_fit`` so it can PREFER footage that suits the frame
+# — it never modifies, crops or resizes media.
+#
+# ADAPTATION RULES (defaults, deliberately conservative):
+#   * Clips are SCALED TO FIT the target frame, PRESERVING their original aspect ratio.
+#   * Footage is NEVER stretched/distorted to fill the frame — the scale factor is
+#     uniform across both axes, never a separate x/y scale.
+#   * Footage is NEVER auto-cropped to match the requested ratio; cropping would discard
+#     picture the editor may need.
+#   * When source and target ratios differ the ENTIRE image is preserved and the unused
+#     frame area becomes letterboxing (bars top/bottom) or pillarboxing (bars left/right).
+#   * Intelligent reframing / AI-assisted cropping is explicitly OUT of scope — it would
+#     be an opt-in enhancement layered on top, never the default workflow.
+
+# The ratios the Selection UI offers, in display order. The parser below accepts any
+# W:H, but these five are the supported, user-selectable set.
+ASPECT_CHOICES: tuple[str, ...] = ("16:9", "9:16", "4:3", "3:4", "1:1")
+
+# The target raster fixes the SHORT edge and derives the long one from the ratio, which
+# gives the conventional raster for each choice: 16:9 → 1920x1080, 9:16 → 1080x1920,
+# 4:3 → 1440x1080, 3:4 → 1080x1440, 1:1 → 1080x1080. An explicit width/height overrides it.
+BASE_SHORT_EDGE = 1080
+
+# Sanity bounds — reject nonsense like "0:5" or "5000:1" rather than emit a broken raster.
+_MIN_ASPECT = 0.05
+_MAX_ASPECT = 20.0
+_ASPECT_EPS = 1e-3
+
+# "16:9", "16x9", "16/9", "2.39:1", or a bare decimal ("1.78" → 1.78:1).
+_ASPECT_PAIR_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[:x×/]\s*(\d+(?:\.\d+)?)\s*$", re.I)
+_ASPECT_BARE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*$")
+
+
+class InvalidAspectRatio(ValueError):
+    """The requested output aspect ratio could not be understood or is out of range.
+
+    Raised instead of silently falling back to a default: the ratio is an explicit output
+    SPEC the editor chose, so delivering a different frame than the one they asked for
+    would be worse than refusing.
+    """
+
+
+def _even(n: float) -> int:
+    """Round to the nearest EVEN pixel — odd rasters break many codecs (e.g. 4:2:0 H.264)."""
+    return max(2, int(round(n / 2.0)) * 2)
+
+
+def _trim_num(value: float) -> str:
+    """Render 16.0 as '16' and 2.39 as '2.39' (labels keep the shape the user typed)."""
+    return f"{value:g}"
+
+
+def aspect_orientation(ratio: float) -> str:
+    """Classify a ratio as ``landscape`` / ``portrait`` / ``square`` (catalogue terms)."""
+    if ratio > 1.05:
+        return "landscape"
+    if ratio < 0.95:
+        return "portrait"
+    return "square"
+
+
+def parse_aspect_ratio(text) -> dict | None:
+    """Parse a user-supplied output aspect ratio into a normalised spec, or ``None``.
+
+    The UI offers ``16:9`` / ``9:16`` / ``4:3`` / ``3:4`` / ``1:1``; the parser is
+    deliberately more permissive and accepts any ``W:H`` / ``WxH`` / ``W/H`` plus a bare
+    decimal (``1.78`` → ``1.78:1``), so a caller is never blocked by the UI's shortlist.
+    Blank/``None`` means "no ratio requested" and returns ``None``, in which case the
+    caller keeps its existing behaviour
+    (the raster is inferred from the footage) — that is what makes the parameter safely
+    optional and backward-compatible. An already-parsed spec dict passes through.
+
+    Returns:
+        ``{"label", "ratio", "width", "height", "orientation"}`` — ``width``/``height``
+        being the concrete target raster in pixels (short edge = ``BASE_SHORT_EDGE``).
+
+    Raises:
+        InvalidAspectRatio: the value is non-empty but not a usable ratio.
+    """
+    if text is None:
+        return None
+    if isinstance(text, dict):
+        return text if text.get("width") and text.get("height") else None
+    raw = str(text).strip()
+    if not raw:
+        return None
+
+    m = _ASPECT_PAIR_RE.match(raw)
+    if m:
+        w_part, h_part = float(m.group(1)), float(m.group(2))
+        if w_part <= 0 or h_part <= 0:
+            raise InvalidAspectRatio(f"'{raw}' is not a usable aspect ratio (zero side).")
+        ratio = w_part / h_part
+        label = f"{_trim_num(w_part)}:{_trim_num(h_part)}"
+    else:
+        b = _ASPECT_BARE_RE.match(raw)
+        if not b:
+            raise InvalidAspectRatio(
+                f"Could not read '{raw}' as an aspect ratio. Use W:H — e.g. 16:9, 9:16, "
+                "4:3, 3:4, 1:1.")
+        ratio = float(b.group(1))
+        if ratio <= 0:
+            raise InvalidAspectRatio(f"'{raw}' is not a usable aspect ratio.")
+        label = f"{_trim_num(ratio)}:1"
+
+    if not (_MIN_ASPECT <= ratio <= _MAX_ASPECT):
+        raise InvalidAspectRatio(
+            f"Aspect ratio '{raw}' ({ratio:.3g}:1) is outside the supported range "
+            f"{_MIN_ASPECT}-{_MAX_ASPECT}.")
+
+    if ratio >= 1.0:
+        width, height = _even(BASE_SHORT_EDGE * ratio), BASE_SHORT_EDGE
+    else:
+        width, height = BASE_SHORT_EDGE, _even(BASE_SHORT_EDGE / ratio)
+
+    return {"label": label, "ratio": round(ratio, 6),
+            "width": int(width), "height": int(height),
+            "orientation": aspect_orientation(ratio)}
+
+
+def normalise_aspect_label(text) -> str:
+    """The canonical label for a requested ratio (``''`` when none was requested)."""
+    spec = parse_aspect_ratio(text)
+    return spec["label"] if spec else ""
+
+
+def fit_within(src_width, src_height, dst_width: int, dst_height: int) -> dict:
+    """Compute the NON-DESTRUCTIVE fit of a source frame inside the target frame.
+
+    ONE uniform scale factor — ``min(dst_w/src_w, dst_h/src_h)`` — is applied to both
+    axes, so the whole image is preserved at its original shape. Nothing is stretched (the
+    axes never get different factors) and nothing is cropped (the factor is the MINIMUM,
+    so the image always lands inside the frame). Leftover frame area is reported as
+    letterboxing/pillarboxing instead of being filled by enlarging the picture.
+
+    Args:
+        src_width / src_height: The clip's MEASURED pixel dimensions. ``0``/``None``
+            (never measured) yields ``mode='unknown'`` and no scale — the caller then
+            leaves the clip untransformed rather than guessing.
+        dst_width / dst_height: The target raster.
+
+    Returns:
+        ``{"mode", "scale", "scale_percent", "fitted_width", "fitted_height",
+        "source_ratio", "target_ratio", "coverage", "bar_axis", "note"}``. ``mode`` is
+        ``exact`` | ``letterbox`` | ``pillarbox`` | ``unknown``; ``scale_percent`` is the
+        FCP7/Premiere Basic-Motion scale (100 = source at its native pixel size).
+    """
+    sw, sh = float(src_width or 0), float(src_height or 0)
+    dw, dh = float(dst_width or 0), float(dst_height or 0)
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        return {"mode": "unknown", "scale": None, "scale_percent": None,
+                "fitted_width": None, "fitted_height": None, "source_ratio": None,
+                "target_ratio": round(dw / dh, 6) if dh else None,
+                "coverage": None, "bar_axis": None,
+                "note": "source dimensions were never measured — left untransformed"}
+
+    src_ratio, dst_ratio = sw / sh, dw / dh
+    scale = min(dw / sw, dh / sh)
+    fitted_w, fitted_h = sw * scale, sh * scale
+
+    if abs(src_ratio - dst_ratio) <= _ASPECT_EPS:
+        mode, bar_axis = "exact", None
+        note = "fills the frame exactly"
+    elif src_ratio > dst_ratio:
+        # Wider than the frame → fits by width → spare height becomes bars top/bottom.
+        mode, bar_axis = "letterbox", "vertical"
+        note = (f"letterboxed - full width, {fitted_h / dh:.0%} of the frame height "
+                "(bars top/bottom)")
+    else:
+        mode, bar_axis = "pillarbox", "horizontal"
+        note = (f"pillarboxed - full height, {fitted_w / dw:.0%} of the frame width "
+                "(bars left/right)")
+
+    return {"mode": mode, "scale": round(scale, 6),
+            "scale_percent": round(scale * 100.0, 4),
+            "fitted_width": round(fitted_w, 2), "fitted_height": round(fitted_h, 2),
+            "source_ratio": round(src_ratio, 6), "target_ratio": round(dst_ratio, 6),
+            "coverage": round((fitted_w * fitted_h) / (dw * dh), 4),
+            "bar_axis": bar_axis, "note": note}
+
+
+def describe_fit(src_width, src_height, aspect) -> str:
+    """One-line note on how a clip will sit in the target frame (for the SELECTION stage).
+
+    This is what lets Selection take the output ratio into account when deciding which
+    footage serves the edit — a landscape shot in a 9:16 frame keeps only about a third of
+    the height, so portrait-friendly material is usually the better pick — WITHOUT the
+    stage ever cropping, resizing or otherwise touching the media.
+    """
+    spec = parse_aspect_ratio(aspect)
+    if not spec:
+        return ""
+    fit = fit_within(src_width, src_height, spec["width"], spec["height"])
+    if fit["mode"] == "unknown":
+        return f"{spec['label']}: source size unknown"
+    return f"{spec['label']}: {fit['note']}"
 
 
 class InvalidSegmentRange(ValueError):
@@ -160,6 +372,7 @@ def build_timeline(
     fps: float | None = None,
     width: int | None = None,
     height: int | None = None,
+    aspect_ratio=None,
 ) -> dict:
     """Build the structured JSON timeline from ordered, resolved clips.
 
@@ -170,25 +383,44 @@ def build_timeline(
 
     Args:
         clips: Ordered list of resolved clip dicts. Each MUST have ``file_path``. Optional
-            keys read here: ``duration_seconds``, ``fps``, ``has_audio``,
-            ``audio_streams`` (int count of audio streams if probed), ``role``,
-            ``shot_id``, ``in_point`` / ``out_point`` (seconds).
+            keys read here: ``duration_seconds``, ``fps``, ``width``, ``height``,
+            ``has_audio``, ``audio_streams`` (int count of audio streams if probed),
+            ``role``, ``shot_id``, ``in_point`` / ``out_point`` (seconds).
         sequence_name: Name of the resulting Premiere sequence.
         fps: Sequence frame rate (timebase). Falls back to the first clip's fps, then
             ``DEFAULT_FPS``.
-        width / height: Sequence raster size; falls back to the first clip's, then the
-            default 1920×1080.
+        width / height: Explicit sequence raster override. Wins over ``aspect_ratio``;
+            otherwise falls back to the first clip's size, then the default 1920x1080.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio ("16:9", "9:16", "1:1",
+            "2.39:1", ...). When given, it sets the sequence raster and each clip gets a
+            ``frame_fit`` describing how it is SCALED TO FIT that frame with its own
+            aspect preserved — never stretched, never cropped, the leftover area becoming
+            letterboxing/pillarboxing. ``None`` keeps the previous behaviour (raster
+            inferred from the footage) and adds no transform.
 
     Returns:
         A dict with ``sequence`` metadata and an ordered ``clips`` list, each entry
-        carrying both seconds and frame-accurate in/out and sequence start/end. This is
-        the intermediate that ``to_fcp7_xml`` (or any other exporter) consumes.
+        carrying both seconds and frame-accurate in/out and sequence start/end, plus its
+        ``frame_fit``. This is the intermediate that ``to_fcp7_xml`` (or any other
+        exporter) consumes.
+
+    Raises:
+        InvalidAspectRatio: ``aspect_ratio`` was supplied but is not a usable ratio — the
+            spec is refused rather than quietly delivering a different frame.
     """
     first = clips[0] if clips else {}
     seq_fps = float(fps or first.get("fps") or DEFAULT_FPS) or DEFAULT_FPS
     timebase, seq_ntsc = _timebase_ntsc(seq_fps)
-    seq_w = int(width or first.get("width") or DEFAULT_WIDTH)
-    seq_h = int(height or first.get("height") or DEFAULT_HEIGHT)
+
+    # The requested output ratio defines the DELIVERY frame; an explicit width/height
+    # still wins (a caller that knows the exact raster is more specific than a ratio).
+    aspect = parse_aspect_ratio(aspect_ratio)
+    if aspect:
+        seq_w = int(width or aspect["width"])
+        seq_h = int(height or aspect["height"])
+    else:
+        seq_w = int(width or first.get("width") or DEFAULT_WIDTH)
+        seq_h = int(height or first.get("height") or DEFAULT_HEIGHT)
 
     entries: list[dict] = []
     playhead_frames = 0  # cumulative sequence position, in frames
@@ -254,6 +486,11 @@ def build_timeline(
         audio_bit_depth = int(clip.get("audio_bit_depth") or 0) or (
             DEFAULT_AUDIO_BIT_DEPTH if has_audio else 0)
 
+        # Non-destructive adaptation to the delivery frame (audit: no crop, no stretch).
+        # Computed from the clip's MEASURED size only — an unmeasured clip gets
+        # mode='unknown' and is left untransformed rather than scaled on a guess.
+        frame_fit = fit_within(clip.get("width"), clip.get("height"), seq_w, seq_h)
+
         abs_path = _absolute_path(file_path)
         entries.append({
             "order": order,
@@ -280,6 +517,7 @@ def build_timeline(
             "seq_end_seconds": round(seq_end_f / timebase, 3),
             "seq_start_frame": seq_start_f,
             "seq_end_frame": seq_end_f,
+            "frame_fit": frame_fit,
         })
 
     return {
@@ -290,6 +528,15 @@ def build_timeline(
             "ntsc": seq_ntsc,
             "width": seq_w,
             "height": seq_h,
+            "aspect_ratio": aspect["label"] if aspect else None,
+            "aspect_ratio_value": aspect["ratio"] if aspect else round(seq_w / seq_h, 6),
+            # How the timeline was adapted to the frame. 'fit' is the ONLY mode: scale to
+            # fit, aspect preserved, no crop, no stretch (see the module header).
+            "adaptation": "fit",
+            "letterboxed_clips": sum(1 for e in entries
+                                     if e["frame_fit"]["mode"] == "letterbox"),
+            "pillarboxed_clips": sum(1 for e in entries
+                                     if e["frame_fit"]["mode"] == "pillarbox"),
             "total_frames": playhead_frames,
             "total_seconds": round(playhead_frames / timebase, 3),
             "clip_count": len(entries),
@@ -398,6 +645,62 @@ def _file_element(clip: dict, file_id: str, define: bool, indent: str) -> str:
     )
 
 
+def _fit_filter_xml(frame_fit: dict, indent: str) -> str:
+    """A Basic Motion filter that SCALES the clip to fit the delivery frame.
+
+    FCP7/Premiere express a clip's geometry as the ``basic`` motion effect, where
+    ``scale`` = 100 means the source is shown at its NATIVE pixel size inside the
+    sequence raster. So the uniform fit factor from :func:`fit_within` maps directly to
+    ``scale = 100 x fit``:
+
+        - one scale parameter for BOTH axes → the image cannot be stretched or distorted;
+        - it is the MINIMUM of the two axis ratios → the whole frame stays inside the
+          raster, so nothing is cropped;
+        - ``center`` is pinned at (0, 0) → the image is centred, never reframed. Any
+          leftover raster area is letterbox/pillarbox, which is the intended default.
+
+    Returns ``""`` — no filter at all — when the clip already fills the frame exactly, or
+    when its source size was never measured (in which case there is no honest transform
+    to apply and Premiere is left to handle the clip itself).
+    """
+    scale = frame_fit.get("scale_percent")
+    if frame_fit.get("mode") in ("exact", "unknown") or not scale:
+        return ""
+    return (
+        f"{indent}<filter>\n"
+        f"{indent}  <effect>\n"
+        f"{indent}    <name>Basic Motion</name>\n"
+        f"{indent}    <effectid>basic</effectid>\n"
+        f"{indent}    <effectcategory>motion</effectcategory>\n"
+        f"{indent}    <effecttype>motion</effecttype>\n"
+        f"{indent}    <mediatype>video</mediatype>\n"
+        f"{indent}    <parameter>\n"
+        f"{indent}      <parameterid>scale</parameterid>\n"
+        f"{indent}      <name>Scale</name>\n"
+        f"{indent}      <valuemin>0</valuemin>\n"
+        f"{indent}      <valuemax>1000</valuemax>\n"
+        f"{indent}      <value>{scale:g}</value>\n"
+        f"{indent}    </parameter>\n"
+        f"{indent}    <parameter>\n"
+        f"{indent}      <parameterid>center</parameterid>\n"
+        f"{indent}      <name>Center</name>\n"
+        f"{indent}      <value>\n"
+        f"{indent}        <horiz>0</horiz>\n"
+        f"{indent}        <vert>0</vert>\n"
+        f"{indent}      </value>\n"
+        f"{indent}    </parameter>\n"
+        f"{indent}    <parameter>\n"
+        f"{indent}      <parameterid>rotation</parameterid>\n"
+        f"{indent}      <name>Rotation</name>\n"
+        f"{indent}      <valuemin>-8640</valuemin>\n"
+        f"{indent}      <valuemax>8640</valuemax>\n"
+        f"{indent}      <value>0</value>\n"
+        f"{indent}    </parameter>\n"
+        f"{indent}  </effect>\n"
+        f"{indent}</filter>"
+    )
+
+
 def _link_xml(refs: list[tuple[str, str, int]], clip_index: int, indent: str) -> str:
     """Build the <link> group shared by a clip's video + audio items.
 
@@ -475,6 +778,10 @@ def to_fcp7_xml(timeline: dict) -> str:
         define_here = clip["absolute_path"] not in defined_files
         defined_files.add(clip["absolute_path"])
         file_xml = _file_element(clip, fid, define_here, "        ")
+        # Scale-to-fit for the delivery frame; empty when the clip already fits exactly
+        # or its size was never measured. Video only — audio carries no geometry.
+        fit_xml = _fit_filter_xml(clip.get("frame_fit") or {}, "        ")
+        fit_xml = f"{fit_xml}\n" if fit_xml else ""
         video_items.append(
             f'      <clipitem id="{v_id}">\n'
             f"        <name>{name}</name>\n"
@@ -487,6 +794,7 @@ def to_fcp7_xml(timeline: dict) -> str:
             f"        <out>{clip['out_frame']}</out>\n"
             f"{comment}"
             f"{file_xml}\n"
+            f"{fit_xml}"
             f"{links_for_clip}\n"
             f"      </clipitem>"
         )
@@ -512,6 +820,10 @@ def to_fcp7_xml(timeline: dict) -> str:
     if audio_tracks:
         audio_block = "  <audio>\n" + "\n".join(audio_tracks) + "\n  </audio>\n"
 
+    # The sequence raster IS the delivery frame (set from the requested output aspect
+    # ratio when one was given). Square pixels + non-anamorphic are declared explicitly so
+    # Premiere cannot re-interpret the raster as a stretched/anamorphic frame — the whole
+    # point of the fit-don't-distort rule.
     video_block = (
         "  <video>\n"
         "    <format>\n"
@@ -519,6 +831,8 @@ def to_fcp7_xml(timeline: dict) -> str:
         f"{_rate_xml(tb, ntsc, '        ')}\n"
         f"        <width>{w}</width>\n"
         f"        <height>{h}</height>\n"
+        "        <pixelaspectratio>square</pixelaspectratio>\n"
+        "        <anamorphic>FALSE</anamorphic>\n"
         "      </samplecharacteristics>\n"
         "    </format>\n"
         "    <track>\n"
@@ -593,6 +907,7 @@ def compile_project(
     fps: float | None = None,
     width: int | None = None,
     height: int | None = None,
+    aspect_ratio=None,
     write: bool = True,
     verify_media: bool = True,
 ) -> dict:
@@ -603,6 +918,9 @@ def compile_project(
         sequence_name: Name of the Premiere sequence.
         project_id: Project id (used for the output filename).
         fps / width / height: Sequence overrides; otherwise inferred from the clips.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio. Sets the delivery frame
+            and scales every clip to FIT it with its own aspect preserved (letterbox /
+            pillarbox where the ratios differ — never cropped, never stretched).
         write: When True, write the ``.xml`` and ``.json`` to
             ``settings.PROCESSED_OUTPUT_DIR / "exports"`` (versioned + atomic).
         verify_media: When True (default), validate every clip's media exists on disk
@@ -622,7 +940,7 @@ def compile_project(
             raise MediaValidationError(report)
 
     timeline = build_timeline(clips, sequence_name=sequence_name, fps=fps,
-                              width=width, height=height)
+                              width=width, height=height, aspect_ratio=aspect_ratio)
     xml = to_fcp7_xml(timeline)
 
     result = {"timeline": timeline, "xml": xml}

@@ -1,0 +1,1633 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="5">
+  <sequence id="sequence-1">
+    <name>MAPO fashion Edit</name>
+    <duration>3623</duration>
+    <rate>
+      <timebase>25</timebase>
+      <ntsc>FALSE</ntsc>
+    </rate>
+    <timecode>
+      <rate>
+        <timebase>25</timebase>
+        <ntsc>FALSE</ntsc>
+      </rate>
+      <string>00:00:00:00</string>
+      <frame>0</frame>
+      <displayformat>NDF</displayformat>
+    </timecode>
+    <media>
+      <video>
+        <format>
+          <samplecharacteristics>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <width>1920</width>
+            <height>1080</height>
+          </samplecharacteristics>
+        </format>
+        <track>
+          <clipitem id="clipitem-v1">
+            <name>25-068_signify_race_track_cutdowns_opening_miami_gp_16x9_9sec_final_v2.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>113</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>0</start>
+            <end>113</end>
+            <in>112</in>
+            <out>225</out>
+            <comments>
+              <mastercomment1>Vertical light bands sweep across the frame while a glowing </mastercomment1>
+            </comments>
+            <file id="file-1">
+              <name>25-068_signify_race_track_cutdowns_opening_miami_gp_16x9_9sec_final_v2.mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/25-068_signify_race_track_cutdowns_opening_miami_gp_16x9_9sec_final_v2.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>225</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v1</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-1</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v2">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>322</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>113</start>
+            <end>435</end>
+            <in>0</in>
+            <out>322</out>
+            <comments>
+              <mastercomment1>A man lifts and spreads a bright red cardigan up in front of</mastercomment1>
+            </comments>
+            <file id="file-2">
+              <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/tnl_tom_daley_hero_9x16_v08_sub.mp4_v1%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>322</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1080</width>
+                    <height>1920</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v2</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-2</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v3">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>174</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>435</start>
+            <end>609</end>
+            <in>938</in>
+            <out>1112</out>
+            <comments>
+              <mastercomment1>Cuts between close-up detail shots of making and tailoring, </mastercomment1>
+            </comments>
+            <file id="file-3">
+              <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung__found_in_translation_v1%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1112</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v3</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>3</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-3</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>3</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v4">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>138</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>609</start>
+            <end>747</end>
+            <in>0</in>
+            <out>138</out>
+            <comments>
+              <mastercomment1>People gather and move into a conference venue, a wristband </mastercomment1>
+            </comments>
+            <file id="file-4">
+              <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung_ifa2025_60sec_16x9_v05a-final_v1%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>138</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v4</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>4</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-4</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>4</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v5">
+            <name>gh_cop30_wrap_v3_16x9_final_clean_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>160</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>747</start>
+            <end>907</end>
+            <in>437</in>
+            <out>597</out>
+            <comments>
+              <mastercomment1>The shot moves from a view through a glass door into a live </mastercomment1>
+            </comments>
+            <file id="file-5">
+              <name>gh_cop30_wrap_v3_16x9_final_clean_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/gh_cop30_wrap_v3_16x9_final_clean_v1%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>597</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v5</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>5</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-5</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>5</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v6">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>237</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>907</start>
+            <end>1144</end>
+            <in>504</in>
+            <out>741</out>
+            <comments>
+              <mastercomment1>A man models a bright sweater, turns to the closet and reach</mastercomment1>
+            </comments>
+            <file id="file-2"/>
+            <link>
+              <linkclipref>clipitem-v6</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>6</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-6</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>6</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v7">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>137</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1144</start>
+            <end>1281</end>
+            <in>1438</in>
+            <out>1575</out>
+            <comments>
+              <mastercomment1>A smartphone rotates from a close-up of its rear cameras to </mastercomment1>
+            </comments>
+            <file id="file-4"/>
+            <link>
+              <linkclipref>clipitem-v7</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>7</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-7</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>7</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v8">
+            <name>red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>150</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1281</start>
+            <end>1431</end>
+            <in>1039</in>
+            <out>1189</out>
+            <comments>
+              <mastercomment1>A man adjusts a red clown nose at a pedestal, then the shot </mastercomment1>
+            </comments>
+            <file id="file-6">
+              <name>red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov (Original).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov%20%28Original%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1189</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v8</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-8</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v9">
+            <name>gh_cop30_wrap_v3_16x9_final_clean_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>138</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1431</start>
+            <end>1569</end>
+            <in>1878</in>
+            <out>2016</out>
+            <comments>
+              <mastercomment1>A man performs soccer-ball freestyle tricks in front of a sm</mastercomment1>
+            </comments>
+            <file id="file-5"/>
+            <link>
+              <linkclipref>clipitem-v9</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-9</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v10">
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>188</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1569</start>
+            <end>1757</end>
+            <in>927</in>
+            <out>1115</out>
+            <comments>
+              <mastercomment1>A person in a hat holds up a phone to film or photograph as </mastercomment1>
+            </comments>
+            <file id="file-7">
+              <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/samsung_9x16_one_shot_challenge_english_clean_v2%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1115</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1080</width>
+                    <height>1920</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v10</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>10</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-10</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>10</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v11">
+            <name>weoy_moke_1._what_traits_make_a_great_business_leader._v1_v1.mov</name>
+            <enabled>TRUE</enabled>
+            <duration>413</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1757</start>
+            <end>2170</end>
+            <in>716</in>
+            <out>1129</out>
+            <comments>
+              <mastercomment1>A woman talks and gestures with her hand while sitting besid</mastercomment1>
+            </comments>
+            <file id="file-8">
+              <name>weoy_moke_1._what_traits_make_a_great_business_leader._v1_v1.mov</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/weoy_moke_1._what_traits_make_a_great_business_leader._v1_v1.mov</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1129</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1080</width>
+                    <height>1920</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>24</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v11</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>11</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-11</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>11</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v12">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>140</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2170</start>
+            <end>2310</end>
+            <in>1298</in>
+            <out>1438</out>
+            <comments>
+              <mastercomment1>Colorful abstract particles swirl and spread across the scre</mastercomment1>
+            </comments>
+            <file id="file-4"/>
+            <link>
+              <linkclipref>clipitem-v12</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>12</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-12</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>12</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v13">
+            <name>25_150_tnl_151025_community_hero_16_9_branded_subs_eng_5b_zl_v05b_v10 (2160p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>129</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2310</start>
+            <end>2439</end>
+            <in>1017</in>
+            <out>1146</out>
+            <comments>
+              <mastercomment1>A crowd stands and applauds as a person on the stage is call</mastercomment1>
+            </comments>
+            <file id="file-9">
+              <name>25_150_tnl_151025_community_hero_16_9_branded_subs_eng_5b_zl_v05b_v10 (2160p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/25_150_tnl_151025_community_hero_16_9_branded_subs_eng_5b_zl_v05b_v10%20%282160p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1146</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>3840</width>
+                    <height>2160</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v13</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>13</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-13</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>13</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v14">
+            <name>TNL_WARWICK_HERO_Delivery CLEAN.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>99</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2439</start>
+            <end>2538</end>
+            <in>2673</in>
+            <out>2772</out>
+            <comments>
+              <mastercomment1>A group stands together posing and smiling while the camera </mastercomment1>
+            </comments>
+            <file id="file-10">
+              <name>TNL_WARWICK_HERO_Delivery CLEAN.mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/TNL_WARWICK_HERO_Delivery%20CLEAN.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>2772</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v14</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>14</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-14</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>14</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v15">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>162</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2538</start>
+            <end>2700</end>
+            <in>546</in>
+            <out>708</out>
+            <comments>
+              <mastercomment1>The video cuts from a close-up product shot of a robot vacuu</mastercomment1>
+            </comments>
+            <file id="file-4"/>
+            <link>
+              <linkclipref>clipitem-v15</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>15</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-15</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>15</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v16">
+            <name>red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>155</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2700</start>
+            <end>2855</end>
+            <in>1614</in>
+            <out>1769</out>
+            <comments>
+              <mastercomment1>The camera pans away from a man with a red clown nose to rev</mastercomment1>
+            </comments>
+            <file id="file-6"/>
+            <link>
+              <linkclipref>clipitem-v16</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>16</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-16</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>16</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v17">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>143</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2855</start>
+            <end>2998</end>
+            <in>1889</in>
+            <out>2032</out>
+            <comments>
+              <mastercomment1>A person walks from backstage onto the white set and settles</mastercomment1>
+            </comments>
+            <file id="file-3"/>
+            <link>
+              <linkclipref>clipitem-v17</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>17</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-17</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>17</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v18">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>93</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2998</start>
+            <end>3091</end>
+            <in>322</in>
+            <out>415</out>
+            <comments>
+              <mastercomment1>A man stands facing the camera, talks while gesturing with o</mastercomment1>
+            </comments>
+            <file id="file-2"/>
+            <link>
+              <linkclipref>clipitem-v18</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>18</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-18</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>18</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v19">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>131</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3091</start>
+            <end>3222</end>
+            <in>590</in>
+            <out>721</out>
+            <comments>
+              <mastercomment1>A person holds a smartphone showing a photo, swipes or circl</mastercomment1>
+            </comments>
+            <file id="file-3"/>
+            <link>
+              <linkclipref>clipitem-v19</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>19</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-19</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>19</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v20">
+            <name>23-018_gh_website_loop_16x9_30s (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>59</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3222</start>
+            <end>3281</end>
+            <in>488</in>
+            <out>547</out>
+            <comments>
+              <mastercomment1>The shot cuts from a woman speaking into a microphone to thr</mastercomment1>
+            </comments>
+            <file id="file-11">
+              <name>23-018_gh_website_loop_16x9_30s (Original).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/23-018_gh_website_loop_16x9_30s%20%28Original%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>547</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+              </media>
+            </file>
+
+          </clipitem>
+          <clipitem id="clipitem-v21">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>169</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3281</start>
+            <end>3450</end>
+            <in>831</in>
+            <out>1000</out>
+            <comments>
+              <mastercomment1>A presenter stands onstage speaking while the large display </mastercomment1>
+            </comments>
+            <file id="file-4"/>
+            <link>
+              <linkclipref>clipitem-v21</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>21</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-21</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>21</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v22">
+            <name>runner-cut_v2_v1.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>113</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3450</start>
+            <end>3563</end>
+            <in>1802</in>
+            <out>1915</out>
+            <comments>
+              <mastercomment1>A smiling woman reaches out and makes a high-five with anoth</mastercomment1>
+            </comments>
+            <file id="file-12">
+              <name>runner-cut_v2_v1.mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/runner-cut_v2_v1.mp4</pathurl>
+              <rate>
+                <timebase>24</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1915</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>24</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1088</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v22</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>22</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-22</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>22</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v23">
+            <name>23-018_gh_website_loop_16x9_30s (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>60</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3563</start>
+            <end>3623</end>
+            <in>682</in>
+            <out>742</out>
+            <comments>
+              <mastercomment1>Cuts from a close-up of a woman smiling and singing into a m</mastercomment1>
+            </comments>
+            <file id="file-11"/>
+
+          </clipitem>
+        </track>
+      </video>
+      <audio>
+        <track>
+          <clipitem id="clipitem-a1-1">
+            <name>25-068_signify_race_track_cutdowns_opening_miami_gp_16x9_9sec_final_v2.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>113</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>0</start>
+            <end>113</end>
+            <in>112</in>
+            <out>225</out>
+            <file id="file-1"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v1</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-1</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-2">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>322</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>113</start>
+            <end>435</end>
+            <in>0</in>
+            <out>322</out>
+            <file id="file-2"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v2</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-2</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-3">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>174</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>435</start>
+            <end>609</end>
+            <in>938</in>
+            <out>1112</out>
+            <file id="file-3"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v3</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>3</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-3</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>3</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-4">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>138</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>609</start>
+            <end>747</end>
+            <in>0</in>
+            <out>138</out>
+            <file id="file-4"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v4</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>4</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-4</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>4</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-5">
+            <name>gh_cop30_wrap_v3_16x9_final_clean_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>160</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>747</start>
+            <end>907</end>
+            <in>437</in>
+            <out>597</out>
+            <file id="file-5"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v5</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>5</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-5</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>5</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-6">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>237</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>907</start>
+            <end>1144</end>
+            <in>504</in>
+            <out>741</out>
+            <file id="file-2"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v6</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>6</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-6</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>6</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-7">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>137</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1144</start>
+            <end>1281</end>
+            <in>1438</in>
+            <out>1575</out>
+            <file id="file-4"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v7</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>7</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-7</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>7</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-8">
+            <name>red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>150</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1281</start>
+            <end>1431</end>
+            <in>1039</in>
+            <out>1189</out>
+            <file id="file-6"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v8</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-8</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>8</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-9">
+            <name>gh_cop30_wrap_v3_16x9_final_clean_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>138</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1431</start>
+            <end>1569</end>
+            <in>1878</in>
+            <out>2016</out>
+            <file id="file-5"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v9</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-9</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>9</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-10">
+            <name>samsung_9x16_one_shot_challenge_english_clean_v2 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>188</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1569</start>
+            <end>1757</end>
+            <in>927</in>
+            <out>1115</out>
+            <file id="file-7"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v10</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>10</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-10</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>10</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-11">
+            <name>weoy_moke_1._what_traits_make_a_great_business_leader._v1_v1.mov</name>
+            <enabled>TRUE</enabled>
+            <duration>413</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>1757</start>
+            <end>2170</end>
+            <in>716</in>
+            <out>1129</out>
+            <file id="file-8"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v11</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>11</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-11</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>11</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-12">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>140</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2170</start>
+            <end>2310</end>
+            <in>1298</in>
+            <out>1438</out>
+            <file id="file-4"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v12</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>12</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-12</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>12</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-13">
+            <name>25_150_tnl_151025_community_hero_16_9_branded_subs_eng_5b_zl_v05b_v10 (2160p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>129</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2310</start>
+            <end>2439</end>
+            <in>1017</in>
+            <out>1146</out>
+            <file id="file-9"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v13</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>13</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-13</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>13</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-14">
+            <name>TNL_WARWICK_HERO_Delivery CLEAN.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>99</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2439</start>
+            <end>2538</end>
+            <in>2673</in>
+            <out>2772</out>
+            <file id="file-10"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v14</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>14</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-14</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>14</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-15">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>162</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2538</start>
+            <end>2700</end>
+            <in>546</in>
+            <out>708</out>
+            <file id="file-4"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v15</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>15</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-15</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>15</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-16">
+            <name>red_nose_22_005_hero_master_16x9_broadcast_patched_version.mov (Original).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>155</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2700</start>
+            <end>2855</end>
+            <in>1614</in>
+            <out>1769</out>
+            <file id="file-6"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v16</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>16</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-16</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>16</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-17">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>143</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2855</start>
+            <end>2998</end>
+            <in>1889</in>
+            <out>2032</out>
+            <file id="file-3"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v17</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>17</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-17</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>17</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-18">
+            <name>tnl_tom_daley_hero_9x16_v08_sub.mp4_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>93</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>2998</start>
+            <end>3091</end>
+            <in>322</in>
+            <out>415</out>
+            <file id="file-2"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v18</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>18</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-18</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>18</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-19">
+            <name>samsung__found_in_translation_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>131</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3091</start>
+            <end>3222</end>
+            <in>590</in>
+            <out>721</out>
+            <file id="file-3"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v19</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>19</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-19</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>19</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-21">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>169</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3281</start>
+            <end>3450</end>
+            <in>831</in>
+            <out>1000</out>
+            <file id="file-4"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v21</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>21</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-21</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>21</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-22">
+            <name>runner-cut_v2_v1.mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>113</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>3450</start>
+            <end>3563</end>
+            <in>1802</in>
+            <out>1915</out>
+            <file id="file-12"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v22</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>22</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-22</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>22</clipindex>
+            </link>
+          </clipitem>
+        </track>
+      </audio>
+    </media>
+  </sequence>
+</xmeml>

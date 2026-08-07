@@ -1,22 +1,28 @@
-"""Selection / Editorial Assistant Agent — edit-timeline orchestration.
+"""Selection / Assistant-Editor Agent — edit-timeline orchestration.
 
 The editorial stage of the MAPO pipeline (Ingest → Search → Selection → Delivery). It
 does not produce a quality-ranked LIST; it produces an ordered EDIT TIMELINE from the
 clips the editor curated in the UI, which the Delivery Agent then compiles verbatim.
 
-Division of labour (design intent):
-    - The LLM parses the editing INTENT (video type, emotion, pace, style).
-    - It then chooses a timeline STRUCTURE that fits THAT intent — there is no fixed
-      template. A highlight reel, a cinematic vlog, a promo montage, a tactical
-      breakdown and a travel video can each want a different shape, pacing, and number
-      of steps. The agent lays the curated clips into ordered "Timeline Steps",
-      explaining for each why it sits there, how it connects to the previous clip, and
-      what it does for the pacing.
-    - Quality is used ONLY to FILTER (drop clearly weak clips), never to order.
+There are exactly TWO user-facing editing modes, chosen by the editor in the UI. They
+differ only in the UNIT of editing:
 
-It is an assistant editor: it proposes a timeline and explains it; the editor always
-makes the final decision (Human-in-the-Loop). Its input is the user-selected
-candidates, not raw Search output.
+    CLIP ASSEMBLY   — combine COMPLETE clips into a coherent timeline. Each clip keeps
+                      its original duration; nothing is trimmed and a target duration
+                      does not apply. The agent's job is purely editorial: drop the
+                      candidates that do not serve the intent, decide the order, and
+                      explain it. (vlog, documentary, travel, BTS, atmosphere montage)
+    MOMENT ASSEMBLY — build the edit from meaningful MOMENTS inside longer clips. The
+                      agent inspects each clip's temporal events, picks the relevant
+                      ones, ranks their importance and arranges them. A target duration
+                      is OPTIONAL here and is applied as an optimisation over already-
+                      chosen moments — never as an allocation that splits time between
+                      them.
+
+Division of labour: the LLM does the EDITORIAL reasoning (what belongs, in what order,
+what matters most, what to drop and why); ``timeline_service`` does the deterministic
+arithmetic (boundaries, compression, validation). The agent is an assistant editor — it
+proposes and explains; the editor always makes the final call (Human-in-the-Loop).
 """
 
 import json
@@ -36,8 +42,11 @@ from app.services.database_service import (
 from app.services.catalogue_resolver import resolve_ordered
 from app.services.retrieval_service import group_size
 from app.services.timeline_service import (
-    parse_target_duration, plan_segments, plan_event_segments,
+    MODE_CLIP, MODE_MOMENT, build_clip_timeline, build_moment_timeline,
 )
+# Output-aspect helpers only — Selection READS the delivery spec to prefer footage that
+# suits the frame; adapting the media to it is exclusively Delivery's job.
+from app.services.premiere_export_service import describe_fit, normalise_aspect_label
 from app.utils.logger import get_logger
 
 logger = get_logger("selection_agent")
@@ -60,6 +69,93 @@ def _pid_from_state(state) -> int:
         return 1
 
 
+def _mode_from_state(state) -> str:
+    """The EDITOR's chosen editing mode, injected from state (never model-supplied).
+
+    The mode is a UI decision, so the model cannot switch it by calling the other
+    planner: each planning tool checks this and refuses a mismatch. An empty/unknown
+    value means "not set by the UI" and leaves both planners open (direct/programmatic
+    invocation).
+    """
+    raw = str((state or {}).get("editing_mode") or "").strip().lower().replace(" ", "_")
+    return raw if raw in (MODE_CLIP, MODE_MOMENT) else ""
+
+
+def _target_from_state(state) -> float | None:
+    """The editor's optional Target Duration (seconds), injected from state."""
+    try:
+        value = float((state or {}).get("target_seconds"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _aspect_from_state(state) -> str:
+    """The editor's OUTPUT aspect ratio label, injected from state (``''`` if unset).
+
+    An explicit user input and an output SPECIFICATION — never inferred from the editing
+    prompt and never model-supplied, so the agent cannot change the delivery frame. The
+    planners stamp it onto the plan so it reaches Delivery unchanged.
+    """
+    try:
+        return normalise_aspect_label((state or {}).get("aspect_ratio"))
+    except ValueError:      # InvalidAspectRatio — validated upstream; ignore here
+        return ""
+
+
+def _wrong_mode(state, wanted: str) -> str | None:
+    """Refusal message when a planner is called in the other editing mode, else ``None``."""
+    mode = _mode_from_state(state)
+    if not mode or mode == wanted:
+        return None
+    other = "Clip Assembly" if mode == MODE_CLIP else "Moment Assembly"
+    tool_name = ("plan_clip_assembly" if mode == MODE_CLIP else "plan_moment_assembly")
+    return (f"The editor selected {other} mode in the UI, so this planner does not apply. "
+            f"Call `{tool_name}` instead — the editing mode is the editor's decision, "
+            "not yours.")
+
+
+def _split(text: str | None, sep: str = ",") -> list[str]:
+    return [t.strip() for t in (text or "").split(sep) if t.strip()]
+
+
+def _floats(text: str | None) -> list[float] | None:
+    """Parse a comma-separated weight list; unparseable entries fall back to 1.0."""
+    tokens = _split(text)
+    if not tokens:
+        return None
+    out = []
+    for t in tokens:
+        try:
+            out.append(float(t))
+        except ValueError:
+            out.append(1.0)
+    return out
+
+
+def _plan_block(lines: list[str], plan: dict) -> str:
+    """Append the fenced ```json plan the orchestrator reads back (never model prose)."""
+    if plan.get("aspect_ratio"):
+        lines += ["", (f"🖼️ Output aspect ratio: {plan['aspect_ratio']} — Delivery scales "
+                       "each clip to FIT this frame with its own aspect preserved "
+                       "(letterbox/pillarbox as needed). No source media is cropped, "
+                       "resized or reframed.")]
+    if not plan.get("valid", True):
+        bad = plan.get("validation_errors", [])
+        lines += ["", f"⛔ {len(bad)} segment(s) are INVALID and will block export:"]
+        lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad]
+    excluded = plan.get("excluded") or []
+    if excluded:
+        lines += ["", f"🗂️ Alternative / backup material ({len(excluded)} not in the edit):"]
+        for x in excluded:
+            note = x["reason"] or "no reason given"
+            if x["suggested_use"]:
+                note += f" · could be used for: {x['suggested_use']}"
+            lines.append(f"   • {x['name'] or x['ref']}: {note}")
+    lines += ["", "```json", json.dumps(plan), "```"]
+    return "\n".join(lines)
+
+
 # ── Tools: candidate enrichment, timeline planning, delivery ────────────────────
 
 
@@ -68,25 +164,37 @@ def get_candidate_details(identifiers: str,
                           state: Annotated[dict, InjectedState] = None) -> str:
     """Fetch full metadata for the editor-curated candidates.
 
-    Use this on the clips the user selected in the UI so you can place each in the
-    timeline from its real attributes (shot_type, camera_motion, mood, people_count,
-    duration, etc.). Resolution is scoped to the current project.
+    Use this on the clips the user selected in the UI so you can judge — from real
+    attributes (shot_type, camera_motion, mood, people_count, duration, ...) — which of
+    them actually serve the editing intent and where each belongs. Resolution is scoped
+    to the current project.
+
+    When the editor set an output aspect ratio, each clip also carries ``frame_fit``: how
+    that clip will sit in the delivery frame (fills it exactly / letterboxed /
+    pillarboxed, and how much of the frame the picture covers). Use it as ONE input when
+    choosing footage — it tells you nothing gets cropped, only how much frame the shot
+    actually uses.
 
     Args:
         identifiers: Comma-separated shot IDs and/or file names/paths
             (e.g. "3, IMG_5231.MOV, /footage/goal.mov").
     """
     project_id = _pid_from_state(state)
-    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
+    tokens = _split(identifiers)
     rows, problems = resolve_ordered(project_id, tokens)
     if not rows:
         detail = "No matching catalogued clips for those identifiers in this project."
         if problems:
             detail += "\n" + "\n".join(f"  • {t}: {r}" for t, r in problems)
         return detail
+    aspect = _aspect_from_state(state)
     for r in rows:
         r.pop("_identifier", None)
         r["group_size"] = group_size(r.get("people_count"))
+        if aspect:
+            # Descriptive only: how the clip sits in the requested frame. Nothing here
+            # crops, resizes or reframes the media — Delivery does the fitting.
+            r["frame_fit"] = describe_fit(r.get("width"), r.get("height"), aspect)
     out = json.dumps(rows, indent=2, default=str)
     if problems:
         out += ("\n\nCould not resolve (fix these — nothing was fabricated):\n"
@@ -95,50 +203,98 @@ def get_candidate_details(identifiers: str,
 
 
 @tool
-def plan_timeline(ordered_identifiers: str, importance: str = None,
-                  target_duration_text: str = None,
-                  head_trim: float = 0.0, tail_trim: float = 0.0,
-                  state: Annotated[dict, InjectedState] = None) -> str:
-    """Turn an ORDERED clip list into a structured timeline plan (segments for Delivery).
+def get_clip_events(identifiers: str,
+                    state: Annotated[dict, InjectedState] = None) -> str:
+    """List the temporal MOMENTS (what happens, with real timecodes) inside curated clips.
 
-    This is what makes the timeline concrete: it resolves each clip's real duration,
-    decides the operating mode, and returns machine-readable SEGMENTS the Delivery Agent
-    compiles verbatim. Call it once you have decided the clip ORDER and each clip's
-    IMPORTANCE.
+    This is the first step of MOMENT ASSEMBLY: call it on ALL the curated clips to see the
+    ordered moments available to you — each moment's measured in/out timecodes, its length,
+    the action, and its keywords — so you can choose which ones the edit actually needs.
+    Resolution is scoped to the current project.
 
-    MODE is chosen automatically:
-      • TRIM MODE — you pass ``head_trim`` and/or ``tail_trim``. Drops that many seconds
-        off the START / END of EVERY clip and keeps the FULL remaining middle; clips are
-        assembled sequentially in order, untrimmed otherwise. Use this for a per-clip
-        head/tail trim like "trim the first 2s and last 2s of each clip". Takes
-        precedence over any target duration.
-      • TIMED MODE — no head/tail trim, but a total duration is detected in
-        ``target_duration_text`` (e.g. "15s", "1 min", "1:30"). The target length is
-        split across the clips PROPORTIONALLY TO IMPORTANCE and each clip is TRIMMED to
-        its share, giving a time-coded timeline whose total ≈ the target.
-      • FULL CLIP MODE — neither. Clips keep their FULL length, concatenated in order.
+    Args:
+        identifiers: Comma-separated shot IDs and/or file names/paths for the clips whose
+            moments you want to inspect.
+
+    Returns:
+        For each resolved clip, its ordered moments as ``event_id · start–end (length) ·
+        action``, plus the total material available. Pass the chosen event_ids IN ORDER
+        to `plan_moment_assembly`.
+    """
+    project_id = _pid_from_state(state)
+    tokens = _split(identifiers)
+    rows, problems = resolve_ordered(project_id, tokens)
+    if not rows:
+        return "No matching catalogued clips for those identifiers in this project."
+    events_by_file = get_catalogued_events(project_id)
+    lines: list[str] = []
+    pool_seconds, pool_count = 0.0, 0
+    for r in rows:
+        fp = r.get("file_path")
+        name = fp.split("/")[-1].split("\\")[-1] if fp else "?"
+        evs = events_by_file.get(fp) or []
+        if not evs:
+            lines.append(f"{name}: no temporal moments extracted (clip not event-analysed) "
+                         "— it can only be used whole.")
+            continue
+        lines.append(f"{name} (shot_id {r.get('shot_id')}) — {len(evs)} moment(s):")
+        for e in evs:
+            start = float(e.get("start_seconds") or 0.0)
+            end = float(e.get("end_seconds") or 0.0)
+            length = max(0.0, end - start)
+            pool_seconds += length
+            pool_count += 1
+            action = (e.get("action") or "").strip()
+            keywords = (e.get("keywords") or "").strip()
+            detail = action or keywords or "unclassified"
+            if action and keywords:
+                detail += f"  [{keywords}]"
+            lines.append(f"  • event {e.get('event_id')}: {start:.1f}s–{end:.1f}s "
+                         f"({length:.1f}s) — {detail}")
+    if pool_count:
+        lines.append(f"\nAvailable material: {pool_count} moment(s), {pool_seconds:.1f}s total "
+                     "at full length (before any duration optimisation).")
+    if problems:
+        lines.append("\nCould not resolve (nothing fabricated):")
+        lines += [f"  • {t}: {r}" for t, r in problems]
+    return "\n".join(lines)
+
+
+@tool
+def plan_clip_assembly(ordered_identifiers: str, labels: str = None,
+                       excluded_json: str = None,
+                       state: Annotated[dict, InjectedState] = None) -> str:
+    """CLIP ASSEMBLY — assemble ORDERED COMPLETE clips into a timeline (no trimming).
+
+    Use this in Clip Assembly mode. The unit of editing is the WHOLE CLIP: every clip you
+    pass keeps its ORIGINAL duration, and there is no trimming and no duration control in
+    this mode (a target duration does not apply — ignore any length wording in the intent).
+
+    The editorial work is entirely YOURS and happens BEFORE you call this: the curated
+    clips are CANDIDATES, not guaranteed content. Pass only the clips that genuinely serve
+    the editing intent, in the order you want them on the timeline, and report the ones you
+    left out via ``excluded_json``.
 
     Args:
         ordered_identifiers: Comma-separated shot IDs and/or file names IN TIMELINE ORDER
             (first = timeline step 1). This exact order is preserved — never re-sorted.
-        importance: Optional comma-separated importance weights aligned 1:1 with the
-            clips (any positive scale, e.g. "3,5,2,4" or "1,1,3"). Higher = more screen
-            time in TIMED MODE. Omit for equal weighting.
-        target_duration_text: A TOTAL target length for the whole edit ("make it 30s",
-            "1:30"). The tool auto-detects the duration. This is NOT for per-clip trims —
-            a phrase like "trim the first/last 2 seconds of each clip" is a per-clip trim,
-            so use head_trim/tail_trim for it and do NOT rely on this argument.
-        head_trim: Seconds to drop from the START of EVERY clip (per-clip trim).
-        tail_trim: Seconds to drop from the END of EVERY clip (per-clip trim).
+        labels: Optional PIPE-separated step labels aligned 1:1 with the clips
+            (e.g. "cold open|the arrival|wide breather|closing beat").
+        excluded_json: The candidates you deliberately left OUT, as a JSON list of
+            ``{"ref": "<file name or shot id>", "reason": "why it is not in the edit",
+            "suggested_use": "how it could still be used"}``. Never drop a candidate
+            silently — everything you exclude must be reported here as backup material.
 
     Returns:
-        A readable step list plus a fenced ```json block containing the structured plan
-        (mode, target_seconds, head_trim, tail_trim, total_seconds, and per-segment
-        in/out points). Report the readable part to the editor; the JSON is consumed
-        downstream by Delivery.
+        A readable step list plus a fenced ```json block with the structured plan that
+        Delivery compiles verbatim. Report the readable part to the editor.
     """
+    refusal = _wrong_mode(state, MODE_CLIP)
+    if refusal:
+        return refusal
+
     project_id = _pid_from_state(state)
-    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
+    tokens = _split(ordered_identifiers)
     clips, problems = resolve_ordered(project_id, tokens)
     if problems:
         # H-01: never silently drop or first-match an ambiguous/unknown identifier — the
@@ -149,136 +305,79 @@ def plan_timeline(ordered_identifiers: str, importance: str = None,
     if not clips:
         return "No catalogued clips matched those identifiers — nothing to plan."
 
-    weights = None
-    if importance:
-        parsed = []
-        for tok in importance.split(","):
-            tok = tok.strip()
-            try:
-                parsed.append(float(tok))
-            except ValueError:
-                parsed.append(1.0)
-        weights = parsed
+    plan = build_clip_timeline(clips, labels=_split(labels, "|") or None,
+                               excluded=excluded_json,
+                               aspect_ratio=_aspect_from_state(state))
 
-    head_trim = max(0.0, float(head_trim or 0.0))
-    tail_trim = max(0.0, float(tail_trim or 0.0))
-    trimming = head_trim > 0 or tail_trim > 0
-
-    # A per-clip trim is NOT a target length — don't let the intent text's trim wording
-    # be mis-read as a target when the editor asked for head/tail trimming.
-    target = None if trimming else parse_target_duration(target_duration_text)
-    plan = plan_segments(clips, target, weights=weights,
-                         head_trim=head_trim, tail_trim=tail_trim)
-
-    mode = plan["mode"]
-    if mode == "trim":
-        header = (f"🎬 Timeline plan — TRIM MODE (drop first {head_trim:g}s + last "
-                  f"{tail_trim:g}s of each clip; {plan['total_seconds']:g}s total)")
-    elif mode == "timed":
-        header = (f"🎬 Timeline plan — TIMED MODE (target {plan['target_seconds']:g}s, "
-                  f"actual {plan['total_seconds']:g}s)")
-    else:
-        header = f"🎬 Timeline plan — FULL CLIP MODE ({plan['total_seconds']:g}s total, no trimming)"
-
-    lines = [header, ""]
-    no_middle = []
+    lines = [f"🎞️ Timeline plan — CLIP ASSEMBLY ({len(plan['segments'])} complete clip(s), "
+             f"{plan['total_seconds']:g}s total · no trimming)", ""]
     for s in plan["segments"]:
-        if mode == "trim":
-            lines.append(
-                f"  {s['order']}. {s['name']} — keep {s['in_point']:.1f}s–{s['out_point']:.1f}s "
-                f"({s['duration']:.1f}s of {s['source_duration']:.1f}s)")
-            if s["source_duration"] > 0 and s["duration"] <= 0:
-                no_middle.append(s["name"])
-        elif mode == "timed":
-            lines.append(
-                f"  {s['order']}. {s['name']} — {s['in_point']:.1f}s–{s['out_point']:.1f}s "
-                f"({s['duration']:.1f}s of {s['source_duration']:.1f}s) · importance {s['importance']:g}")
-        else:
-            lines.append(f"  {s['order']}. {s['name']} — full {s['duration']:.1f}s")
-    # C-06: an invalid segment (real footage but nothing left after trimming) must block
-    # delivery. plan_segments flags these; warn clearly and note Delivery will refuse.
-    if not plan.get("valid", True):
-        bad = plan.get("validation_errors", [])
-        lines += ["", (f"⛔ {len(bad)} segment(s) are INVALID and will block export — "
-                       "fix the trim or drop the clip:")]
-        lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad]
-    elif no_middle:
-        lines += ["", (f"⚠ {len(no_middle)} clip(s) are shorter than "
-                       f"{head_trim + tail_trim:g}s and have no middle left after trimming: "
-                       + ", ".join(no_middle))]
-    lines += ["", "```json", json.dumps(plan), "```"]
-    return "\n".join(lines)
+        length = (f"full {s['duration']:.1f}s" if s["source_duration"] > 0
+                  else "full clip (length not measured)")
+        lines.append(f"  {s['order']}. {s['name']} — {length}"
+                     + (f" · {s['label']}" if s.get("label") else ""))
+    return _plan_block(lines, plan)
 
 
 @tool
-def get_clip_events(identifiers: str,
-                    state: Annotated[dict, InjectedState] = None) -> str:
-    """List the temporal EVENTS (what happens, with timecodes) inside curated clips.
-
-    Use this to see the ordered moments within the editor's curated clips — each event's
-    in/out timecodes, the action, and its keywords — so you can build a MOMENT-precise
-    timeline (e.g. keep only "the goal" from a long clip) rather than trimming by
-    head/tail seconds. Resolution is scoped to the current project.
-
-    Args:
-        identifiers: Comma-separated shot IDs and/or file names/paths for the clips whose
-            events you want to inspect.
-
-    Returns:
-        For each resolved clip, its ordered events as ``event_id · start–end · action``,
-        so you can pass the chosen event_ids IN ORDER to `plan_moment_timeline`.
-    """
-    project_id = _pid_from_state(state)
-    tokens = [t.strip() for t in (identifiers or "").split(",") if t.strip()]
-    rows, problems = resolve_ordered(project_id, tokens)
-    if not rows:
-        return "No matching catalogued clips for those identifiers in this project."
-    events_by_file = get_catalogued_events(project_id)
-    lines = []
-    for r in rows:
-        fp = r.get("file_path")
-        name = fp.split("/")[-1].split("\\")[-1] if fp else "?"
-        evs = events_by_file.get(fp) or []
-        if not evs:
-            lines.append(f"{name}: no temporal events extracted (clip not event-analysed).")
-            continue
-        lines.append(f"{name} (shot_id {r.get('shot_id')}) — {len(evs)} event(s):")
-        for e in evs:
-            action = (e.get("action") or e.get("keywords") or "").strip()
-            lines.append(f"  • event {e.get('event_id')}: "
-                         f"{e.get('start_seconds', 0):.1f}s–{e.get('end_seconds', 0):.1f}s "
-                         f"— {action}")
-    if problems:
-        lines.append("\nCould not resolve (nothing fabricated):")
-        lines += [f"  • {t}: {r}" for t, r in problems]
-    return "\n".join(lines)
-
-
-@tool
-def plan_moment_timeline(ordered_event_ids: str,
+def plan_moment_assembly(ordered_event_ids: str, importance: str = None,
+                         target_seconds: float = None, labels: str = None,
+                         protect_event_ids: str = None, focus_json: str = None,
+                         excluded_json: str = None,
                          state: Annotated[dict, InjectedState] = None) -> str:
-    """Build a MOMENT-precise timeline from ordered temporal events (segments for Delivery).
+    """MOMENT ASSEMBLY — arrange ORDERED MOMENTS into a timeline, optionally optimised.
 
-    The event-based counterpart to `plan_timeline`: instead of trimming clips by
-    head/tail seconds or a proportional allocation, each segment is trimmed to an EVENT's
-    own measured in/out timecodes — so the edit cuts to the exact moment the action
-    happens. Get the event_ids from `get_clip_events` (or the Search stage's
-    `search_moments`).
+    Use this in Moment Assembly mode, after `get_clip_events`. The unit of editing is the
+    temporal MOMENT: each segment is cut to that event's OWN measured in/out timecodes.
+
+    SELECT FIRST, OPTIMISE SECOND. Choose enough meaningful moments to satisfy the editing
+    intent — do NOT pre-shrink your selection to fit the clock. If their combined length
+    overruns the target, this tool absorbs the overrun by COMPRESSING moments in ascending
+    order of importance (repetitive / transitional / low-impact moments are shortened
+    first and hardest; high-value moments keep more screen time and are the last touched).
+    Time is never "split between" the moments proportionally, and every trim stays strictly
+    inside its own event boundaries, placed around the moment's focus rather than chopped
+    off the front.
+
+    This tool NEVER removes a moment. If compression alone cannot reach the target it
+    reports the shortfall plus the weakest-contribution candidates; deciding whether to
+    drop one is YOUR editorial call (weigh importance, narrative contribution, pacing and
+    diversity — never length alone), and anything you drop must come back in
+    ``excluded_json`` as backup material. Content richness beats hitting the target
+    exactly: an edit slightly over target is better than one missing a key beat.
 
     Args:
         ordered_event_ids: Comma-separated event IDs IN TIMELINE ORDER (first = step 1).
             This exact order is preserved — never re-sorted. Each id must belong to the
             current project.
+        importance: Comma-separated editorial weights aligned 1:1 with the moments (any
+            positive scale, e.g. "5,2,4,1" — higher = more valuable to the intent, so
+            compressed later and less). Omit for equal weighting.
+        target_seconds: Optional target TOTAL length in seconds. Pass the editor's Target
+            Duration if they set one; omit it when they did not (never invent one).
+        labels: Optional PIPE-separated step labels aligned 1:1 with the moments
+            (defaults to each event's own action text).
+        protect_event_ids: Comma-separated event IDs that must NEVER be trimmed (the beats
+            the edit exists for). Use sparingly.
+        focus_json: Optional JSON object mapping event_id → the absolute timecode of that
+            moment's PEAK (e.g. ``{"42": 18.5}``). Any compression keeps the window around
+            that point instead of the moment's centre. Only use timecodes inside the event.
+        excluded_json: Moments you considered but left OUT, as a JSON list of
+            ``{"ref": "<event id or clip name>", "reason": "why it is not in the edit",
+            "suggested_use": "how it could still be used"}``.
 
     Returns:
-        A readable step list plus a fenced ```json block with the structured plan
-        (mode 'events', per-segment in/out timecodes) that Delivery compiles verbatim.
+        A readable step list plus a fenced ```json block with the structured plan that
+        Delivery compiles verbatim.
     """
+    refusal = _wrong_mode(state, MODE_MOMENT)
+    if refusal:
+        return refusal
+
     project_id = _pid_from_state(state)
-    raw = [t.strip() for t in (ordered_event_ids or "").split(",") if t.strip()]
     ids: list[int] = []
     bad: list[str] = []
-    for t in raw:
+    for t in _split(ordered_event_ids):
         try:
             ids.append(int(t))
         except ValueError:
@@ -298,22 +397,75 @@ def plan_moment_timeline(ordered_event_ids: str,
                 + ", ".join(str(m) for m in missing))
 
     ordered_events = [found[i] for i in ids]   # preserve the caller's exact order
-    plan = plan_event_segments(ordered_events)
 
-    lines = [f"🎬 Timeline plan — EVENTS MODE ({plan['total_seconds']:g}s total, "
-             f"trimmed to {len(plan['segments'])} moment(s))", ""]
+    protected_ids = set()
+    for t in _split(protect_event_ids):
+        try:
+            protected_ids.add(int(t))
+        except ValueError:
+            continue
+    protect = [i in protected_ids for i in ids]
+
+    focus_map: dict = {}
+    if focus_json:
+        try:
+            parsed = json.loads(focus_json)
+            if isinstance(parsed, dict):
+                focus_map = parsed
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("plan_moment_assembly: unreadable focus_json, ignoring it.")
+    focus = []
+    for i in ids:
+        raw = focus_map.get(str(i), focus_map.get(i))
+        try:
+            focus.append(float(raw) if raw is not None else None)
+        except (TypeError, ValueError):
+            focus.append(None)
+
+    # The editor's Target Duration is authoritative: fall back to the injected state so a
+    # target the editor set in the UI still applies if the model omits the argument.
+    target = target_seconds if (target_seconds and target_seconds > 0) else None
+    if target is None:
+        target = _target_from_state(state)
+
+    plan = build_moment_timeline(
+        ordered_events, target_seconds=target, importance=_floats(importance),
+        labels=_split(labels, "|") or None, focus=focus, protect=protect,
+        excluded=excluded_json, aspect_ratio=_aspect_from_state(state),
+    )
+
+    comp = plan["compression"]
+    header = (f"🎯 Timeline plan — MOMENT ASSEMBLY ({len(plan['segments'])} moment(s), "
+              f"{plan['total_seconds']:g}s total")
+    header += f" · target {plan['target_seconds']:g}s)" if plan["target_seconds"] else ")"
+    lines = [header, ""]
     for s in plan["segments"]:
-        lines.append(
-            f"  {s['order']}. {s['name']} — {s['in_point']:.1f}s–{s['out_point']:.1f}s "
-            f"({s['duration']:.1f}s)"
-            + (f" · {s['label']}" if s.get("label") else ""))
-    if not plan.get("valid", True):
-        bad_segs = plan.get("validation_errors", [])
-        lines += ["", (f"⛔ {len(bad_segs)} segment(s) are INVALID and will block export "
-                       "— fix or drop them:")]
-        lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad_segs]
-    lines += ["", "```json", json.dumps(plan), "```"]
-    return "\n".join(lines)
+        line = (f"  {s['order']}. {s['name']} — {s['in_point']:.1f}s–{s['out_point']:.1f}s "
+                f"({s['duration']:.1f}s) · importance {s['importance']:g}")
+        if s.get("label"):
+            line += f" · {s['label']}"
+        lines.append(line)
+        if s.get("trimmed"):
+            lines.append(f"       ↳ {s['trim_note']}")
+
+    if comp["applied"]:
+        lines += ["", (f"⏱️ Duration optimisation: {comp['overrun_seconds']:.1f}s over target — "
+                       f"absorbed {comp['absorbed_seconds']:.1f}s by compressing "
+                       f"{comp['trimmed_count']} lower-value moment(s), no content removed.")]
+        lines += [f"   • {n}" for n in comp["notes"]]
+    if comp["shortfall_seconds"] > 0:
+        lines += ["", (f"⚠ Still {comp['shortfall_seconds']:.1f}s over target after compressing "
+                       "every moment to its floor. Compressing further would damage the "
+                       "material. Decide editorially: accept the overrun, or drop a moment "
+                       "and re-plan (report it in excluded_json). Weakest contributors:")]
+        for c in plan["removal_candidates"]:
+            lines.append(f"   • #{c['order']} event {c['event_id']} "
+                         f"({c['label'] or c['name']}) — importance {c['importance']:g}, "
+                         f"would save {c['would_save_seconds']:.1f}s")
+    elif plan["duration_status"] == "under_target":
+        lines += ["", (f"ℹ️ {plan['duration_delta']:.1f}s under the target — footage is never "
+                       "stretched. Add more meaningful moments if the edit needs the length.")]
+    return _plan_block(lines, plan)
 
 
 @tool
@@ -347,111 +499,137 @@ Status: Ready for review
 selection_tools = [
     get_candidate_details,
     get_clip_events,
-    plan_timeline,
-    plan_moment_timeline,
+    plan_clip_assembly,
+    plan_moment_assembly,
     generate_delivery_summary,
 ]
 
 llm_with_selection = llm.bind_tools(selection_tools)
 selection_tool_node = ToolNode(selection_tools)
 
-SELECTION_PROMPT = """You are the SELECTION AGENT in the MAPO system — an assistant
-editor, not an autonomous one. You do NOT rank clips by score. You build an ordered
-EDIT TIMELINE from the clips the editor has already curated, and explain it. The editor
-always makes the final decision.
+SELECTION_PROMPT = """You are the SELECTION AGENT in the MAPO system — an ASSISTANT
+EDITOR, not an autonomous one. You do NOT rank clips by score. You build an ordered EDIT
+TIMELINE and explain your editorial reasoning; the editor always makes the final call.
 
-INPUT: an editing intent PLUS a set of curated candidate clips (identified by file name
-or shot id) that the user selected in the UI. Work ONLY with those clips.
+INPUT: an EDITING MODE (chosen by the editor), an EDITING INTENT (free-form: style,
+emotion, pacing, purpose), a set of CURATED CANDIDATE clips the editor ticked in the UI,
+an OUTPUT ASPECT RATIO, and — in Moment Assembly only — an optional TARGET DURATION.
 
-THERE IS NO FIXED TEMPLATE. Do NOT assume every edit follows a traditional
-"establishing → buildup → climax → reaction → ending" narrative arc. That is only ONE
-possible structure among many — never the default. The timeline's structure, pacing,
-and length are decided by the USER'S EDITING INTENT. Different intents want different
-shapes, for example (illustrative, not exhaustive):
+THE CURATED CLIPS ARE CANDIDATES, NOT A SHOT LIST. The editor ticked them as "worth
+considering". Never include material just because it was selected: if a clip or moment
+does not serve the intent, LEAVE IT OUT and report it as alternative/backup material
+(what it is, why it is not in the edit, and how it could still be used). Work ONLY within
+the curated set — never add a clip that was not given to you.
+
+THERE IS NO FIXED TEMPLATE. Do NOT assume every edit follows an "establishing → buildup →
+climax → reaction → ending" arc. That is one possible shape among many, never the default.
+Structure, pacing and number of steps come from the INTENT — for example (illustrative):
    - Matchday highlight reel → tension-and-release beats around the key moments
-   - Fast-paced football / brand promo → punchy, escalating energy, quick cuts
+   - Fast-paced promo → punchy, escalating energy, quick cuts
    - Emotional stadium vlog → personal, atmosphere-led, room to breathe
    - Cinematic travel montage → rhythmic, image-driven, mood over story
    - Tactical analysis → logical/chronological, clarity over drama
-   - Player introduction → build recognition, then reveal
-Choose the ordering that best serves THIS intent.
+Use only AS MANY STEPS AS THE EDIT NEEDS — 3, 7, 12, whatever the material and goal call
+for. Do not force a fixed count.
 
-WORKFLOW:
-1. INTERPRET THE EDITING INTENT — infer video type, emotion, pace, and style. State
-   your interpretation, and the timeline structure you'll use for it, so the editor can
-   correct you.
-2. FETCH DETAILS — call `get_candidate_details` on the curated clips to read their real
-   metadata (shot_type, camera_motion, lighting, mood, people_count, duration, ...).
-3. DECIDE ORDER + IMPORTANCE — order the clips into whatever sequence best delivers the
-   intent, using each clip's real attributes. Use only AS MANY STEPS AS THE EDIT NEEDS —
-   3, 7, 12, however many the curated set and goal call for. Do NOT force a fixed count
-   and do NOT invent clips. Assign each clip an IMPORTANCE weight (any positive scale,
-   higher = more significant to the intent) — the key moments should weigh more.
-4. PLAN THE TIMELINE — call `plan_timeline` with the clips IN ORDER and their importance
-   weights. It returns the structured timeline and runs in one of three modes, chosen
-   automatically from the arguments you pass:
-     • TRIM MODE — the intent asks to drop the first/last N seconds of EACH clip (a
-       per-clip head/tail trim, keeping the middle). Pass `head_trim` and/or `tail_trim`
-       (in seconds). Every clip keeps its FULL remaining middle and clips are assembled
-       sequentially in order. DO NOT put that trim wording into `target_duration_text`.
-     • TIMED MODE — the intent names a TOTAL length for the whole edit ("15s", "1 min",
-       "1:30"): pass the intent text as `target_duration_text`; clips are TRIMMED and
-       screen time allocated PROPORTIONALLY to importance, producing a time-coded timeline.
-     • FULL CLIP MODE — no total length and no per-clip trim: clips keep their FULL
-       duration, concatenated in order, untrimmed.
-   CRITICAL — do NOT confuse a PER-CLIP trim ("trim the first/last 2s of each clip" →
-   head_trim/tail_trim) with a TOTAL target length ("make the whole edit 30s" →
-   target_duration_text). They are different arguments; never route a per-clip trim
-   through target_duration_text.
-   You do NOT compute the trims yourself — `plan_timeline` does. Report its result and,
-   if it trimmed clips, tell the editor which moments were shortened and why.
-   Optional free-form step labels ("cold open", "hero moment", "outro") may help the
-   editor, but are never a required fixed set.
+═══ THE TWO EDITING MODES ═══
+The editor's mode selection is binding — use the planner for the mode you were given, and
+never the other one.
 
-   MOMENT-PRECISE ALTERNATIVE (event-based) — when the edit is about specific MOMENTS
-   inside clips (keep only "the goal", "the celebration", "the entrance"), not whole
-   clips: call `get_clip_events` on the curated clips to see each clip's ordered events
-   (with in/out timecodes and actions), then call `plan_moment_timeline` with the chosen
-   event_ids IN ORDER. This trims each segment to the EXACT event boundary rather than by
-   head/tail seconds. Use `plan_timeline` for whole-clip / head-tail / timed edits, and
-   `plan_moment_timeline` for moment-precise edits. Both produce the same structured plan
-   that Delivery compiles verbatim.
+▸ CLIP ASSEMBLY — the unit of editing is the WHOLE CLIP.
+  Combine complete clips into a coherent timeline. Each clip keeps its ORIGINAL duration:
+  there is NO trimming and NO duration control in this mode, and a target duration does
+  NOT apply (ignore any length wording in the intent). Typical: vlog, documentary, travel,
+  behind-the-scenes, atmosphere montage.
+  Workflow:
+    1. Read the intent — video type, emotion, pace, style. State your interpretation.
+    2. `get_candidate_details` on the curated clips to read their real metadata.
+    3. Decide which clips BELONG (drop the irrelevant ones) and in what ORDER.
+    4. `plan_clip_assembly` with the kept clips IN ORDER, optional step labels, and every
+       dropped candidate in `excluded_json` with a reason and a suggested alternative use.
 
-ANTI-HALLUCINATION: only ever place clips that a tool actually returned in this
-conversation. NEVER invent file names, shot IDs, durations, or metadata — the real
-lengths and trims come only from `plan_timeline`. When an attribute is
-missing/'unclassified', say you inferred the placement from what IS known rather than
-guessing the missing field. If no candidates resolve, say so instead of fabricating.
+▸ MOMENT ASSEMBLY — the unit of editing is a MOMENT (temporal event) inside a clip.
+  Build the edit from the meaningful moments within longer clips. A target duration is
+  optional here.
+  Workflow:
+    1. Read the intent, as above.
+    2. `get_clip_events` on ALL the curated clips to see every available moment with its
+       real timecodes and length. (A clip with no extracted moments cannot be used here —
+       say so rather than inventing timecodes.)
+    3. SELECT the moments that serve the intent — enough of them to tell the story
+       properly. Do NOT pre-shrink the selection to fit the clock; select first, optimise
+       second.
+    4. RANK them: give each an importance weight reflecting narrative contribution, not
+       length. Order them into the timeline the intent calls for.
+    5. `plan_moment_assembly` with the event_ids IN ORDER, the importance weights, the
+       target duration if the editor set one, and any moments you rejected in
+       `excluded_json`.
+
+═══ OUTPUT ASPECT RATIO — A DELIVERY SPEC, NOT AN EDITORIAL INTENTION ═══
+The editor sets it explicitly in the UI (16:9, 9:16, 4:3, 3:4 or 1:1). NEVER infer
+it from the editing intent, never change it, and never ask the editor to change it.
+  - You MAY take it into account when choosing footage: `get_candidate_details` reports
+    each clip's `frame_fit` in the target frame, so for a 9:16 delivery portrait-friendly
+    shots usually serve better than landscape ones that end up mostly bars. Treat it as
+    ONE input alongside the editing intent — a landscape shot that is essential to the
+    story still belongs in a 9:16 edit.
+  - You must NEVER modify, crop, resize, reframe or "re-shoot" source media, and never
+    claim you did. Selection only chooses and orders material.
+  - DELIVERY adapts the timeline to the frame: each clip is SCALED TO FIT with its own
+    aspect preserved, so the whole image survives and any leftover frame area becomes
+    letterboxing or pillarboxing. Nothing is stretched and nothing is auto-cropped.
+    Say this plainly if the editor asks why a shot will have bars.
+  - The ratio is stamped onto the plan automatically — you do not pass it to any tool.
+
+═══ DURATION IS OPTIMISED, NEVER ALLOCATED (Moment Assembly only) ═══
+Never divide the target between moments, and never trim by a fixed rule. The tool
+compresses the LEAST valuable moments first, keeps high-value moments long, and never
+trims outside a moment's own event boundaries. Your part:
+  - Weight importance honestly — that is what decides which moments get compressed.
+  - Protect the beats the edit exists for (`protect_event_ids`), sparingly.
+  - If the tool reports it is STILL over target after compressing everything, make an
+    EDITORIAL decision — weigh importance, narrative contribution, pacing and diversity,
+    never length alone. Prefer accepting a small overrun over losing a key beat. If you do
+    drop a moment, re-call the planner without it and report it in `excluded_json`.
+  - Narrative completeness and content richness outrank hitting the target exactly.
+
+ANTI-HALLUCINATION: only ever place clips and moments that a tool actually returned in
+this conversation. NEVER invent file names, shot IDs, event IDs, timecodes, durations or
+metadata — every real length and trim comes from the planning tool. When an attribute is
+missing/'unclassified', say you inferred the placement from what IS known. If no
+candidates resolve, say so instead of fabricating.
 
 OUTPUT FORMAT — an ordered edit timeline, NOT a score ranking. For EVERY step explain
-(a) why the clip sits at this position, (b) how it connects to the previous clip, and
-(c) what it does for the overall pacing/rhythm: 
+(a) why this material is in the edit, (b) why it sits at THIS position and how it connects
+to the surrounding segments, and (c) what it does for the pacing/rhythm:
 
-    🎬 Proposed Edit Timeline — <your one-line read of the intent + the structure chosen>
+    🎬 Proposed Edit Timeline — <one-line read of the intent + the structure you chose>
+    Mode: <CLIP ASSEMBLY | MOMENT ASSEMBLY> · <target/length as the planner reported it>
+    Output frame: <the aspect ratio, and — only if it influenced your picks — one line on
+                   how, e.g. "9:16: favoured the portrait shots; the two landscape clips
+                   are essential to the story and will be letterboxed">
 
-    1. IMG_0003.MOV  (0.0–4.0s · 4.0s)     ← show the allotted time in TIMED MODE
-       Why here: Opens on crowd atmosphere to set the energy immediately.
-       Connects: —  (first clip)
-       Pacing: A high-energy cold open; establishes tempo for what follows.
-    2. IMG_0018.MOV  (4.0–7.0s · 3.0s)
-       Why here: Players entering the pitch gives the viewer a subject to follow.
-       Connects: Cuts from the wide crowd to the players — pulls focus inward.
-       Pacing: Steadies the rhythm briefly before the action ramps up.
-    3. IMG_0042.MOV  (7.0–15.0s · 8.0s)
-       Why here: The attacking sequence is the momentum peak of the reel.
-       Connects: Escalates directly off the entrance build-up.
-       Pacing: Fastest section — drives the edit's energy (weighted most, so most time).
 
-    (…as many steps as the intent needs — no more, no fewer. In FULL CLIP MODE just show
-     each clip's full length instead of a trimmed in/out.)
+    1. IMG_0003.MOV  (0.0–4.0s · 4.0s)
+       Why selected: Crowd atmosphere is the energy the intent asks to open on.
+       Why here: Sets the tempo immediately; nothing needs to precede it.
+       Connects: — (first segment)
+       Pacing: High-energy cold open, establishes the rhythm.
+    2. IMG_0018.MOV  (12.0–15.0s · 3.0s)
+       Why selected: Gives the viewer a subject to follow after the wide opener.
+       Why here: Pulls focus inward from the crowd to the players.
+       Connects: Cuts from wide atmosphere to a human subject.
+       Pacing: Steadies briefly before the action ramps up.
+
+    (…as many steps as the intent needs — no more, no fewer.)
 
     ---
-    Mode: <TRIM (first Xs / last Ys of each clip), TIMED (target Xs), or FULL CLIP> — as
-          reported by plan_timeline.
-    Notes: <pacing / gaps / alternatives the editor should weigh>
+    Not used (backup material): <each excluded candidate — why it is out, and where it
+    could still work>
+    Notes: <pacing, gaps, duration trade-offs, alternatives the editor should weigh>
 
-Make clear this timeline is ONE proposal for the editor to approve, reorder, extend, or
-reject — not the only correct order. Invite the editor to adjust it.
+Make clear this timeline is ONE proposal for the editor to approve, reorder, extend or
+reject. Invite them to adjust it.
 
 Prior user preferences: {memory}"""
 

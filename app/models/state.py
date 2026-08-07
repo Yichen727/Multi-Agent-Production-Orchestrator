@@ -47,6 +47,17 @@ class ProductionState(TypedDict):
         selected_candidates: File paths the editor curated in the UI — the explicit
             input to the Selection stage (it works only on these).
         selected_shots: Clips the editor has chosen to keep (Human-in-the-Loop).
+        editing_mode: The editor's Selection mode — ``'clip_assembly'`` (whole clips, no
+            trimming, no duration control) or ``'moment_assembly'`` (moments inside clips,
+            optional target duration). It is a UI decision, injected into the Selection
+            tools from state so the model cannot switch modes on its own.
+        target_seconds: The editor's optional Target Duration in seconds. Applies to
+            MOMENT ASSEMBLY only (``None`` = N/A, the default); Clip Assembly ignores it.
+        aspect_ratio: The editor's OUTPUT aspect ratio label ("16:9", "9:16", "1:1" or a
+            "4:3" or "3:4"; ``""`` = none requested). An explicit user input
+            and an output SPECIFICATION — never inferred from the editing prompt. Selection
+            may let it influence WHICH footage it picks but never modifies media; the label
+            travels on the plan so Delivery can scale each clip to fit that frame.
         recommendations: (Legacy) intent-aware clip notes from the Selection stage; the
             editor always makes the final decision — nothing here is auto-selected.
         edit_timeline: The Selection stage's structured ``EditPlan`` (mode + ordered
@@ -68,6 +79,9 @@ class ProductionState(TypedDict):
     search_candidates: list[SearchCandidate]
     selected_candidates: list[str]
     selected_shots: list[dict]
+    editing_mode: str
+    target_seconds: Optional[float]
+    aspect_ratio: str
     recommendations: list[dict]
     edit_timeline: Optional[EditPlan]
     delivery_output: Optional[DeliveryResult]

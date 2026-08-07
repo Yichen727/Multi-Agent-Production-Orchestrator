@@ -1,311 +1,463 @@
-"""Timeline planning service — turn an ordered set of clips into structured segments.
+"""Timeline planning service — build an edit timeline from ordered material.
 
-This backs the Selection stage's operating modes:
+MAPO's Selection stage has exactly TWO user-facing editing modes. They differ ONLY in
+the UNIT of editing; both emit the same structured plan, which Delivery compiles
+verbatim:
 
-    TRIM MODE    — the intent asks to drop the first/last N seconds of EACH clip (a
-                   per-clip head/tail trim). Every clip keeps its full remaining middle
-                   and clips are assembled sequentially in order.
-    TIMED MODE   — the editing intent names a target length ("15s", "1 min",
-                   "2 minutes", "1:30"). The target is split across the clips
-                   PROPORTIONALLY TO THEIR IMPORTANCE and each clip is trimmed to its
-                   allotted length, producing a time-coded timeline whose total ≈ target
-                   (capped by how much footage actually exists).
-    FULL CLIP MODE — no duration is named. Clips keep their full length and are simply
-                   concatenated in order, untrimmed.
+    CLIP ASSEMBLY   — the unit is the WHOLE CLIP. Ordered complete clips, each keeping
+                      its full measured length. There is NO trimming and NO duration
+                      control in this mode (a target duration does not apply).
+    MOMENT ASSEMBLY — the unit is a temporal EVENT inside a clip. Ordered moments, each
+                      cut to its own measured in/out timecodes, with an OPTIONAL target
+                      total duration.
 
-Everything here is PURE and deterministic (no LLM, no I/O): the Selection Agent's tool
-feeds it resolved clip metadata and it returns structured segments. Downstream, the
-Delivery Agent compiles those segments verbatim — order and timings preserved.
+The old TRIM / TIMED / FULL CLIP / EVENT modes are gone: they conflated editing
+GRANULARITY (clip vs moment) with DURATION CONTROL. So is clip-level proportional
+allocation — screen time is never "split between clips" any more.
+
+DURATION HANDLING (Moment Assembly only) is an OPTIMISATION, not an allocation. The
+agent first selects enough meaningful moments to satisfy the editing intent; only if
+their combined length overruns the target does :func:`compress_to_target` shave it back,
+under these rules:
+
+    * Fine-grained trimming is preferred over removing content.
+    * Compression is PRIORITY-ORDERED: repetitive / transitional / low-impact moments
+      (low importance) are compressed first and hardest; high-value moments retain
+      proportionally more of their screen time and are the last to be touched.
+    * Every moment has a retention FLOOR — it can never be shaved to an unreadable
+      flash, and a protected moment is never trimmed at all.
+    * A trim NEVER leaves the moment's original event boundaries; the kept window is
+      placed around the moment's editorial focus (its centre by default), so nothing is
+      mechanically trimmed "from the beginning".
+    * This module NEVER removes a moment. When trimming alone cannot reach the target it
+      reports the shortfall plus the weakest-contribution candidates, and the AGENT makes
+      the editorial call — anything it drops is reported back as alternative/backup
+      material with a reason.
+
+Everything here is PURE and deterministic (no LLM, no I/O).
 """
 
 from __future__ import annotations
 
-import re
+import json
 from pathlib import Path
 
-# Duration tokens. Minutes must be tried before the bare "m"/"s" so "1m30s" and
-# "2 minutes" both parse. A negative lookahead stops "m"/"s" swallowing a following
-# letter (so "promo" / "seconds" aren't mis-read) while still allowing a digit after
-# (so "1m30s" works).
-_MINUTES_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:minutes|minute|mins|min|m)(?![a-z])")
-_SECONDS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:seconds|second|secs|sec|s)(?![a-z])")
-_CLOCK_RE = re.compile(r"\b(\d{1,3}):([0-5]?\d)\b")  # mm:ss
+# ── Compression tuning ────────────────────────────────────────────────────────
+# A moment shorter than this reads as a flash frame rather than a beat, so no trim ever
+# takes a moment below it (unless the source event is itself shorter).
+MIN_MOMENT_SECONDS = 1.0
+# Retention floor as a FRACTION of a moment's own length, interpolated by importance:
+# the least valuable moment in the set may lose over half its length, the most valuable
+# keeps nearly all of it. This is what makes high-value moments retain more screen time.
+RETAIN_LOW = 0.45
+RETAIN_HIGH = 0.90
+# Fraction of the kept window that sits BEFORE the moment's focus point (0.5 = centred).
+FOCUS_BIAS = 0.5
 
-# A PER-CLIP trim phrase ("trim the first 2 seconds", "drop the last 5s", "cut 3
-# seconds off the start") describes head/tail trimming of EACH clip — it is NOT a
-# target TOTAL length. Such durations are stripped before target detection so they
-# never get summed into a bogus target (the bug that shrank every clip to ~0.2s).
-_TRIM_PHRASE_RE = re.compile(
-    r"\b(?:first|last|initial|final|leading|trailing|head|tail)\s+"
-    r"\d+(?:\.\d+)?\s*(?:seconds|second|secs|sec|s|minutes|minute|mins|min|m)(?![a-z])",
-    re.IGNORECASE,
-)
+_TOL = 0.05          # seconds — arithmetic tolerance
+_ON_TARGET_FRAC = 0.02   # within 2% (or 0.5s) of the target counts as "on target"
+
+MODE_CLIP = "clip_assembly"
+MODE_MOMENT = "moment_assembly"
 
 
-def parse_target_duration(text: str | None) -> float | None:
-    """Detect a target TOTAL duration in free text and return it in seconds, else ``None``.
+# ── Small helpers ─────────────────────────────────────────────────────────────
 
-    Recognises, in one string, any mix of:
-        - clock form ``mm:ss``  (e.g. "1:30" → 90)
-        - minutes ("1 min", "2 minutes", "1m")
-        - seconds ("15s", "30 sec", "45 seconds")
-        - combined ("1m30s", "1 min 30 s")
 
-    Per-clip TRIM phrases ("first/last N seconds") are ignored — they mean head/tail
-    trimming of each clip, not a target length (see TRIM MODE in ``plan_segments``).
+def _f(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    Returns ``None`` when no duration is present (→ FULL CLIP MODE). Never guesses a
-    number that carries no time unit.
+
+def _weights(importance, n: int) -> list[float]:
+    """Normalise a per-item importance list to exactly ``n`` positive floats."""
+    base = [max(0.0, _f(w, 1.0)) for w in (importance or [])]
+    out = [(base[i] if i < len(base) else 1.0) for i in range(n)]
+    return [w if w > 0 else 1.0 for w in out]
+
+
+def _aligned(values, n: int, default=None) -> list:
+    seq = list(values or [])
+    return [(seq[i] if i < len(seq) else default) for i in range(n)]
+
+
+def normalise_alternates(raw) -> list[dict]:
+    """Coerce the agent's excluded/backup material into a uniform list of dicts.
+
+    Accepts a JSON string, a list of dicts, or a list of plain strings. Every entry ends
+    up as ``{"ref", "name", "reason", "suggested_use"}`` — the reason a moment or clip did
+    NOT make the edit, and how it could still be used in another one. Nothing is invented:
+    a missing reason stays an empty string.
     """
-    if not text:
-        return None
-    # Remove per-clip trim phrases first so "trim the first/last 2 seconds" cannot be
-    # mistaken for (and summed into) a target total length.
-    t = _TRIM_PHRASE_RE.sub(" ", text.lower())
-
-    clock = _CLOCK_RE.search(t)
-    if clock:
-        return float(int(clock.group(1)) * 60 + int(clock.group(2)))
-
-    total = 0.0
-    found = False
-    for m in _MINUTES_RE.finditer(t):
-        total += float(m.group(1)) * 60.0
-        found = True
-    for s in _SECONDS_RE.finditer(t):
-        total += float(s.group(1))
-        found = True
-    return round(total, 3) if found else None
-
-
-def allocate_durations(sources: list[float], weights: list[float],
-                       target: float) -> list[float]:
-    """Split ``target`` seconds across clips proportionally to ``weights``.
-
-    A clip can never be given more than its own source length (water-filling: when a
-    clip's proportional share exceeds the footage available, it is capped at its full
-    length and the surplus is redistributed among the clips that still have room). A
-    source length of 0/unknown is treated as uncapped so the clip still receives its
-    share. Clips with weight ≤ 0 receive nothing.
-
-    Returns a list of allocated seconds, aligned to ``sources``. Its sum is
-    ``min(target, total available footage)``.
-    """
-    n = len(sources)
-    if n == 0:
-        return []
-
-    # Normalise weights: fall back to equal weighting if none are positive.
-    weights = [max(0.0, float(w)) for w in weights]
-    if sum(weights) <= 0:
-        weights = [1.0] * n
-
-    caps = [s if (s and s > 0) else float("inf") for s in sources]
-    total_footage = sum(c for c in caps if c != float("inf"))
-    uncapped = any(c == float("inf") for c in caps)
-    achievable = target if uncapped else min(target, total_footage)
-
-    alloc = [0.0] * n
-    active = {i for i in range(n) if weights[i] > 0}
-
-    # At most n rounds: each round either caps ≥1 clip or finishes.
-    for _ in range(n + 1):
-        remaining = achievable - sum(alloc)
-        if remaining <= 1e-9 or not active:
-            break
-        wsum = sum(weights[i] for i in active)
-        if wsum <= 0:
-            break
-        capped_now = []
-        for i in active:
-            share = remaining * weights[i] / wsum
-            room = caps[i] - alloc[i]
-            if room != float("inf") and share >= room - 1e-12:
-                alloc[i] = caps[i]
-                capped_now.append(i)
-        if capped_now:
-            active -= set(capped_now)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return [{"ref": raw.strip(), "name": Path(raw.strip()).name,
+                     "reason": "", "suggested_use": ""}] if raw.strip() else []
+    if isinstance(raw, dict):
+        raw = [raw]
+    out: list[dict] = []
+    for item in (raw or []):
+        if isinstance(item, str):
+            ref, reason, use = item.strip(), "", ""
+        elif isinstance(item, dict):
+            ref = str(item.get("ref") or item.get("event_id") or item.get("file_path")
+                      or item.get("name") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            use = str(item.get("suggested_use") or item.get("use") or "").strip()
+        else:
             continue
-        for i in active:
-            alloc[i] += remaining * weights[i] / wsum
-        break
+        if not (ref or reason):
+            continue
+        out.append({"ref": ref, "name": Path(ref).name if ref else "",
+                    "reason": reason, "suggested_use": use})
+    return out
 
-    return [round(a, 3) for a in alloc]
+
+def _duration_status(total: float, target: float | None) -> tuple[str, float]:
+    """Classify the plan's length against its target. Returns ``(status, delta)``."""
+    if not target or target <= 0:
+        return "unconstrained", 0.0
+    slack = max(0.5, target * _ON_TARGET_FRAC)
+    if abs(total - target) <= slack:
+        return "on_target", round(total - target, 3)
+    if total > target:
+        return "over_target", round(total - target, 3)
+    return "under_target", round(target - total, 3)
 
 
-def plan_segments(clips: list[dict], target_seconds: float | None,
-                  weights: list[float] | None = None,
-                  labels: list[str] | None = None,
-                  head_trim: float = 0.0, tail_trim: float = 0.0) -> dict:
-    """Build the structured timeline plan from ordered, resolved clips.
+# ── Duration optimisation (Moment Assembly only) ──────────────────────────────
 
-    Order is preserved EXACTLY (clip 0 is timeline step 1). Three modes:
 
-        TRIM MODE (``head_trim`` and/or ``tail_trim`` > 0) — drop ``head_trim`` seconds
-            off the START and ``tail_trim`` seconds off the END of EVERY clip, keeping
-            the FULL remaining middle. Clips are assembled sequentially, untrimmed
-            otherwise. Takes precedence over any target. A clip shorter than
-            ``head_trim + tail_trim`` has no middle → its duration is 0 (reported by the
-            caller, never fabricated).
-        TIMED MODE (a positive ``target_seconds``) — the target is split across clips
-            proportionally to importance and each clip trimmed from its head to its share.
-        FULL CLIP MODE (neither) — each clip keeps its full source duration.
+def compress_to_target(spans: list[float], target_seconds: float | None, *,
+                       importance: list[float] | None = None,
+                       protect: list[bool] | None = None,
+                       min_moment_seconds: float = MIN_MOMENT_SECONDS) -> dict:
+    """Shave a set of moments back towards ``target_seconds`` — least valuable first.
+
+    This is deliberately NOT an allocator: nothing is "split" across the moments and no
+    screen time is handed out proportionally to importance. Every moment starts at its
+    FULL measured length and is only reduced when there is a real overrun, in ascending
+    order of importance:
+
+        1. Each moment gets a retention FLOOR — ``max(min_moment_seconds, length ×
+           retain)`` where ``retain`` scales from ``RETAIN_LOW`` for the least important
+           moment in the set to ``RETAIN_HIGH`` for the most important. Protected moments
+           get a floor equal to their full length (never trimmed).
+        2. Moments are banded into importance TIERS. The lowest tier absorbs as much of
+           the overrun as its slack allows (shared inside the tier in proportion to each
+           moment's own slack, so nothing in a tier is singled out), then the next tier
+           up, and so on. Compression stops the instant the target is met — high-value
+           tiers are usually never reached.
+        3. If every floor is hit and the plan is still long, the residual is reported as
+           ``shortfall`` and NOTHING is removed. Removal is an editorial decision the
+           agent must make and justify.
 
     Args:
-        clips: Ordered clip dicts, each with ``file_path`` and (ideally)
-            ``duration_seconds``; ``shot_id`` optional.
-        target_seconds: Target total length, or ``None`` for full-clip mode.
-        weights: Per-clip importance weights (aligned to ``clips``); defaults to equal.
-        labels: Optional per-clip free-form step labels.
-        head_trim: Seconds to drop from the START of every clip (TRIM MODE).
-        tail_trim: Seconds to drop from the END of every clip (TRIM MODE).
+        spans: Each moment's full measured length in seconds, in timeline order.
+        target_seconds: Target TOTAL length, or ``None``/0 for no constraint.
+        importance: Per-moment editorial weight (any positive scale, higher = more
+            valuable). Defaults to equal weighting.
+        protect: Per-moment flags — ``True`` means "never trim this moment".
+        min_moment_seconds: Absolute floor for any single trimmed moment.
 
     Returns:
-        ``{"mode", "target_seconds", "head_trim", "tail_trim", "total_seconds",
-        "segments": [...]}`` where each segment has order/shot_id/file_path/name/label/
-        importance/source_duration/in_point/out_point/duration.
+        ``{"keeps", "floors", "excess", "absorbed", "shortfall", "notes"}`` where
+        ``keeps[i]`` is the seconds moment ``i`` should retain (≤ its full length).
     """
-    n = len(clips)
-    sources = [float(c.get("duration_seconds") or 0.0) for c in clips]
-    if weights is None or len(weights) != n:
-        base = list(weights or [])
-        weights = [(base[i] if i < len(base) else 1.0) for i in range(n)]
-    weights = [max(0.0, float(w)) for w in weights]
+    n = len(spans)
+    full = [max(0.0, _f(s)) for s in spans]
+    keeps = list(full)
+    total = sum(full)
+    idle = {"keeps": [round(k, 3) for k in keeps], "floors": [round(f, 3) for f in full],
+            "excess": 0.0, "absorbed": 0.0, "shortfall": 0.0, "notes": []}
+    if n == 0 or not target_seconds or target_seconds <= 0:
+        return idle
+    excess = total - float(target_seconds)
+    if excess <= _TOL:
+        return idle
 
-    head_trim = max(0.0, float(head_trim or 0.0))
-    tail_trim = max(0.0, float(tail_trim or 0.0))
-    trimming = head_trim > 0 or tail_trim > 0
-    timed = (not trimming) and target_seconds is not None and target_seconds > 0
+    w = _weights(importance, n)
+    prot = [bool(p) for p in _aligned(protect, n, False)]
+    lo, hi = min(w), max(w)
 
-    alloc = allocate_durations(sources, weights, float(target_seconds)) if timed else None
+    floors: list[float] = []
+    for i in range(n):
+        if prot[i] or full[i] <= 0:
+            floors.append(full[i])
+            continue
+        norm = 0.5 if hi <= lo else (w[i] - lo) / (hi - lo)
+        retain = RETAIN_LOW + (RETAIN_HIGH - RETAIN_LOW) * norm
+        floors.append(min(full[i], max(min_moment_seconds, full[i] * retain)))
 
+    tiers: dict[float, list[int]] = {}
+    for i in range(n):
+        tiers.setdefault(round(w[i], 3), []).append(i)
+
+    remaining = excess
+    notes: list[str] = []
+    for tier_weight in sorted(tiers):              # ascending importance = compress first
+        if remaining <= _TOL:
+            break
+        idxs = tiers[tier_weight]
+        slack = {i: max(0.0, full[i] - floors[i]) for i in idxs}
+        pool = sum(slack.values())
+        if pool <= _TOL:
+            continue
+        take = min(remaining, pool)
+        touched = 0
+        for i in idxs:
+            if slack[i] <= 0:
+                continue
+            keeps[i] = max(floors[i], keeps[i] - take * slack[i] / pool)
+            touched += 1
+        remaining -= take
+        notes.append(f"importance {tier_weight:g}: trimmed {take:.1f}s across "
+                     f"{touched} moment(s)")
+
+    return {
+        "keeps": [round(k, 3) for k in keeps],
+        "floors": [round(f, 3) for f in floors],
+        "excess": round(excess, 3),
+        "absorbed": round(excess - max(0.0, remaining), 3),
+        "shortfall": round(max(0.0, remaining), 3),
+        "notes": notes,
+    }
+
+
+def place_window(start: float, end: float, keep: float,
+                 focus: float | None = None, bias: float = FOCUS_BIAS) -> tuple[float, float]:
+    """Place a ``keep``-second window INSIDE ``[start, end]``, around the editorial focus.
+
+    The kept window is centred on ``focus`` (the moment's peak — its midpoint when the
+    agent gives none), with ``bias`` of it before that point, then clamped so it can never
+    leave the original event boundaries. This is why nothing is trimmed by a fixed rule
+    such as "always drop the first N seconds": what survives is the core of the action.
+    """
+    span = max(0.0, end - start)
+    if keep >= span - 1e-9 or span <= 0:
+        return start, end
+    centre = start + span * 0.5 if focus is None else min(max(float(focus), start), end)
+    in_p = centre - keep * bias
+    in_p = min(max(in_p, start), end - keep)
+    return in_p, in_p + keep
+
+
+# ── Timeline builders (one per editing mode) ──────────────────────────────────
+
+
+def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = None,
+            raw_seconds: float | None = None, excluded=None, aspect_ratio: str = "",
+            extra: dict | None = None) -> dict:
+    """Assemble the common plan envelope shared by both modes."""
+    total = round(sum(s["duration"] for s in segments), 3)
+    status, delta = _duration_status(total, target_seconds)
+    validation_errors = [
+        {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
+        for s in segments if not s["valid"]
+    ]
+    plan = {
+        "mode": mode,
+        # The editor's OUTPUT aspect ratio rides along the plan untouched. Nothing in this
+        # module acts on it — it is a delivery SPEC, not an editing decision — but carrying
+        # it here is what gets it from the Selection UI to the Delivery compiler.
+        "aspect_ratio": aspect_ratio or None,
+        "target_seconds": round(float(target_seconds), 3) if target_seconds else None,
+        "raw_seconds": round(float(raw_seconds), 3) if raw_seconds is not None else total,
+        "total_seconds": total,
+        "duration_status": status,
+        "duration_delta": delta,
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
+        "segments": segments,
+        "excluded": normalise_alternates(excluded),
+    }
+    if extra:
+        plan.update(extra)
+    return plan
+
+
+def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
+                        excluded=None, aspect_ratio: str = "") -> dict:
+    """CLIP ASSEMBLY — ordered COMPLETE clips, each at its full measured length.
+
+    The unit of editing is the whole clip. There is no trimming, no screen-time
+    allocation and no target duration: the plan's length is simply the sum of the clips
+    the agent kept. All the editorial work in this mode is the agent's — dropping
+    candidates that do not serve the intent (reported via ``excluded``) and deciding the
+    order, which is preserved EXACTLY (clip 0 = timeline step 1).
+
+    Args:
+        clips: Ordered, resolved clip dicts with ``file_path`` and (ideally)
+            ``duration_seconds``; ``shot_id`` optional.
+        labels: Optional per-clip step labels ("cold open", "hero moment", ...).
+        excluded: Candidate clips deliberately left out — see :func:`normalise_alternates`.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio, carried through to
+            Delivery untouched. It is a delivery spec, so it changes nothing here — no
+            clip is cropped, resized or reframed by the planner.
+
+    Returns:
+        The standard plan dict with ``mode='clip_assembly'``.
+    """
     segments = []
     for i, c in enumerate(clips):
-        src = sources[i]
-        if trimming:
-            # Keep the middle: [head_trim, src - tail_trim]. When the clip is too short
-            # to have a middle, in==out → duration 0 (a real fact, not fabricated).
-            if src > 0:
-                in_p = min(head_trim, src)
-                out_p = max(in_p, src - tail_trim)
-            else:
-                in_p = out_p = 0.0  # unknown source length — cannot trim, leave to Delivery
-            dur = round(max(0.0, out_p - in_p), 3)
-        elif timed:
-            in_p = 0.0
-            dur = round(alloc[i], 3)
-            out_p = dur
-        else:  # full clip
-            in_p = 0.0
-            dur = round(src, 3)
-            out_p = dur
-        # Segment-level validity (audit C-06): a clip with real footage (src > 0) but
-        # NOTHING left after trimming/allocation (dur <= 0) is an ILLEGAL segment. It is
-        # flagged here — with a human-readable reason — instead of being silently emitted
-        # or dropped, so Delivery can refuse and the UI can show the file name, source
-        # length, and trim parameters. (src == 0 means the source length is simply
-        # unknown, not illegal — left valid for the compiler to handle.)
-        valid = True
-        validation_error = None
-        if src > 0 and dur <= 0:
-            valid = False
-            if trimming:
-                validation_error = (
-                    f"clip is {src:g}s — shorter than the requested trim "
-                    f"(first {head_trim:g}s + last {tail_trim:g}s); no middle remains")
-            else:
-                validation_error = f"allocated screen time is 0s (source {src:g}s)"
-
+        src = round(max(0.0, _f(c.get("duration_seconds"))), 3)
+        # A measured length gives explicit in/out points. An UNKNOWN length (0) emits
+        # in/out = None so the compiler uses the whole clip — we never fabricate a range.
+        in_p, out_p = (0.0, src) if src > 0 else (None, None)
         segments.append({
             "order": i + 1,
             "shot_id": c.get("shot_id"),
             "file_path": c.get("file_path"),
             "name": Path(c.get("file_path") or "").name,
             "label": (labels[i] if labels and i < len(labels) else ""),
-            "importance": round(weights[i], 3),
-            "source_duration": round(src, 3),
-            "in_point": round(in_p, 3),
-            "out_point": round(out_p, 3),
-            "duration": dur,
-            "valid": valid,
-            "validation_error": validation_error,
+            "importance": 1.0,
+            "source_duration": src,
+            "in_point": in_p,
+            "out_point": out_p,
+            "duration": src,
+            "trimmed": False,
+            "trim_note": "",
+            "valid": True,
+            "validation_error": None,
         })
-
-    mode = "trim" if trimming else ("timed" if timed else "full")
-    validation_errors = [
-        {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
-        for s in segments if not s["valid"]
-    ]
-    return {
-        "mode": mode,
-        "target_seconds": round(float(target_seconds), 3) if timed else None,
-        "head_trim": head_trim,
-        "tail_trim": tail_trim,
-        "total_seconds": round(sum(s["duration"] for s in segments), 3),
-        "valid": not validation_errors,
-        "validation_errors": validation_errors,
-        "segments": segments,
-    }
+    return _finish(MODE_CLIP, segments, target_seconds=None, excluded=excluded,
+                   aspect_ratio=aspect_ratio)
 
 
-def plan_event_segments(events: list[dict], labels: list[str] | None = None) -> dict:
-    """Build a timeline plan from ORDERED temporal events (moment-precise trims).
+def build_moment_timeline(events: list[dict], *, target_seconds: float | None = None,
+                          importance: list[float] | None = None,
+                          labels: list[str] | None = None,
+                          focus: list[float | None] | None = None,
+                          protect: list[bool] | None = None,
+                          excluded=None, aspect_ratio: str = "",
+                          min_moment_seconds: float = MIN_MOMENT_SECONDS) -> dict:
+    """MOMENT ASSEMBLY — ordered temporal moments, optionally optimised to a target.
 
-    This is the event-based counterpart to :func:`plan_segments`: instead of a per-clip
-    head/tail trim or a proportional allocation, each segment's in/out points are the
-    event's OWN measured ``start_seconds``/``end_seconds`` — so the timeline cuts to the
-    exact moment the action happens. Order is preserved exactly (event 0 = step 1).
+    Each segment starts as the event's OWN measured ``start_seconds``/``end_seconds``, so
+    the edit cuts to the exact moment the action happens. Order is preserved EXACTLY.
 
-    Each event dict needs ``file_path``, ``start_seconds`` and ``end_seconds`` (and
-    ideally ``shot_id`` and the parent ``source_duration``/``clip_duration``). A segment
-    whose range is empty or falls outside the known source length is flagged invalid
-    (``valid: False``) rather than silently dropped, so Delivery refuses it.
+    When ``target_seconds`` is given AND the chosen moments overrun it, the overrun is
+    absorbed by :func:`compress_to_target` — low-value moments compressed first, every
+    trim kept strictly inside its own event boundaries and placed around the moment's
+    focus. Nothing is ever removed here; an overrun that trimming cannot absorb is
+    reported (``duration_status='over_target'`` + ``removal_candidates``) for the agent to
+    resolve editorially. When the moments fall SHORT of the target, footage is never
+    stretched — the plan simply reports ``under_target``.
 
-    Returns the same plan shape as ``plan_segments`` with ``mode='events'``.
+    Args:
+        events: Ordered event dicts with ``file_path``, ``start_seconds``, ``end_seconds``
+            and ideally ``shot_id``, ``event_id`` and the parent ``source_duration``.
+        target_seconds: Optional target TOTAL length for the edit.
+        importance: Per-moment editorial weight (higher = more valuable, harder to cut).
+        labels: Optional per-moment step labels (defaults to the event's action text).
+        focus: Per-moment peak timecode (absolute, inside the event) to trim around.
+        protect: Per-moment "never trim" flags.
+        excluded: Moments deliberately left out — see :func:`normalise_alternates`.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio, carried through to
+            Delivery untouched (a delivery spec — no clip is cropped, resized or reframed
+            here, and it never changes a moment's in/out points).
+        min_moment_seconds: Absolute floor for any single trimmed moment.
+
+    Returns:
+        The standard plan dict with ``mode='moment_assembly'``, plus ``compression`` and
+        ``removal_candidates``.
     """
+    n = len(events)
+    weights = _weights(importance, n)
+    focuses = _aligned(focus, n, None)
+    protects = [bool(p) for p in _aligned(protect, n, False)]
+
+    starts, ends, spans, srcs = [], [], [], []
+    for e in events:
+        start = max(0.0, _f(e.get("start_seconds")))
+        end = _f(e.get("end_seconds"))
+        starts.append(start)
+        ends.append(end)
+        spans.append(max(0.0, end - start))
+        srcs.append(_f(e.get("source_duration") or e.get("clip_duration")))
+
+    raw_seconds = sum(spans)
+    report = compress_to_target(spans, target_seconds, importance=weights,
+                                protect=protects, min_moment_seconds=min_moment_seconds)
+    keeps = report["keeps"]
+
     segments = []
     for i, e in enumerate(events):
-        in_p = max(0.0, float(e.get("start_seconds") or 0.0))
-        out_p = float(e.get("end_seconds") or 0.0)
-        src = float(e.get("source_duration") or e.get("clip_duration") or 0.0)
+        start, end, src = starts[i], ends[i], srcs[i]
+        keep = min(keeps[i], spans[i])
+        in_p, out_p = place_window(start, end, keep, focuses[i])
         dur = round(max(0.0, out_p - in_p), 3)
+        trimmed = spans[i] - dur > _TOL
 
-        valid = True
-        validation_error = None
-        if dur <= 0:
+        valid, validation_error = True, None
+        if spans[i] <= 0:
+            valid, validation_error = False, f"event range is empty ({start:g}s–{end:g}s)"
+        elif src > 0 and end > src + 1e-6:
             valid, validation_error = False, (
-                f"event range is empty ({in_p:g}s–{out_p:g}s)")
-        elif src > 0 and out_p > src + 1e-6:
+                f"event out-point {end:g}s exceeds source length {src:g}s")
+        elif dur <= 0:
             valid, validation_error = False, (
-                f"event out-point {out_p:g}s exceeds source length {src:g}s")
+                f"nothing remains of the moment after optimisation "
+                f"(event {start:g}s–{end:g}s)")
 
         segments.append({
             "order": i + 1,
             "shot_id": e.get("shot_id"),
+            "event_id": e.get("event_id"),
             "file_path": e.get("file_path"),
             "name": Path(e.get("file_path") or "").name,
-            "label": (labels[i] if labels and i < len(labels) else
-                      (e.get("action") or "")[:60]),
-            "importance": 1.0,
+            "label": (labels[i] if labels and i < len(labels)
+                      else (e.get("action") or "")[:60]),
+            "importance": round(weights[i], 3),
             "source_duration": round(src, 3),
+            "event_start": round(start, 3),
+            "event_end": round(end, 3),
+            "event_duration": round(spans[i], 3),
             "in_point": round(in_p, 3),
             "out_point": round(out_p, 3),
             "duration": dur,
+            "trimmed": trimmed,
+            "trim_note": (f"compressed {spans[i] - dur:.1f}s (kept {in_p:.1f}s–{out_p:.1f}s "
+                          f"of the {start:.1f}s–{end:.1f}s event)") if trimmed else "",
+            "protected": protects[i],
             "valid": valid,
             "validation_error": validation_error,
         })
 
-    validation_errors = [
-        {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
-        for s in segments if not s["valid"]
-    ]
-    return {
-        "mode": "events",
-        "target_seconds": None,
-        "head_trim": 0.0,
-        "tail_trim": 0.0,
-        "total_seconds": round(sum(s["duration"] for s in segments), 3),
-        "valid": not validation_errors,
-        "validation_errors": validation_errors,
-        "segments": segments,
-    }
+    # Weakest-contribution moments, offered to the AGENT when trimming alone fell short.
+    # This module never acts on them — removal is an editorial decision, not a rule.
+    removal_candidates = []
+    if report["shortfall"] > _TOL:
+        ranked = sorted(range(n), key=lambda i: (weights[i], -spans[i]))
+        for i in ranked[:3]:
+            if protects[i]:
+                continue
+            removal_candidates.append({
+                "order": i + 1,
+                "event_id": events[i].get("event_id"),
+                "name": segments[i]["name"],
+                "label": segments[i]["label"],
+                "importance": round(weights[i], 3),
+                "would_save_seconds": segments[i]["duration"],
+            })
+
+    return _finish(
+        MODE_MOMENT, segments,
+        target_seconds=target_seconds, raw_seconds=raw_seconds, excluded=excluded,
+        aspect_ratio=aspect_ratio,
+        extra={
+            "compression": {
+                "applied": report["absorbed"] > _TOL,
+                "overrun_seconds": report["excess"],
+                "absorbed_seconds": report["absorbed"],
+                "shortfall_seconds": report["shortfall"],
+                "trimmed_count": sum(1 for s in segments if s["trimmed"]),
+                "notes": report["notes"],
+            },
+            "removal_candidates": removal_candidates,
+        },
+    )

@@ -37,7 +37,9 @@ from app.services.openai_service import llm
 from app.services.catalogue_resolver import (
     resolve_one, resolve_ordered, AmbiguousIdentifier,
 )
-from app.services.premiere_export_service import build_timeline, compile_project
+from app.services.premiere_export_service import (
+    build_timeline, compile_project, InvalidAspectRatio,
+)
 from app.services.ffmpeg_service import count_audio_streams
 from app.utils.logger import get_logger
 
@@ -95,12 +97,35 @@ def _parse_roles(roles: str | None, count: int) -> list[str] | None:
     return parsed[:count]
 
 
+def _frame_summary(seq: dict) -> str:
+    """One line describing the delivery frame and how clips were fitted into it.
+
+    Reports the requested aspect ratio, the raster, and how many clips end up
+    letterboxed/pillarboxed — the honest consequence of scaling to fit rather than
+    cropping. Nothing here is a creative choice; it is the compiler stating what it did.
+    """
+    parts = [f"{seq['width']}x{seq['height']}"]
+    if seq.get("aspect_ratio"):
+        parts.insert(0, f"frame {seq['aspect_ratio']}")
+    boxed = []
+    if seq.get("letterboxed_clips"):
+        boxed.append(f"{seq['letterboxed_clips']} letterboxed")
+    if seq.get("pillarboxed_clips"):
+        boxed.append(f"{seq['pillarboxed_clips']} pillarboxed")
+    line = " · ".join(parts)
+    if boxed:
+        line += (f" · scaled to fit: {', '.join(boxed)} "
+                 "(full image kept — nothing cropped or stretched)")
+    return line
+
+
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 
 @tool
 def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
                               sequence_name: str = "MAPO Edit",
+                              aspect_ratio: str = None,
                               state: Annotated[dict, InjectedState] = None) -> str:
     """Dry-run the timeline compile: resolve the ordered clips and show the layout.
 
@@ -116,6 +141,11 @@ def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
             the clips (e.g. "cold open, hero moment, outro" — whatever the Selection
             Agent used, if anything). Purely descriptive; never reorders.
         sequence_name: Name for the sequence.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio ("16:9", "9:16", "1:1",
+            "4:3", "3:4" or "1:1"). Pass ONLY the value the editor actually specified — never
+            invent one, and never infer one from the editing intent. Omit it when none was
+            given. Clips are scaled to FIT this frame (aspect preserved, no crop, no
+            stretch), so the preview shows which clips will be letterboxed/pillarboxed.
 
     Returns:
         A grounded, numbered preview of the timeline, or a clear error listing any
@@ -133,24 +163,31 @@ def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
 
     role_list = _parse_roles(roles, len(rows))
     clips = _to_compiler_clips(rows, role_list, probe_audio=False)
-    timeline = build_timeline(clips, sequence_name=sequence_name)
+    try:
+        timeline = build_timeline(clips, sequence_name=sequence_name,
+                                  aspect_ratio=aspect_ratio)
+    except InvalidAspectRatio as e:
+        return f"Cannot build the timeline — unusable output aspect ratio: {e}"
 
     seq = timeline["sequence"]
     lines = [
         f"🎬 Timeline preview — {seq['name']}",
         f"   {seq['clip_count']} clips · {seq['total_seconds']:.1f}s "
-        f"· {seq['timebase']} fps · {seq['width']}x{seq['height']}",
+        f"· {seq['timebase']} fps",
+        f"   Output: {_frame_summary(seq)}",
         "",
     ]
     for c in timeline["clips"]:
         role = f"[{c['role']}] " if c["role"] else ""
         audio = ("A1+A2" if c["audio_streams"] >= 2
                  else "A1" if c["audio_streams"] == 1 else "no audio")
+        fit = c["frame_fit"]
+        fit_note = f"  · {fit['note']}" if fit["mode"] not in ("exact", "unknown") else ""
         lines.append(
             f"  {c['order']}. {role}{c['name']}  "
             f"@ {c['seq_start_seconds']:.1f}s–{c['seq_end_seconds']:.1f}s  "
             f"(in {c['in_seconds']:.1f}s / out {c['out_seconds']:.1f}s)  "
-            f"· V1 + {audio}"
+            f"· V1 + {audio}{fit_note}"
         )
     lines.append("")
     lines.append("Order is exactly as provided. Call compile_premiere_project to write the file.")
@@ -160,6 +197,7 @@ def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
 @tool
 def compile_premiere_project(ordered_identifiers: str, roles: str = None,
                              sequence_name: str = "MAPO Edit",
+                             aspect_ratio: str = None,
                              state: Annotated[dict, InjectedState] = None) -> str:
     """Compile the ordered timeline into a Premiere-importable FCP7 XML (+ JSON).
 
@@ -177,6 +215,12 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
         roles: Optional comma-separated free-form timeline-step labels aligned 1:1 with
             the clips (recorded as clip comments; descriptive only).
         sequence_name: Name for the Premiere sequence.
+        aspect_ratio: The editor's requested OUTPUT aspect ratio ("16:9", "9:16", "1:1",
+            "4:3", "3:4" or "1:1"). Pass ONLY the value the editor actually specified — never
+            invent one and never infer one from the editing intent. Omit it when none was
+            given. The sequence is built at that frame and each clip is SCALED TO FIT it
+            with its own aspect preserved (letterbox/pillarbox where the ratios differ —
+            never cropped, never stretched).
 
     Returns:
         The paths to the written .xml (Premiere import) and .json files plus a summary,
@@ -197,7 +241,10 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
 
     try:
         result = compile_project(clips, sequence_name=sequence_name,
-                                 project_id=project_id, write=True)
+                                 project_id=project_id, aspect_ratio=aspect_ratio,
+                                 write=True)
+    except InvalidAspectRatio as e:
+        return f"Refusing to compile — unusable output aspect ratio: {e}"
     except Exception as e:  # keep the ReAct loop alive with a grounded error
         logger.error(f"Compile failed: {e}")
         return f"Compile failed: {e}"
@@ -212,7 +259,8 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
         f"  XML : {result['xml_path']}\n"
         f"  JSON: {result['json_path']}\n"
         f"  Sequence '{seq['name']}': {seq['clip_count']} clips · "
-        f"{seq['total_seconds']:.1f}s · {seq['timebase']} fps · {seq['width']}x{seq['height']}\n"
+        f"{seq['total_seconds']:.1f}s · {seq['timebase']} fps\n"
+        f"  Output: {_frame_summary(seq)}\n"
         f"  Timeline order (preserved): {order_summary}"
     )
 
@@ -222,32 +270,40 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
                               state: Annotated[dict, InjectedState] = None) -> str:
     """Compile STRUCTURED timeline segments (from the Selection plan) into Premiere FCP7 XML.
 
-    This is the preferred delivery path: it consumes the Selection Agent's
-    `plan_timeline` output directly, so trims (in/out points) and order are honoured
-    exactly. Each segment already carries its file, in_point, out_point and optional
-    label — this tool resolves the real media, applies those trims, and writes the XML
-    (+ JSON). It NEVER re-orders, drops, or re-times a segment. Media resolution and the
-    output filename are scoped to the current project.
+    This is the preferred delivery path: it consumes the Selection Agent's timeline plan
+    directly, so in/out points and order are honoured exactly. Each segment already
+    carries its file, in_point, out_point and optional label — this tool resolves the real
+    media, applies those points, and writes the XML (+ JSON). It NEVER re-orders, drops,
+    or re-times a segment. The plan's editing mode (clip_assembly / moment_assembly)
+    changes nothing here — both compile identically. Media resolution and the output
+    filename are scoped to the current project.
+
+    OUTPUT ASPECT RATIO: if the plan carries an ``aspect_ratio``, that is the editor's
+    delivery spec and it is read straight from the JSON (you never supply or override it).
+    The sequence is built at that frame and every clip is SCALED TO FIT it with its own
+    aspect preserved — never stretched, never auto-cropped; where the ratios differ the
+    whole image is kept and the spare frame area becomes letterboxing/pillarboxing.
 
     Args:
-        segments_json: JSON — either the full plan object from `plan_timeline`
-            (``{"mode":..., "segments":[...]}``) or a bare list of segment objects. Each
-            segment needs ``file_path`` or ``shot_id``; optional ``in_point`` /
-            ``out_point`` (seconds) and ``label``.
+        segments_json: JSON — either the full plan object from the Selection planner
+            (``{"mode":..., "aspect_ratio":..., "segments":[...]}``) or a bare list of
+            segment objects. Each segment needs ``file_path`` or ``shot_id``; optional
+            ``in_point`` / ``out_point`` (seconds) and ``label``.
         sequence_name: Name for the Premiere sequence.
 
     Returns:
-        The written .xml / .json paths + a summary, or a clear error naming any segment
-        whose media did not resolve, was ambiguous, or was flagged invalid upstream.
+        The written .xml / .json paths + a summary (including the delivery frame and how
+        many clips are letterboxed/pillarboxed), or a clear error naming any segment whose
+        media did not resolve, was ambiguous, or was flagged invalid upstream.
     """
     project_id = _pid_from_state(state)
     try:
         data = json.loads(segments_json)
     except (json.JSONDecodeError, TypeError) as e:
-        return f"Could not parse segments_json: {e}. Pass the plan_timeline JSON verbatim."
+        return f"Could not parse segments_json: {e}. Pass the Selection plan JSON verbatim."
     segments = data.get("segments") if isinstance(data, dict) else data
     if not segments:
-        return "No segments to compile. Provide the plan_timeline JSON."
+        return "No segments to compile. Provide the Selection plan JSON."
 
     # C-06: refuse any segment the planner flagged invalid (real footage but nothing left
     # after trimming). Never silently emit or repair it.
@@ -295,15 +351,26 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         return ("Refusing to compile — these segments matched no catalogued clip: "
                 f"{unresolved}. Every media reference must be real.")
 
+    # The delivery frame comes from the PLAN (the editor's UI spec), not from the model —
+    # so the exported sequence is always the aspect ratio that was actually requested.
+    aspect_ratio = data.get("aspect_ratio") if isinstance(data, dict) else None
+
     try:
         result = compile_project(clips, sequence_name=sequence_name,
-                                 project_id=project_id, write=True)
+                                 project_id=project_id, aspect_ratio=aspect_ratio,
+                                 write=True)
+    except InvalidAspectRatio as e:
+        return (f"Refusing to compile — the plan's output aspect ratio is unusable: {e} "
+                "Fix it in ③ Selection and re-generate the timeline.")
     except Exception as e:
         logger.error(f"Segment compile failed: {e}")
         return f"Compile failed: {e}"
 
     seq = result["timeline"]["sequence"]
-    mode = data.get("mode", "full") if isinstance(data, dict) else "full"
+    # Cosmetic only — Delivery compiles both editing modes identically (order + in/out
+    # points preserved); the mode merely tells the editor how the timeline was generated.
+    mode = (data.get("mode") if isinstance(data, dict) else None) or "clip_assembly"
+    mode = mode.replace("_", " ")
     order_summary = " → ".join(
         f"{c['order']}.{(c['role'] + ':') if c['role'] else ''}{c['name']} "
         f"({c['used_seconds']:.1f}s)"
@@ -315,7 +382,8 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         f"  XML : {result['xml_path']}\n"
         f"  JSON: {result['json_path']}\n"
         f"  Sequence '{seq['name']}': {seq['clip_count']} segments · "
-        f"{seq['total_seconds']:.1f}s · {seq['timebase']} fps · {seq['width']}x{seq['height']}\n"
+        f"{seq['total_seconds']:.1f}s · {seq['timebase']} fps\n"
+        f"  Output: {_frame_summary(seq)}\n"
         f"  Segments (order + trim preserved): {order_summary}"
     )
 
@@ -349,15 +417,27 @@ HARD RULES:
 3. You do NOT make creative choices (no trimming, no reordering, no quality judgement).
    Time mapping uses the full measured clip duration laid end-to-end unless explicit
    in/out points are provided.
+4. OUTPUT ASPECT RATIO is the editor's delivery SPEC. It arrives with the timeline (in the
+   plan's `aspect_ratio` field, which `compile_timeline_segments` reads by itself). NEVER
+   invent one, never infer one from the edit's content, and never change the one you were
+   given. If none was specified, omit it and the frame is inferred from the footage.
+   You ADAPT the timeline to that frame, non-destructively: every clip is SCALED TO FIT
+   with its own aspect preserved. Footage is NEVER stretched to fill the frame and NEVER
+   auto-cropped to match it — where the source and target ratios differ the whole image is
+   kept and the leftover frame area becomes letterboxing (bars top/bottom) or
+   pillarboxing (bars left/right). The tools report how many clips that affects; pass it on
+   to the editor plainly rather than presenting it as a problem or "fixing" it by cropping.
 
 WORKFLOW:
-- PREFERRED — if the Selection Agent provided STRUCTURED timeline segments (a
-  `plan_timeline` JSON object, with per-segment in/out points), call
-  `compile_timeline_segments` with that JSON verbatim. This honours any trims (TIMED
-  MODE) and the exact order. This is the right path whenever segments are available.
+- PREFERRED — if the Selection Agent provided STRUCTURED timeline segments (its plan JSON
+  object, with per-segment in/out points), call `compile_timeline_segments` with that JSON
+  verbatim. It honours the in/out points and the exact order, whichever editing mode built
+  them (clip_assembly or moment_assembly — they compile identically). This is the right
+  path whenever segments are available.
 - FALLBACK — if you only have a plain ordered clip list (no segments/trims), call
   `preview_delivery_timeline` to confirm every clip resolves, then
-  `compile_premiere_project` with the SAME ordered list.
+  `compile_premiere_project` with the SAME ordered list. On THIS path only, pass
+  `aspect_ratio` yourself — and only if the editor stated one.
 - Either way: report the output paths back to the editor. If any clip/segment fails to
   resolve, STOP and report exactly which identifiers were bad — never substitute or
   invent a clip.
@@ -367,7 +447,9 @@ A1 = original/ambient audio, A2 = secondary audio only when a clip truly has a s
 audio stream.
 
 OUTPUT: confirm the sequence was compiled, give the .xml path (for File ▸ Import in
-Premiere Pro) and the .json path, and restate the preserved clip order.
+Premiere Pro) and the .json path, restate the preserved clip order, and state the delivery
+frame — the aspect ratio, the raster, and which clips are letterboxed/pillarboxed because
+their source shape differs from it (the full image is kept in every case).
 
 Prior user preferences: {memory}"""
 

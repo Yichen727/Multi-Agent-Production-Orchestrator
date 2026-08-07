@@ -205,7 +205,7 @@ class EditTimeline(BaseModel):
 # ── Pipeline stage data contracts (Ingest → Search → Curation → Selection → Delivery) ──
 #
 # These mirror the plain dicts the services already produce/consume today
-# (``retrieval_service.hybrid_search`` candidates and ``timeline_service.plan_segments``
+# (``retrieval_service.hybrid_search`` candidates and the ``timeline_service`` timeline
 # plans) so they can become the TYPED contract that flows on ``ProductionState`` between
 # stages (audit H-03 / H-05), replacing the current messages-only + fenced-JSON hand-off.
 #
@@ -247,42 +247,88 @@ class SearchCandidate(BaseModel):
 
 
 class TimelineSegment(BaseModel):
-    """One ordered segment of an edit timeline (``timeline_service.plan_segments``).
+    """One ordered segment of an edit timeline (``timeline_service`` builders).
 
     ``order`` is 1-based and preserved end-to-end. ``in_point``/``out_point``/``duration``
-    are seconds against the SOURCE clip (Delivery maps them to frames verbatim).
-    ``valid``/``validation_error`` are reserved for segment-range validation (audit
-    C-05/C-06) — a segment defaults to valid, and a later batch flips it (rather than
-    silently expanding a zero-length trim back to the full clip).
+    are seconds against the SOURCE clip (Delivery maps them to frames verbatim); both
+    points are ``None`` only when the source length is unknown, in which case the
+    compiler uses the whole clip rather than a fabricated range.
+
+    The MOMENT ASSEMBLY fields (``event_id``/``event_start``/``event_end``/
+    ``event_duration``/``trimmed``/``trim_note``/``protected``) record the original event
+    boundary a segment came from and any duration optimisation applied inside it — a
+    trim can never leave ``[event_start, event_end]``. They stay unset in CLIP ASSEMBLY,
+    where nothing is ever trimmed.
+
+    ``valid``/``validation_error`` carry segment-range validation (audit C-05/C-06): a
+    segment defaults to valid, and the builder flips it rather than silently expanding an
+    illegal range back to the full clip.
     """
     order: int
     shot_id: Optional[int] = None
+    event_id: Optional[int] = None
     file_path: str
     name: str = ""
     label: str = ""
     importance: float = 1.0
     source_duration: float = 0.0
-    in_point: float = 0.0
-    out_point: float = 0.0
+    event_start: Optional[float] = None
+    event_end: Optional[float] = None
+    event_duration: Optional[float] = None
+    in_point: Optional[float] = 0.0
+    out_point: Optional[float] = 0.0
     duration: float = 0.0
+    trimmed: bool = False
+    trim_note: str = ""
+    protected: bool = False
     valid: bool = True
     validation_error: Optional[str] = None
+
+
+class ExcludedMaterial(BaseModel):
+    """Candidate material the Selection Agent deliberately left OUT of the edit.
+
+    Selected clips/moments are candidates, not guaranteed content: the agent drops what
+    does not serve the editing intent (or, in Moment Assembly, what could not survive the
+    target duration). Every drop is reported here as alternative/backup material — WHY it
+    was excluded and how it could still be used in another edit — so nothing disappears
+    silently.
+    """
+    ref: str = ""
+    name: str = ""
+    reason: str = ""
+    suggested_use: str = ""
 
 
 class EditPlan(BaseModel):
     """The Selection stage's structured timeline plan.
 
-    ``mode`` is 'trim' | 'timed' | 'full'. ``segments`` are ordered and compiled VERBATIM
-    by the Delivery stage (order + trims preserved — no re-ordering, dropping, or
-    re-trimming). This is the object that replaces the fenced ```json plan the UI
-    currently regex-extracts from the Selection Agent's prose.
+    ``mode`` is one of the two user-facing editing modes — ``'clip_assembly'`` (ordered
+    complete clips, no trimming, no target duration) or ``'moment_assembly'`` (ordered
+    temporal moments with an optional target duration). The mode changes only how the
+    timeline is GENERATED; ``segments`` are ordered and compiled VERBATIM by the Delivery
+    stage either way (order + in/out points preserved — no re-ordering, dropping, or
+    re-trimming).
+
+    ``raw_seconds`` is the length before any duration optimisation, ``total_seconds``
+    after it, and ``duration_status`` is 'unconstrained' | 'on_target' | 'under_target' |
+    'over_target'.
+
+    ``aspect_ratio`` is the editor's OUTPUT specification ("16:9", "9:16", "1:1", or a
+    "4:3", "3:4"), carried through Selection untouched — Selection may let it influence
+    which footage it picks but never crops or resizes media. Delivery reads it from here
+    and scales each clip to FIT that frame with its own aspect preserved.
     """
-    mode: str = "full"
+    mode: str = "clip_assembly"
+    aspect_ratio: Optional[str] = None
     target_seconds: Optional[float] = None
-    head_trim: float = 0.0
-    tail_trim: float = 0.0
+    raw_seconds: float = 0.0
     total_seconds: float = 0.0
+    duration_status: str = "unconstrained"
+    duration_delta: float = 0.0
+    valid: bool = True
     segments: list[TimelineSegment] = Field(default_factory=list)
+    excluded: list[ExcludedMaterial] = Field(default_factory=list)
     explanation: str = ""
 
 
@@ -322,5 +368,12 @@ class DeliveryResult(BaseModel):
     project_id: Optional[int] = None
     clip_count: int = 0
     total_frames: int = 0
+    # The delivery frame actually written, and the honest consequence of scaling to fit
+    # it (nothing was cropped or stretched to avoid these).
+    aspect_ratio: Optional[str] = None
+    width: int = 0
+    height: int = 0
+    letterboxed_clips: int = 0
+    pillarboxed_clips: int = 0
     message: str = ""
     warnings: list[str] = Field(default_factory=list)

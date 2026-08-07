@@ -14,9 +14,9 @@ class Settings:
 
     # LLM
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5.4")
-    LLM_MODEL_FALLBACK: str = os.getenv("LLM_MODEL_FALLBACK", "gpt-5.4-mini")
-    VISION_MODEL: str = os.getenv("VISION_MODEL", "gpt-5.4")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5.5")
+    LLM_MODEL_FALLBACK: str = os.getenv("LLM_MODEL_FALLBACK", "gpt-5.5-mini")
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "gpt-5.5")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     # How many times a vision call may be attempted before the clip/event is left
     # unclassified. A dropped clip loses its tags AND its embedding, so a retry is the
