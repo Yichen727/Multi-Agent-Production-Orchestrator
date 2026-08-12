@@ -26,7 +26,7 @@ from app.services.database_service import _engine
 _DEFAULT_COLUMNS = (
     "shot_id, file_path, shot_type, duration_seconds, orientation, fps, "
     "width, height, codec, has_audio, keywords, description, "
-    "people_count, camera_motion, lighting, mood, subject_position, "
+    "people_count, mood, "
     "audio_channels, audio_sample_rate, audio_bit_depth"
 )
 

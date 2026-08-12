@@ -42,9 +42,9 @@ _TIERS = [("suggested", "🟡 Suggested"), ("neutral", "⚪ Neutral"), ("low", "
 # control is a property of Moment Assembly alone, not a mode of its own.
 EDITING_MODES = {
     "🎞️ Clip Assembly": ("clip_assembly",
-                          "Combine complete clips — each keeps its original duration."),
+                          "Combine complete clips."),
     "🎯 Moment Assembly": ("moment_assembly",
-                           "Extract meaningful moments from inside clips — target duration optional."),
+                           "Select moments from within clips."),
 }
 
 _DURATION_STATUS = {
@@ -116,6 +116,19 @@ def _pid(project_id):
         return int(project_id)
     except (TypeError, ValueError):
         return project_id
+
+
+def _backup_headline(item: dict) -> str:
+    """``name (start–end)`` for one backup-material item — an editor's clip reference.
+
+    The timecodes come from the catalogue (the Selection tool resolved them); an item that
+    matched nothing simply shows its raw reference rather than an invented range.
+    """
+    name = item.get("name") or item.get("ref") or "(unidentified)"
+    start, end = item.get("start_seconds"), item.get("end_seconds")
+    if start is None or end is None:
+        return name
+    return f"{name} ({start:.2f}s–{end:.2f}s)"
 
 
 # ── Backend calls (thin wrappers over the orchestrator stages) ─────────────────
@@ -392,7 +405,7 @@ def main():
     # ── Main area (full width): the workflow ──────────────────────────────────
     # ① Ingest
     st.subheader("① Ingest")
-    st.caption("Scan the footage directory, extract semantic metadata, build the catalogue.")
+    st.caption("Scan and catalogue the footage.")
     if st.session_state.ingest_done:
         st.success("✅ Ingest completed. All clips are in the Bin (left sidebar).")
     run_ingest = st.button("🎬 Run Ingest Analysis", use_container_width=True,
@@ -401,9 +414,7 @@ def main():
 
     # ② Search — decision cards (always clip-level; choosing a moment is Selection's job)
     st.subheader("② Search")
-    st.caption("Finds matching clips (🟡 suggested · ⚪ neutral · 🔴 low). Recall is "
-               "event-aware — a clip surfaces when a moment inside it matches, shown as the "
-               "card's reason. ➕ ticks the clip in the Media Pool.")
+    st.caption("Find matching clips and add them to the Media Pool.")
 
     if locked:
         st.info("🔒 Locked — run Ingest first.")
@@ -426,8 +437,7 @@ def main():
 
     # ③ Selection — two editing modes, nothing else to configure
     st.subheader("③ Selection")
-    st.caption("Pick how to edit, then describe your intent. Your ticked clips are "
-               "CANDIDATES — the agent decides which ones belong, in what order, and why.")
+    st.caption("Choose an editing mode and describe your intent.")
     selected_paths = [c["file_path"] for c in st.session_state.bin_shots
                       if st.session_state.get(_bin_key(c["file_path"]))]
     have_sel = bool(selected_paths)
@@ -451,8 +461,7 @@ def main():
         aspect_ratio = st.selectbox(
             "Output aspect ratio", options=ASPECT_CHOICES, index=0,
             disabled=sel_disabled, key="aspect_ratio",
-            help="Delivery frame. Clips are scaled to FIT it with their own aspect kept — "
-                 "never stretched, never auto-cropped (letterbox/pillarbox where needed).")
+            )
     with o2:
         # Target Duration applies to MOMENT ASSEMBLY only — Clip Assembly keeps every
         # clip's original length, so there is nothing to optimise. Default is N/A.
@@ -463,17 +472,14 @@ def main():
             help=("Optional. The agent selects the moments the intent needs first, then "
                   "compresses the lower-value ones to fit — content is never dropped just "
                   "to hit the number." if is_moment
-                  else "Not available in Clip Assembly — every clip keeps its full length."))
+                  else "Not available in Clip Assembly Mode."))
     if not is_moment:
         target_seconds = None
-    if not sel_disabled:
-        st.caption(f"Delivering at {aspect_ratio} · clips are scaled to fit "
-                   "(letterbox/pillarbox as needed — no cropping, no stretching).")
 
     intent_text = st.text_input(
         "Editing intent", key="intent", disabled=sel_disabled,
         placeholder="e.g. Warm, unhurried travel vlog — atmosphere first, ending on the sunset",
-        help="Describe style, emotion, pacing and purpose — not technical operations.")
+        help="Describe style, emotion, pacing and purpose.")
     run_select = st.button("🎬 Generate Edit Timeline", use_container_width=True,
                            disabled=sel_disabled,
                            help="Selection Agent — an assistant editor: it curates, orders "
@@ -499,21 +505,45 @@ def main():
                 st.caption(f"🎞️ CLIP ASSEMBLY · {n_steps} complete clip(s) · "
                            f"{plan.get('total_seconds')}s (no trimming)")
             if plan.get("aspect_ratio"):
-                st.caption(f"🖼️ Output frame {plan['aspect_ratio']} — Delivery scales each "
-                           "clip to fit; no source media is cropped or resized.")
-            dropped = plan.get("excluded") or []
-            if dropped:
-                st.caption(f"🗂️ {len(dropped)} candidate(s) held back as backup material — "
-                           "see the agent's reasoning below.")
+                st.caption(f"🖼️ Output frame: {plan['aspect_ratio']}")
+            # Ordering is the stage's core editorial act — surface the declared shape, and
+            # flag an order that merely reproduces how the material was listed.
+            if plan.get("ordering_strategy"):
+                st.caption(f"🧭 Ordering: {plan['ordering_strategy']}")
+            if (plan.get("order_check") or {}).get("unchanged"):
+                st.caption(f"⚠ Order matches {plan['order_check']['reference']} — "
+                           "check the agent's reasoning below for why that shape fits.")
         with st.container(border=True):
             st.markdown(st.session_state.selection_output)
+        # Backup material, identified the way an editor reads it — source file + real
+        # timecodes, never a bare event id.
+        dropped = (plan or {}).get("excluded") or []
+        if dropped:
+            with st.expander(f"🗂️ Not used — backup material ({len(dropped)})",
+                             expanded=False):
+                st.caption("The alternatives the agent weighed and rejected — not every "
+                           "unused clip.")
+                for x in dropped:
+                    st.markdown(f"**{_backup_headline(x)}**")
+                    if x.get("label"):
+                        st.markdown(x["label"])
+                    for g in x.get("also_details") or []:
+                        st.caption(f"Same call for {_backup_headline(g)}"
+                                   + (f" — {g['label']}" if g.get("label") else ""))
+                    if not x.get("file_path"):
+                        st.caption("No catalogued clip matched this reference.")
+                    st.markdown(f"- **Why not used:** {x.get('reason') or 'not stated'}")
+                    if x.get("suggested_use"):
+                        st.markdown(f"- **Could be used for:** {x['suggested_use']}")
+                omitted = (plan or {}).get("excluded_omitted", 0)
+                if omitted:
+                    st.caption(f"{omitted} further item(s) were trimmed — the shortlist is "
+                               "capped at the strongest alternatives.")
     st.divider()
 
     # ④ Deliver — compile the timeline into a Premiere-importable project
     st.subheader("④ Deliver")
-    st.caption("Compiles the edit timeline into a Premiere Pro–importable project "
-               "(FCP7 XML + JSON) at the aspect ratio you chose in ③. Preserves clip order "
-               "exactly — no re-editing, and clips are scaled to fit, never cropped.")
+    st.caption("Export the generated timeline as a Premiere Pro–compatible project.")
     # H-04: Delivery needs the STRUCTURED plan (ordered segments) from Selection — not
     # merely some timeline text. Without a structured plan there is no defined edit order
     # to compile and NO media-pool-order fallback, so Deliver stays disabled.
@@ -522,18 +552,17 @@ def main():
     if locked:
         st.info("🔒 Locked — run Ingest first.")
     elif not have_plan:
-        st.info("Generate a structured edit timeline in ③ Selection first "
-                "(Delivery compiles the ordered segments — there is no media-pool fallback).")
+        st.info("Generate a structured edit timeline first.")
     else:
         st.caption(f"Timeline ready · {len(_plan['segments'])} segment(s) · "
                    f"built by {_plan.get('mode', 'clip_assembly').replace('_', ' ')} · "
                    f"{_plan.get('total_seconds')}s"
                    + (f" · output frame {_plan['aspect_ratio']}"
                       if _plan.get("aspect_ratio") else "")
-                   + ". Delivery exports it as-is.")
+                   )
     seq_name = st.text_input("Sequence name", value="MAPO Edit",
                              disabled=locked or not have_plan, key="seq_name")
-    run_deliver = st.button("📦 Export to Premiere (FCP7 XML)", use_container_width=True,
+    run_deliver = st.button("📦 Export Project", use_container_width=True,
                             disabled=locked or not have_plan,
                             help="Delivery Agent — compiles the ordered timeline segments")
 

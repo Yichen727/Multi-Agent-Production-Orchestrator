@@ -26,6 +26,7 @@ proposes and explains; the editor always makes the final call (Human-in-the-Loop
 """
 
 import json
+from pathlib import Path
 from typing import Annotated
 
 from langchain_core.messages import SystemMessage
@@ -39,10 +40,13 @@ from app.services.openai_service import llm
 from app.services.database_service import (
     db, get_catalogued_events, get_events_by_ids,
 )
-from app.services.catalogue_resolver import resolve_ordered
+from app.services.catalogue_resolver import (
+    resolve_one, resolve_ordered, AmbiguousIdentifier,
+)
 from app.services.retrieval_service import group_size
 from app.services.timeline_service import (
-    MODE_CLIP, MODE_MOMENT, build_clip_timeline, build_moment_timeline,
+    MODE_CLIP, MODE_MOMENT, MAX_BACKUP_ITEMS, build_clip_timeline, build_moment_timeline,
+    compare_order, normalise_alternates,
 )
 # Output-aspect helpers only — Selection READS the delivery spec to prefer footage that
 # suits the frame; adapting the media to it is exclusively Delivery's job.
@@ -133,8 +137,148 @@ def _floats(text: str | None) -> list[float] | None:
     return out
 
 
+def _enrich_excluded(project_id: int, raw) -> list[dict]:
+    """Resolve the agent's excluded refs into REAL clips and measured timecodes.
+
+    The agent identifies a dropped moment by its ``event_id`` (or a dropped clip by file
+    name), because that is what it actually has. Those are database identifiers and mean
+    nothing to an editor, so every entry is looked up here — project-scoped — and given
+    its source file name, its measured start/end timecodes and the event's own action
+    text. The model is never asked for a timecode, so none can be invented.
+
+    An entry that matches no catalogued event or clip keeps the raw ref and gets NO file
+    path or timecodes — it is shown as given rather than dressed up as resolved.
+    """
+    items = normalise_alternates(raw)
+    if not items:
+        return []
+
+    # One batched lookup for every ref in play, including grouped ones.
+    ids: list[int] = []
+    for item in items:
+        for ref in [item["ref"], *item.get("also", [])]:
+            try:
+                ids.append(int(ref))
+            except (TypeError, ValueError):
+                continue
+    events = get_events_by_ids(project_id, ids) if ids else {}
+
+    def _resolve(ref: str) -> dict | None:
+        """One ref → its real clip + measured timecodes, or ``None`` if nothing matched."""
+        try:
+            event = events.get(int(ref))
+        except (TypeError, ValueError):
+            event = None
+        if event:                                   # a rejected MOMENT
+            fp = event.get("file_path") or ""
+            return {
+                "event_id": event.get("event_id"),
+                "file_path": fp,
+                "name": Path(fp).name,
+                "start_seconds": round(float(event.get("start_seconds") or 0.0), 3),
+                "end_seconds": round(float(event.get("end_seconds") or 0.0), 3),
+                "label": (event.get("action") or "").strip()[:80],
+            }
+        try:                                        # a rejected CLIP
+            row = resolve_one(project_id, ref)
+        except AmbiguousIdentifier:
+            row = None
+        if not row:
+            return None
+        fp = row.get("file_path") or ""
+        duration = float(row.get("duration_seconds") or 0.0)
+        return {
+            "file_path": fp,
+            "name": Path(fp).name,
+            "start_seconds": 0.0,
+            # No measured length → no end timecode, rather than a fabricated 0.
+            "end_seconds": round(duration, 3) if duration > 0 else None,
+            "label": "",
+        }
+
+    for item in items:
+        primary = _resolve(item["ref"])
+        if primary:
+            label = item.get("label") or primary.pop("label", "")
+            item.update(primary)
+            item["label"] = label
+        # Grouped near-duplicates: resolved so the editor can find them, but they do NOT
+        # each take a slot in the shortlist.
+        grouped = [g for g in (_resolve(r) for r in item.get("also", [])) if g]
+        if grouped:
+            item["also_details"] = grouped
+    return items
+
+
+def _excluded_headline(x: dict) -> str:
+    """``name (start–end)`` for one backup item — the way an editor refers to a clip."""
+    name = x.get("name") or x.get("ref") or "(unidentified)"
+    start, end = x.get("start_seconds"), x.get("end_seconds")
+    if start is None or end is None:
+        return name
+    return f"{name} ({start:.2f}s–{end:.2f}s)"
+
+
+def _format_excluded(excluded: list[dict], omitted: int = 0) -> list[str]:
+    """Render backup material the way an EDITOR reads it, not the way the DB stores it.
+
+    Each item shows the source file, its measured start–end timecodes, a short action
+    label, why it is not in the edit, and how it could still be used — never a bare event
+    id. Grouped near-duplicates hang off their representative rather than taking their own
+    slot, and an over-long list is reported as trimmed rather than silently cut.
+    """
+    lines = ["", "🗂️ Not used — backup material", ""]
+    for x in excluded:
+        lines.append(f"• {_excluded_headline(x)}")
+        if x.get("label"):
+            lines.append(f"  {x['label']}")
+        for g in x.get("also_details") or []:
+            lines.append(f"  (same call for {_excluded_headline(g)}"
+                         + (f" — {g['label']}" if g.get("label") else "") + ")")
+        lines.append(f"  Why not used: {x.get('reason') or 'not stated'}")
+        if x.get("suggested_use"):
+            lines.append(f"  Could be used for: {x['suggested_use']}")
+        if not x.get("file_path"):
+            lines.append("  (no catalogued clip matched this reference — shown as given)")
+        lines.append("")
+    if omitted > 0:
+        lines.append(f"({omitted} further item(s) were sent but not shown — the backup "
+                     f"section is capped at {MAX_BACKUP_ITEMS} strongest alternatives. "
+                     "Send fewer, stronger entries and group near-duplicates.)")
+    return [ln for ln in lines[:-1]] if lines and lines[-1] == "" else lines
+
+
+def _order_lines(plan: dict) -> list[str]:
+    """Report the declared ordering strategy, and challenge an order that just echoes input.
+
+    Ordering is the core editorial act of this stage, so it is made explicit rather than
+    left implicit in the sequence of ids: the agent states the SHAPE it chose, and if the
+    resulting order turns out to be identical to the order the material was listed in, the
+    planner says so. That is not an error — chronological is right for plenty of edits —
+    but it is exactly the outcome that anchoring on the candidate list would also produce,
+    so the agent is asked to confirm it was a decision.
+    """
+    lines: list[str] = []
+    strategy = plan.get("ordering_strategy")
+    if strategy:
+        lines += ["", f"🧭 Ordering strategy: {strategy}"]
+    else:
+        lines += ["", ("🧭 Ordering strategy: NOT STATED — say what shape you ordered the "
+                       "material into and why, so the editor can judge the structure.")]
+    check = plan.get("order_check") or {}
+    if check.get("unchanged"):
+        lines += ["", (f"⚠ This timeline's order is IDENTICAL to {check['reference']}. "
+                       "That is a legitimate choice for a chronological edit — but it is "
+                       "also what simply echoing the list would produce. Confirm it is a "
+                       "deliberate editorial decision; if the intent wants a different "
+                       "shape (cold open, escalation, tension-and-release), re-order and "
+                       "call this planner again.")]
+    return lines
+
+
 def _plan_block(lines: list[str], plan: dict) -> str:
     """Append the fenced ```json plan the orchestrator reads back (never model prose)."""
+    lines += _order_lines(plan)
     if plan.get("aspect_ratio"):
         lines += ["", (f"🖼️ Output aspect ratio: {plan['aspect_ratio']} — Delivery scales "
                        "each clip to FIT this frame with its own aspect preserved "
@@ -146,12 +290,7 @@ def _plan_block(lines: list[str], plan: dict) -> str:
         lines += [f"   • #{e['order']} {e['name']}: {e['error']}" for e in bad]
     excluded = plan.get("excluded") or []
     if excluded:
-        lines += ["", f"🗂️ Alternative / backup material ({len(excluded)} not in the edit):"]
-        for x in excluded:
-            note = x["reason"] or "no reason given"
-            if x["suggested_use"]:
-                note += f" · could be used for: {x['suggested_use']}"
-            lines.append(f"   • {x['name'] or x['ref']}: {note}")
+        lines += _format_excluded(excluded, plan.get("excluded_omitted", 0))
     lines += ["", "```json", json.dumps(plan), "```"]
     return "\n".join(lines)
 
@@ -165,7 +304,7 @@ def get_candidate_details(identifiers: str,
     """Fetch full metadata for the editor-curated candidates.
 
     Use this on the clips the user selected in the UI so you can judge — from real
-    attributes (shot_type, camera_motion, mood, people_count, duration, ...) — which of
+    attributes (shot_type, mood, people_count, duration, ...) — which of
     them actually serve the editing intent and where each belongs. Resolution is scoped
     to the current project.
 
@@ -261,8 +400,8 @@ def get_clip_events(identifiers: str,
 
 
 @tool
-def plan_clip_assembly(ordered_identifiers: str, labels: str = None,
-                       excluded_json: str = None,
+def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
+                       labels: str = None, excluded_json: str = None,
                        state: Annotated[dict, InjectedState] = None) -> str:
     """CLIP ASSEMBLY — assemble ORDERED COMPLETE clips into a timeline (no trimming).
 
@@ -277,13 +416,24 @@ def plan_clip_assembly(ordered_identifiers: str, labels: str = None,
 
     Args:
         ordered_identifiers: Comma-separated shot IDs and/or file names IN TIMELINE ORDER
-            (first = timeline step 1). This exact order is preserved — never re-sorted.
+            (first = timeline step 1). This exact order is preserved — never re-sorted,
+            so the order you give IS the edit. The Bin order is NOT a default: re-order
+            freely to serve the intent.
+        ordering_strategy: REQUIRED in practice — one line naming the SHAPE you ordered
+            the clips into and why ("open on the arrival for context, then the two action
+            clips escalating, closing wide to let it breathe"). It is recorded on the plan
+            so the editor can judge the structure, not just the result. The tool also
+            checks whether your order simply matches the candidate list and says so.
         labels: Optional PIPE-separated step labels aligned 1:1 with the clips
             (e.g. "cold open|the arrival|wide breather|closing beat").
-        excluded_json: The candidates you deliberately left OUT, as a JSON list of
+        excluded_json: The curated candidates you deliberately left OUT, as a JSON list of
             ``{"ref": "<file name or shot id>", "reason": "why it is not in the edit",
-            "suggested_use": "how it could still be used"}``. Never drop a candidate
-            silently — everything you exclude must be reported here as backup material.
+            "suggested_use": "how it could still be used", "also": ["<other clips>"]}``.
+            Report the clips you genuinely weighed and rejected — strongest alternatives
+            first, MAXIMUM 5 (the tool trims beyond that), grouping near-duplicates into
+            one entry via ``also``. The tool looks each ``ref`` up in the catalogue and
+            fills in the real file name and length for the editor, so do NOT write
+            durations or timecodes into the reason text yourself.
 
     Returns:
         A readable step list plus a fenced ```json block with the structured plan that
@@ -305,9 +455,19 @@ def plan_clip_assembly(ordered_identifiers: str, labels: str = None,
     if not clips:
         return "No catalogued clips matched those identifiers — nothing to plan."
 
-    plan = build_clip_timeline(clips, labels=_split(labels, "|") or None,
-                               excluded=excluded_json,
-                               aspect_ratio=_aspect_from_state(state))
+    # Anchoring check: compare against the editor's candidate list (the order the agent
+    # was shown), restricted to the clips it actually kept.
+    emitted = [c.get("file_path") for c in clips]
+    keep = set(emitted)
+    candidate_order = [str(p) for p in ((state or {}).get("selected_candidates") or [])
+                       if str(p) in keep]
+    plan = build_clip_timeline(
+        clips, labels=_split(labels, "|") or None,
+        excluded=_enrich_excluded(project_id, excluded_json),
+        aspect_ratio=_aspect_from_state(state),
+        ordering_strategy=ordering_strategy or "",
+        order_check=compare_order(emitted, candidate_order,
+                                  reference_label="the candidate list you were given"))
 
     lines = [f"🎞️ Timeline plan — CLIP ASSEMBLY ({len(plan['segments'])} complete clip(s), "
              f"{plan['total_seconds']:g}s total · no trimming)", ""]
@@ -320,7 +480,8 @@ def plan_clip_assembly(ordered_identifiers: str, labels: str = None,
 
 
 @tool
-def plan_moment_assembly(ordered_event_ids: str, importance: str = None,
+def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
+                         importance: str = None,
                          target_seconds: float = None, labels: str = None,
                          protect_event_ids: str = None, focus_json: str = None,
                          excluded_json: str = None,
@@ -348,11 +509,20 @@ def plan_moment_assembly(ordered_event_ids: str, importance: str = None,
 
     Args:
         ordered_event_ids: Comma-separated event IDs IN TIMELINE ORDER (first = step 1).
-            This exact order is preserved — never re-sorted. Each id must belong to the
-            current project.
+            This exact order is preserved — never re-sorted, so the order you give IS the
+            edit. `get_clip_events` lists moments grouped by clip and chronologically
+            within each clip; that is a LISTING order, NOT a suggested timeline. Re-order
+            freely — a moment from the end of a clip can open the edit.
+        ordering_strategy: REQUIRED in practice — one line naming the SHAPE you arranged
+            the moments into and why ("cold open on the goal, rewind to the build-up, end
+            on the celebration"). Recorded on the plan so the editor can judge the
+            structure. The tool also checks whether your order simply reproduces the
+            source chronology and says so.
         importance: Comma-separated editorial weights aligned 1:1 with the moments (any
-            positive scale, e.g. "5,2,4,1" — higher = more valuable to the intent, so
-            compressed later and less). Omit for equal weighting.
+            positive scale, e.g. "5,2,4,1" — higher = more valuable to the intent).
+            Importance is about narrative VALUE, and it does NOT affect position: it only
+            decides which moments get compressed first when the edit overruns the target.
+            Omit for equal weighting.
         target_seconds: Optional target TOTAL length in seconds. Pass the editor's Target
             Duration if they set one; omit it when they did not (never invent one).
         labels: Optional PIPE-separated step labels aligned 1:1 with the moments
@@ -362,9 +532,21 @@ def plan_moment_assembly(ordered_event_ids: str, importance: str = None,
         focus_json: Optional JSON object mapping event_id → the absolute timecode of that
             moment's PEAK (e.g. ``{"42": 18.5}``). Any compression keeps the window around
             that point instead of the moment's centre. Only use timecodes inside the event.
-        excluded_json: Moments you considered but left OUT, as a JSON list of
-            ``{"ref": "<event id or clip name>", "reason": "why it is not in the edit",
-            "suggested_use": "how it could still be used"}``.
+        excluded_json: A SHORTLIST of the strongest alternatives you genuinely weighed and
+            rejected — NOT an inventory of every unused moment. JSON list of
+            ``{"ref": "<the event_id>", "reason": "why it is not in the edit",
+            "suggested_use": "how it could still be used", "also": ["<ids>"]}``:
+              • Include a moment ONLY if you actually considered it for this edit AND a
+                different edit could genuinely use it. Never list unrelated moments from a
+                clip you used, or every leftover event `get_clip_events` returned.
+              • Maximum 5 items, strongest first — the tool trims beyond that. Three or
+                four is usually right; if nothing was a real contender, send an empty list.
+              • Group near-duplicates: put the best one in ``ref`` and the rest in
+                ``also``, so one rejection covers them all.
+            Give the plain event id as ``ref`` — the tool resolves it to the real source
+            file name, its measured start/end timecodes and its action text, so the editor
+            sees a usable clip reference instead of a database id. Never write timecodes
+            yourself.
 
     Returns:
         A readable step list plus a fenced ```json block with the structured plan that
@@ -428,10 +610,21 @@ def plan_moment_assembly(ordered_event_ids: str, importance: str = None,
     if target is None:
         target = _target_from_state(state)
 
+    # Anchoring check: the source chronology is exactly how `get_clip_events` listed these
+    # moments (grouped by file, chronological within each file), so sorting the emitted
+    # keys reproduces the order the agent was shown.
+    emitted = [(e.get("file_path") or "", float(e.get("start_seconds") or 0.0))
+               for e in ordered_events]
+
     plan = build_moment_timeline(
         ordered_events, target_seconds=target, importance=_floats(importance),
         labels=_split(labels, "|") or None, focus=focus, protect=protect,
-        excluded=excluded_json, aspect_ratio=_aspect_from_state(state),
+        excluded=_enrich_excluded(project_id, excluded_json),
+        aspect_ratio=_aspect_from_state(state),
+        ordering_strategy=ordering_strategy or "",
+        order_check=compare_order(
+            emitted, sorted(emitted),
+            reference_label="the source chronology (how get_clip_events listed them)"),
     )
 
     comp = plan["compression"]
@@ -517,9 +710,22 @@ an OUTPUT ASPECT RATIO, and — in Moment Assembly only — an optional TARGET D
 
 THE CURATED CLIPS ARE CANDIDATES, NOT A SHOT LIST. The editor ticked them as "worth
 considering". Never include material just because it was selected: if a clip or moment
-does not serve the intent, LEAVE IT OUT and report it as alternative/backup material
-(what it is, why it is not in the edit, and how it could still be used). Work ONLY within
-the curated set — never add a clip that was not given to you.
+does not serve the intent, LEAVE IT OUT. Work ONLY within the curated set — never add a
+clip that was not given to you.
+
+═══ BACKUP MATERIAL IS A SHORTLIST, NOT A LEFTOVERS LIST ═══
+`excluded_json` is where you hand the editor the few REAL alternatives you weighed and
+rejected. It is an editorial recommendation, not a report of everything you did not use.
+  - INCLUDE a moment/clip only if BOTH are true: you actually considered it for THIS edit,
+    and it is a meaningful alternative editorial choice a different edit could use.
+  - DO NOT include: unrelated moments from a clip you did use, every unused event
+    `get_clip_events` returned, or anything you are listing merely because it exists.
+  - MAXIMUM 5 entries, strongest first — three or four is usually right. An empty list is
+    the correct answer when nothing was a genuine contender.
+  - GROUP near-duplicates: pick the best one as `ref` and put the rest in `also`, so
+    "four more angles of the same drill" costs one slot, not four.
+  - Each entry needs only `ref` + `reason` + `suggested_use`; the tool fills in the real
+    file name, the measured start–end timecodes and the action label for you.
 
 THERE IS NO FIXED TEMPLATE. Do NOT assume every edit follows an "establishing → buildup →
 climax → reaction → ending" arc. That is one possible shape among many, never the default.
@@ -541,12 +747,21 @@ never the other one.
   there is NO trimming and NO duration control in this mode, and a target duration does
   NOT apply (ignore any length wording in the intent). Typical: vlog, documentary, travel,
   behind-the-scenes, atmosphere montage.
+  Because you cannot trim here, WHICH clips and IN WHAT ORDER are your only two levers —
+  so the ordering carries the whole edit. It deserves as much thought as sequencing
+  moments, not less.
   Workflow:
     1. Read the intent — video type, emotion, pace, style. State your interpretation.
     2. `get_candidate_details` on the curated clips to read their real metadata.
-    3. Decide which clips BELONG (drop the irrelevant ones) and in what ORDER.
-    4. `plan_clip_assembly` with the kept clips IN ORDER, optional step labels, and every
-       dropped candidate in `excluded_json` with a reason and a suggested alternative use.
+    3. SELECT — decide which clips BELONG and drop the rest.
+    4. DECLARE THE SHAPE — before ordering anything, name the structure the intent calls
+       for in one line. That line goes in `ordering_strategy`.
+    5. ORDER the kept clips into that shape (see ORDERING below — it applies here in full).
+       Use each clip's real attributes to place it: shot_type and scale for visual rhythm,
+       mood and people_count for energy, duration for how long a beat holds. The Bin order
+       is a listing, not a running order.
+    6. `plan_clip_assembly` with the kept clips IN ORDER, your `ordering_strategy`,
+       optional step labels, and the rejected candidates in `excluded_json`.
 
 ▸ MOMENT ASSEMBLY — the unit of editing is a MOMENT (temporal event) inside a clip.
   Build the edit from the meaningful moments within longer clips. A target duration is
@@ -559,11 +774,48 @@ never the other one.
     3. SELECT the moments that serve the intent — enough of them to tell the story
        properly. Do NOT pre-shrink the selection to fit the clock; select first, optimise
        second.
-    4. RANK them: give each an importance weight reflecting narrative contribution, not
-       length. Order them into the timeline the intent calls for.
-    5. `plan_moment_assembly` with the event_ids IN ORDER, the importance weights, the
-       target duration if the editor set one, and any moments you rejected in
-       `excluded_json`.
+    4. DECLARE THE SHAPE — before ordering anything, name the structure the intent calls
+       for in one line. That line goes in `ordering_strategy`.
+    5. ORDER the moments into that shape (see ORDERING below).
+    6. RANK them — a SEPARATE step from ordering. Importance is narrative VALUE, not
+       position and not length.
+    7. `plan_moment_assembly` with the event_ids IN ORDER, your `ordering_strategy`, the
+       importance weights, the target duration if the editor set one, and any moments you
+       rejected in `excluded_json`.
+
+═══ ORDERING IS AN EDITORIAL DECISION, NOT A SORT — IN **BOTH** MODES ═══
+This section applies IDENTICALLY whether your unit is a whole CLIP or a MOMENT. The order
+you emit IS the edit — no tool re-sorts it, so nothing downstream will fix a lazy
+sequence. Clip Assembly is not "the selected clips in the order they came"; deciding the
+running order of complete shots is exactly as much of an editorial act as sequencing
+moments.
+
+  - THE ORDER YOU WERE GIVEN IS NOT A RUNNING ORDER.
+      · Clip Assembly: the candidates arrive in the editor's Bin order — effectively
+        file-name / ingest order, an accident of the file system and never an editorial
+        statement. Two clips shot minutes apart may sit adjacent purely by name.
+      · Moment Assembly: `get_clip_events` lists moments grouped by clip and
+        chronological within each clip.
+    Both are LISTINGS for you to read. Do not default to either. The last clip in the Bin
+    can open the edit; moments from different clips can interleave.
+  - DECIDE EACH POSITION from narrative role, pacing, and how the item connects to its
+    neighbours. For every step ask: why THIS one here, what does it do after the previous
+    one, and what does it set up? Worth weighing — where the hook belongs (the strongest
+    material need not come last, nor first); how shot scale and type alternate so two
+    similar wides do not sit back to back; how energy and mood progress across the piece;
+    whether a breather is needed before or after a peak; what the closing beat should
+    leave the viewer with.
+  - CHRONOLOGY IS ONE SHAPE AMONG MANY — right for a tactical breakdown, a documentary
+    walk-through or a build-up-to-payoff story; wrong for a hook-first promo. Choose it
+    because the intent wants it, not because that is how the list arrived. The planner
+    compares your order against that listing and FLAGS an exact match, so be ready to
+    justify it or re-order.
+  - DECLARE THE SHAPE FIRST (`ordering_strategy`), then order to it. Deciding the
+    structure after the fact is exactly how a listing order sneaks in unexamined.
+  - IMPORTANCE DOES NOT DETERMINE POSITION (Moment Assembly). A weight of 5 does not mean
+    "first" or "last"; it only means "compress this last if we overrun the target". A
+    high-value moment may open the edit, or be held back as the payoff. Rank and order are
+    two independent judgements.
 
 ═══ OUTPUT ASPECT RATIO — A DELIVERY SPEC, NOT AN EDITORIAL INTENTION ═══
 The editor sets it explicitly in the UI (16:9, 9:16, 4:3, 3:4 or 1:1). NEVER infer
@@ -605,6 +857,9 @@ to the surrounding segments, and (c) what it does for the pacing/rhythm:
 
     🎬 Proposed Edit Timeline — <one-line read of the intent + the structure you chose>
     Mode: <CLIP ASSEMBLY | MOMENT ASSEMBLY> · <target/length as the planner reported it>
+    Ordering: <your ordering_strategy — the shape you chose and why. If the planner
+               flagged that your order matches the source chronology, say explicitly why
+               chronological is the right shape here, or re-order and re-plan.>
     Output frame: <the aspect ratio, and — only if it influenced your picks — one line on
                    how, e.g. "9:16: favoured the portrait shots; the two landscape clips
                    are essential to the story and will be letterboxed">
@@ -624,8 +879,22 @@ to the surrounding segments, and (c) what it does for the pacing/rhythm:
     (…as many steps as the intent needs — no more, no fewer.)
 
     ---
-    Not used (backup material): <each excluded candidate — why it is out, and where it
-    could still work>
+    🗂️ Not used — backup material   (omit this section entirely when there is none)
+
+    • samsung_9x16.mp4 (44.60s–49.72s)
+      Foldable phone close-up interaction.
+      Why not used: Strong phone moment, but vertical footage conflicts with the
+      horizontal-only requirement.
+      Could be used for: Portrait social version.
+
+    • samsung_ifa2025.mp4 (5.52s–11.08s)
+      Stage presentation with product reveal.
+      Why not used: No direct phone action.
+      Could be used for: IFA event recap.
+
+    Copy the file names and timecodes from the planner's output — never identify a dropped
+    moment by its event id, and never invent a timecode. Only the shortlist you sent in
+    `excluded_json` belongs here.
     Notes: <pacing, gaps, duration trade-offs, alternatives the editor should weigh>
 
 Make clear this timeline is ONE proposal for the editor to approve, reorder, extend or

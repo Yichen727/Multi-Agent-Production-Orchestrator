@@ -43,7 +43,7 @@ logger = get_logger("retrieval_service")
 _SELECT_COLUMNS = (
     "shot_id, file_path, shot_type, duration_seconds, "
     "orientation, width, height, fps, keywords, description, "
-    "people_count, camera_motion, lighting, mood, subject_position, embedding"
+    "people_count, mood, embedding"
 )
 
 # Relevance combines a CALIBRATED vector-cosine signal with lexical term overlap.
@@ -80,7 +80,7 @@ _RELATED_VEC_DAMP = 0.9          # the expanded query's cosine is worth slightly
 #
 # MEASURED constraints are exempt: orientation / duration come from ffprobe, not from a
 # model, so a row that passes them matches EXACTLY and is reported as a full 1.0.
-_MAX_INFERRED_RELEVANCE = 0.95
+_MAX_INFERRED_RELEVANCE = 1.0
 
 
 def _finalise_inferred(relevance: float) -> float:

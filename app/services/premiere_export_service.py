@@ -952,7 +952,7 @@ def compile_project(
         # Versioned filename (timestamp + short uuid) so a re-export of the same sequence
         # never silently overwrites a prior export — each is a trackable version (H-13).
         version = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
-        stem = f"premiere_{project_id}_{safe}_{version}"
+        stem = f"MAPO_{project_id}_{safe}_{version}"
         xml_path = output_dir / f"{stem}.xml"
         json_path = output_dir / f"{stem}.json"
         _atomic_write(xml_path, xml)

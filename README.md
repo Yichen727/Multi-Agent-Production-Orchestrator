@@ -27,7 +27,7 @@ The guiding rule everywhere is **honesty over completeness**: *store only what a
 |---|---|
 | ffprobe technical metadata (dimensions, orientation, fps, codec, audio, duration) | PostgreSQL production datastore (SQLite is used instead) |
 | FFmpeg scene-cut detection (cut count + timestamps) | Whisper transcription |
-| GPT-5.4 Vision frame tagging (shot type, objects, keywords, description, people count, camera motion, lighting, mood, subject position) | Face / speaker **identity** recognition (people are *counted*, never *identified*) |
+| GPT-5.4 Vision frame tagging (shot type, objects, keywords, description, people count, mood) | Face / speaker **identity** recognition (people are *counted*, never *identified*) |
 | GPT-5.4 **temporal event extraction** (per-clip ordered events: action, state change, subjects, keywords, real in/out timecodes) | Audio event detection (loudness/onsets — future work) |
 | Semantic embeddings + hybrid vector/lexical retrieval, with **event-aware clip recall** (moments boost clip search; moments are *cut* in Selection) | Automated quality scoring (removed by design — quality is the editor's call) |
 | FCP7 XML (`xmeml` v5) Premiere-importable export | |
@@ -84,8 +84,8 @@ One call to `ingest_footage` runs the whole pipeline per clip:
 1. **Verify** the media is readable (ffprobe).
 2. **Technical metadata** — true dimensions, rotation-aware display orientation, fps, codec, audio presence, duration.
 3. **Scene detection** — FFmpeg scene-change cut count + timestamps.
-4. **Vision tagging** — GPT-5.4 watches sampled frames (one per detected scene, or adaptive even sampling) and returns a description, shot type, objects, searchable keywords, an approximate people count, and semantic dimensions (camera motion, lighting, mood, subject position).
-5. **Embedding** — the description + keywords + mood/lighting are embedded into a vector for semantic recall.
+4. **Vision tagging** — GPT-5.4 watches sampled frames (one per detected scene, or adaptive even sampling) and returns a description, shot type, objects, searchable keywords, an approximate people count, and the mood.
+5. **Embedding** — the description + keywords + mood are embedded into a vector for semantic recall.
 6. **Temporal event extraction** — the clip is segmented into event windows (scene cuts are the primary boundaries; a long continuous shot is sub-divided), and GPT-5.4 describes **what happens** in each window (action, state change, subjects, action keywords) from several ordered frames. Each event is stored with its **real in/out timecodes** and its **own embedding** in a `clip_events` child table for moment-level search.
 7. (optional) **Proxy** generation per clip.
 
@@ -161,7 +161,7 @@ Import the resulting `.xml` in Premiere via **File ▸ Import**.
 | [timeline_service.py](app/services/timeline_service.py) | Pure timeline planner: `parse_target_duration`, `allocate_durations`, `plan_segments` (clip modes), `plan_event_segments` (events mode). |
 | [premiere_export_service.py](app/services/premiere_export_service.py) | Pure FCP7 XML/JSON compiler: `build_timeline`, `to_fcp7_xml`, `compile_project`. |
 
-The metadata database is **SQLite persisted to a file** (`settings.METADATA_DB_PATH`). The `shots` table carries technical columns (`width/height/orientation/fps/codec/has_audio/scene_count/description/people_count`) plus semantic columns (`camera_motion/lighting/mood/subject_position/embedding`) and a `UNIQUE(project_id, file_path)` constraint. A child **`clip_events`** table holds the temporal events — one `shots` row → many events (`start_seconds`/`end_seconds`, `action`, `state_change`, `subjects`, `keywords`, per-event `embedding`) with an `ON DELETE CASCADE` foreign key, so replacing a project's shots on re-ingest cleanly rebuilds its events. PostgreSQL remains the aspirational production datastore.
+The metadata database is **SQLite persisted to a file** (`settings.METADATA_DB_PATH`). The `shots` table carries technical columns (`width/height/orientation/fps/codec/has_audio/scene_count/description/people_count`) plus semantic columns (`mood/embedding`) and a `UNIQUE(project_id, file_path)` constraint. A child **`clip_events`** table holds the temporal events — one `shots` row → many events (`start_seconds`/`end_seconds`, `action`, `state_change`, `subjects`, `keywords`, per-event `embedding`) with an `ON DELETE CASCADE` foreign key, so replacing a project's shots on re-ingest cleanly rebuilds its events. PostgreSQL remains the aspirational production datastore.
 
 ---
 

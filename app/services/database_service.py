@@ -55,10 +55,7 @@ _SCHEMA_DDL = """
             scene_count INTEGER,
             description TEXT,
             people_count INTEGER,
-            camera_motion TEXT,
-            lighting TEXT,
             mood TEXT,
-            subject_position TEXT,
             embedding TEXT,
             source_mtime REAL,
             source_size INTEGER,
@@ -101,37 +98,17 @@ _SCHEMA_DDL = """
         CREATE INDEX IF NOT EXISTS idx_events_project ON clip_events(project_id);
         CREATE INDEX IF NOT EXISTS idx_events_shot ON clip_events(shot_id);
         CREATE INDEX IF NOT EXISTS idx_events_file ON clip_events(file_path);
+"""
 
-        CREATE TABLE IF NOT EXISTS quality_assessments (
-            assessment_id INTEGER PRIMARY KEY,
-            shot_id INTEGER,
-            exposure_score REAL,
-            white_balance_score REAL,
-            contrast_score REAL,
-            colour_consistency_score REAL,
-            overall_score REAL,
-            recommendations TEXT,
-            FOREIGN KEY (shot_id) REFERENCES shots(shot_id)
-        );
 
-        CREATE TABLE IF NOT EXISTS transitions (
-            transition_id INTEGER PRIMARY KEY,
-            from_shot_id INTEGER,
-            to_shot_id INTEGER,
-            transition_type TEXT,
-            duration_frames INTEGER,
-            confidence_score REAL,
-            FOREIGN KEY (from_shot_id) REFERENCES shots(shot_id),
-            FOREIGN KEY (to_shot_id) REFERENCES shots(shot_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS user_preferences (
-            preference_id INTEGER PRIMARY KEY,
-            user_id TEXT,
-            key TEXT,
-            value TEXT,
-            updated_at TEXT
-        );
+# Tables from earlier designs that no agent or pipeline stage reads or writes any more:
+# quality_assessments and transitions belonged to the removed Quality Agent, and
+# user_preferences was never wired to anything. Dropped idempotently so a pre-existing
+# on-disk catalogue is simplified too, not just a fresh one.
+_DROP_UNUSED_TABLES = """
+        DROP TABLE IF EXISTS quality_assessments;
+        DROP TABLE IF EXISTS transitions;
+        DROP TABLE IF EXISTS user_preferences;
 """
 
 
@@ -145,18 +122,14 @@ _DEMO_SEED = """
             (shot_id, project_id, file_path, shot_type,
              duration_seconds, keywords,
              width, height, orientation, fps, codec, has_audio, scene_count,
-             description, people_count, camera_motion, lighting, mood, subject_position,
+             description, people_count, mood,
              embedding, source_mtime, source_size)
         VALUES
-            (1, 1, '/footage/scene01/take01.mov', 'wide_shot', 12.5, 'exterior,daylight,establishing', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior establishing wide of the location in daylight.', 0, 'static', 'natural', 'calm', 'center', NULL, NULL, NULL),
-            (2, 1, '/footage/scene01/take02.mov', 'wide_shot', 13.1, 'exterior,daylight', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior daylight wide, second take.', 0, 'static', 'natural', 'calm', 'center', NULL, NULL, NULL),
-            (3, 1, '/footage/scene01/take03.mov', 'close_up', 8.2, 'dialogue,interior', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Interior close-up of a subject delivering dialogue.', 1, 'static', 'studio', 'tense', 'center', NULL, NULL, NULL),
-            (4, 1, '/footage/scene02/take01.mov', 'establishing', 20.0, 'aerial,cityscape', 3840, 2160, 'landscape', 24.0, 'prores', 0, 3, 'Aerial establishing shot over a cityscape.', 0, 'pan', 'natural', 'cinematic', 'moving', NULL, NULL, NULL),
-            (5, 1, '/footage/scene02/take02.mov', 'medium_shot', 15.3, 'dialogue,two-shot', 3840, 2160, 'landscape', 24.0, 'prores', 1, 2, 'Interior medium two-shot during dialogue.', 2, 'handheld', 'studio', 'calm', 'center', NULL, NULL, NULL);
-
-        INSERT INTO user_preferences VALUES
-            (1, 'editor_01', 'preferred_color_space', 'Rec.709', '2025-06-01'),
-            (2, 'editor_01', 'preferred_output_format', 'ProRes 422 HQ', '2025-06-01');
+            (1, 1, '/footage/scene01/take01.mov', 'wide_shot', 12.5, 'exterior,daylight,establishing', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior establishing wide of the location in daylight.', 0, 'calm', NULL, NULL, NULL),
+            (2, 1, '/footage/scene01/take02.mov', 'wide_shot', 13.1, 'exterior,daylight', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior daylight wide, second take.', 0, 'calm', NULL, NULL, NULL),
+            (3, 1, '/footage/scene01/take03.mov', 'close_up', 8.2, 'dialogue,interior', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Interior close-up of a subject delivering dialogue.', 1, 'tense', NULL, NULL, NULL),
+            (4, 1, '/footage/scene02/take01.mov', 'establishing', 20.0, 'aerial,cityscape', 3840, 2160, 'landscape', 24.0, 'prores', 0, 3, 'Aerial establishing shot over a cityscape.', 0, 'cinematic', NULL, NULL, NULL),
+            (5, 1, '/footage/scene02/take02.mov', 'medium_shot', 15.3, 'dialogue,two-shot', 3840, 2160, 'landscape', 24.0, 'prores', 1, 2, 'Interior medium two-shot during dialogue.', 2, 'calm', NULL, NULL, NULL);
 """
 
 
@@ -169,13 +142,32 @@ _ADDED_SHOT_COLUMNS = (
     ("audio_bit_depth", "INTEGER"),
 )
 
+# Semantic columns removed from `shots`: nothing downstream read them (only `mood` is
+# still used, in the embedded semantic text and the candidate preview), so they were pure
+# schema weight. A fresh DB simply never creates them; a pre-existing on-disk table has
+# them dropped here so `SELECT *` tools stop surfacing dead fields to the LLM.
+_REMOVED_SHOT_COLUMNS = ("camera_motion", "lighting", "subject_position")
+
 
 def _migrate_shot_columns(connection) -> None:
-    """Ensure newer nullable `shots` columns exist on both fresh and pre-existing DBs."""
+    """Reconcile the `shots` columns on both fresh and pre-existing databases.
+
+    Adds the newer nullable columns (``CREATE TABLE IF NOT EXISTS`` will not alter an
+    existing table) and drops the removed semantic ones. ``DROP COLUMN`` needs SQLite
+    3.35+; on an older library the drop is skipped and the column just stays inert
+    (nothing writes or reads it), so the catalogue still works.
+    """
     existing = {row[1] for row in connection.execute("PRAGMA table_info(shots)").fetchall()}
     for name, decl in _ADDED_SHOT_COLUMNS:
         if name not in existing:
             connection.execute(f"ALTER TABLE shots ADD COLUMN {name} {decl}")
+    for name in _REMOVED_SHOT_COLUMNS:
+        if name in existing:
+            try:
+                connection.execute(f"ALTER TABLE shots DROP COLUMN {name}")
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Could not drop the unused shots.{name} column ({e}); "
+                               "leaving it in place — nothing reads or writes it.")
     connection.commit()
 
 
@@ -225,6 +217,7 @@ def _create_engine(db_target: str):
     connection = sqlite3.connect(db_target, check_same_thread=False)
     _apply_pragmas(connection, in_memory=in_memory)
     connection.executescript(_SCHEMA_DDL)
+    connection.executescript(_DROP_UNUSED_TABLES)
     _migrate_shot_columns(connection)
 
     # Seed the demo catalogue only when the database is brand new (no shots). This is
@@ -292,7 +285,7 @@ _SHOT_COLUMNS = (
     "duration_seconds",
     "keywords", "width", "height", "orientation",
     "fps", "codec", "has_audio", "scene_count", "description", "people_count",
-    "camera_motion", "lighting", "mood", "subject_position", "embedding",
+    "mood", "embedding",
     "source_mtime", "source_size",
     "audio_channels", "audio_sample_rate", "audio_bit_depth",
 )

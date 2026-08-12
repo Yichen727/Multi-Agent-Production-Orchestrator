@@ -406,13 +406,12 @@ def detect_new_footage(directory: str = None, project_id: int = 1,
             f"catalogued for project {project_id}:\n{preview}{more}{cap_note}")
 
 
-def _semantic_text(description: str | None, keywords: str, mood: str | None,
-                   lighting: str | None) -> str:
+def _semantic_text(description: str | None, keywords: str, mood: str | None) -> str:
     """Assemble the text that gets embedded for semantic search.
 
-    Combines the vision description, keyword tags, and mood/lighting into one
-    editor-facing sentence. Returns "" when there is nothing real to embed, so the
-    caller stores no vector rather than embedding an empty/fabricated string.
+    Combines the vision description, keyword tags, and mood into one editor-facing
+    sentence. Returns "" when there is nothing real to embed, so the caller stores no
+    vector rather than embedding an empty/fabricated string.
     """
     parts = []
     if description:
@@ -421,8 +420,6 @@ def _semantic_text(description: str | None, keywords: str, mood: str | None,
         parts.append(keywords.replace(",", " "))
     if mood:
         parts.append(f"{mood} mood")
-    if lighting:
-        parts.append(f"{lighting} lighting")
     return ". ".join(parts).strip()
 
 
@@ -562,7 +559,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                 "duration_seconds",
                 "keywords", "width", "height", "orientation", "fps",
                 "codec", "has_audio", "scene_count", "description", "people_count",
-                "camera_motion", "lighting", "mood", "subject_position", "embedding",
+                "mood", "embedding",
                 "audio_channels", "audio_sample_rate", "audio_bit_depth",
             )}
             # Refresh the fingerprint in case the previous ingest stored none.
@@ -613,10 +610,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         keywords = ""
         description = None
         people_count = None
-        camera_motion = None
-        lighting = None
         mood = None
-        subject_position = None
         if do_vision and meta["ok"]:
             duration = meta["duration_seconds"]
             # Adaptive frame budget: more frames for longer / multi-scene clips.
@@ -648,19 +642,14 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                 keywords = ",".join(k for k in (s.strip().lower() for s in kw) if k and k != "unknown")
                 description = tags.scene_description or None
                 people_count = tags.people_count
-                # Semantic dimensions — store only what the model actually reported.
-                camera_motion = tags.camera_motion if tags.camera_motion != "unknown" else None
-                lighting = tags.lighting if tags.lighting != "unknown" else None
+                # Semantic dimension — store only what the model actually reported.
                 mood = tags.mood if tags.mood != "unknown" else None
-                subject_position = (
-                    tags.subject_position if tags.subject_position != "unknown" else None
-                )
 
         # Build a semantic embedding from what the vision model saw. This is the
         # vector-search layer: only embed when there is real observed content, so we
         # never index a fabricated / empty string.
         embedding = None
-        semantic_text = _semantic_text(description, keywords, mood, lighting)
+        semantic_text = _semantic_text(description, keywords, mood)
         if semantic_text:
             vecs = embed_texts([semantic_text])
             if vecs:
@@ -687,10 +676,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
             "scene_count": scene_count,
             "description": description,
             "people_count": people_count,
-            "camera_motion": camera_motion,
-            "lighting": lighting,
             "mood": mood,
-            "subject_position": subject_position,
             "embedding": embedding,
             "source_mtime": mtime,
             "source_size": size,
@@ -890,10 +876,9 @@ tool on the footage directory. One call runs the whole pipeline per clip:
   duration)
 - detect shot/scene cuts (FFmpeg)
 - VISION TAGGING: GPT-5.4 watches sampled frames and returns a semantic description,
-  shot type, objects, searchable keywords, an approximate people count, plus editing-
-  oriented dimensions (camera motion, lighting, mood, subject position)
-- SEMANTIC EMBEDDING: the description + keywords + mood/lighting are embedded into a
-  vector so Search can do semantic recall, not just literal keyword matching
+  shot type, objects, searchable keywords, an approximate people count, plus the mood
+- SEMANTIC EMBEDDING: the description + keywords + mood are embedded into a vector so
+  Search can do semantic recall, not just literal keyword matching
 It then replaces the project's catalogue with those rows. You may also call
 `detect_new_footage` first to see what is new, and `export_metadata_json` afterwards.
 

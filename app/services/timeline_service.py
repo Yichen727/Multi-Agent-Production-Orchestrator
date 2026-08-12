@@ -83,13 +83,48 @@ def _aligned(values, n: int, default=None) -> list:
     return [(seq[i] if i < len(seq) else default) for i in range(n)]
 
 
+# Backup material is a CURATED shortlist, not an inventory of everything that did not make
+# the cut: the editor wants the few genuine alternatives, so a long list is truncated here
+# (and the drop reported via ``excluded_omitted`` — never silently). The Selection Agent's
+# `excluded_json` docstrings quote this number — keep them in sync if it changes.
+MAX_BACKUP_ITEMS = 5
+
+# Fields an excluded entry can carry beyond the agent's own words. They are filled in by
+# the caller from the CATALOGUE (real filename + measured timecodes), never by the model —
+# an event id like "9" means nothing to an editor, "warmup.mov 18.0s-26.0s" does.
+# ``also``/``also_details`` let ONE entry stand for several near-identical rejected
+# moments, so grouping does not cost shortlist slots.
+_ALTERNATE_RESOLVED_FIELDS = ("event_id", "file_path", "start_seconds", "end_seconds",
+                              "label", "also_details")
+
+
+def _as_ref_list(value) -> list[str]:
+    """Coerce a grouped-reference field into a list of plain ref strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [t.strip() for t in value.split(",") if t.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [str(value).strip()]
+
+
 def normalise_alternates(raw) -> list[dict]:
     """Coerce the agent's excluded/backup material into a uniform list of dicts.
 
     Accepts a JSON string, a list of dicts, or a list of plain strings. Every entry ends
     up as ``{"ref", "name", "reason", "suggested_use"}`` — the reason a moment or clip did
-    NOT make the edit, and how it could still be used in another one. Nothing is invented:
-    a missing reason stays an empty string.
+    NOT make the edit, and how it could still be used in another one — plus, when the
+    caller has already resolved them against the catalogue, ``event_id`` / ``file_path`` /
+    ``start_seconds`` / ``end_seconds`` / ``label`` so the editor sees a real clip and real
+    timecodes instead of a database id. Those resolved fields pass through untouched, so
+    running an already-enriched list back through this function is lossless.
+
+    An entry may also carry ``also`` — further refs the SAME rejection covers — so several
+    near-identical moments group into one shortlist item instead of flooding it.
+
+    Nothing is invented: a missing reason stays an empty string, and an entry that could
+    not be matched to a catalogued clip simply has no file path or timecodes.
     """
     if isinstance(raw, str):
         try:
@@ -102,19 +137,64 @@ def normalise_alternates(raw) -> list[dict]:
     out: list[dict] = []
     for item in (raw or []):
         if isinstance(item, str):
-            ref, reason, use = item.strip(), "", ""
+            entry = {"ref": item.strip(), "reason": "", "suggested_use": "", "also": []}
         elif isinstance(item, dict):
-            ref = str(item.get("ref") or item.get("event_id") or item.get("file_path")
-                      or item.get("name") or "").strip()
-            reason = str(item.get("reason") or "").strip()
-            use = str(item.get("suggested_use") or item.get("use") or "").strip()
+            entry = {
+                "ref": str(item.get("ref") or item.get("event_id") or item.get("file_path")
+                           or item.get("name") or "").strip(),
+                "reason": str(item.get("reason") or "").strip(),
+                "suggested_use": str(item.get("suggested_use")
+                                     or item.get("use") or "").strip(),
+                "also": _as_ref_list(item.get("also") or item.get("also_refs")
+                                     or item.get("similar")),
+            }
+            for key in _ALTERNATE_RESOLVED_FIELDS:
+                if item.get(key) is not None:
+                    entry[key] = item[key]
+            if item.get("name"):
+                entry["name"] = str(item["name"])
         else:
             continue
-        if not (ref or reason):
+        if not (entry["ref"] or entry["reason"]):
             continue
-        out.append({"ref": ref, "name": Path(ref).name if ref else "",
-                    "reason": reason, "suggested_use": use})
+        entry.setdefault("name", Path(entry["ref"]).name if entry["ref"] else "")
+        out.append(entry)
     return out
+
+
+# Below this many segments an "order is unchanged" check is meaningless — with two items
+# a coincidental match is 50/50, so flagging it would be noise rather than signal.
+MIN_ORDER_CHECK_ITEMS = 3
+
+
+def compare_order(emitted: list, reference: list, *, reference_label: str = "") -> dict:
+    """Flag a timeline whose order is IDENTICAL to the order the material arrived in.
+
+    Ordering is meant to be an editorial decision, but the agent sees its candidates in a
+    fixed order (moments grouped by file and chronological within each file; clips in the
+    editor's Bin order), and an LLM can simply echo that listing back. Nothing downstream
+    can tell the difference — a deliberate chronological edit and a lazy one produce the
+    same plan — so this records the comparison for the agent and the editor to judge.
+
+    It is a PROMPT, never a rejection: chronological is genuinely right for a tactical
+    breakdown or a build-up-to-payoff story. The check just makes the coincidence visible
+    instead of silent.
+
+    Args:
+        emitted: The order the agent chose, as comparable keys.
+        reference: The same keys in the order the material was presented in.
+        reference_label: Human-readable name for that reference order.
+
+    Returns:
+        ``{"checked", "unchanged", "reference", "items"}``. ``checked`` is False when
+        there are too few segments, or the reference could not be reconstructed.
+    """
+    n = len(emitted)
+    if n < MIN_ORDER_CHECK_ITEMS or len(reference) != n:
+        return {"checked": False, "unchanged": False,
+                "reference": reference_label, "items": n}
+    return {"checked": True, "unchanged": list(emitted) == list(reference),
+            "reference": reference_label, "items": n}
 
 
 def _duration_status(total: float, target: float | None) -> tuple[str, float]:
@@ -251,6 +331,7 @@ def place_window(start: float, end: float, keep: float,
 
 def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = None,
             raw_seconds: float | None = None, excluded=None, aspect_ratio: str = "",
+            ordering_strategy: str = "", order_check: dict | None = None,
             extra: dict | None = None) -> dict:
     """Assemble the common plan envelope shared by both modes."""
     total = round(sum(s["duration"] for s in segments), 3)
@@ -259,8 +340,19 @@ def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = N
         {"order": s["order"], "name": s["name"], "error": s["validation_error"]}
         for s in segments if not s["valid"]
     ]
+    # Backup material is a SHORTLIST of real alternatives the agent weighed and rejected —
+    # not every unused clip/event. The agent is told to send few and strongest-first; if it
+    # over-sends anyway, the surplus is cut here and COUNTED (never dropped silently).
+    alternates = normalise_alternates(excluded)
+    kept_alternates = alternates[:MAX_BACKUP_ITEMS]
     plan = {
         "mode": mode,
+        # The SHAPE the agent chose and why (declared before it ordered anything), plus the
+        # check on whether the emitted order merely echoes how the material was listed.
+        # Order is an editorial decision, so it is recorded as one rather than left implicit.
+        "ordering_strategy": (ordering_strategy or "").strip(),
+        "order_check": order_check or {"checked": False, "unchanged": False,
+                                       "reference": "", "items": len(segments)},
         # The editor's OUTPUT aspect ratio rides along the plan untouched. Nothing in this
         # module acts on it — it is a delivery SPEC, not an editing decision — but carrying
         # it here is what gets it from the Selection UI to the Delivery compiler.
@@ -273,7 +365,8 @@ def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = N
         "valid": not validation_errors,
         "validation_errors": validation_errors,
         "segments": segments,
-        "excluded": normalise_alternates(excluded),
+        "excluded": kept_alternates,
+        "excluded_omitted": len(alternates) - len(kept_alternates),
     }
     if extra:
         plan.update(extra)
@@ -281,7 +374,9 @@ def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = N
 
 
 def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
-                        excluded=None, aspect_ratio: str = "") -> dict:
+                        excluded=None, aspect_ratio: str = "",
+                        ordering_strategy: str = "",
+                        order_check: dict | None = None) -> dict:
     """CLIP ASSEMBLY — ordered COMPLETE clips, each at its full measured length.
 
     The unit of editing is the whole clip. There is no trimming, no screen-time
@@ -298,6 +393,9 @@ def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
         aspect_ratio: The editor's requested OUTPUT aspect ratio, carried through to
             Delivery untouched. It is a delivery spec, so it changes nothing here — no
             clip is cropped, resized or reframed by the planner.
+        ordering_strategy: The agent's one-line statement of the SHAPE it ordered the
+            clips into, recorded on the plan so the choice is explicit and reviewable.
+        order_check: Result of :func:`compare_order` against the candidate list order.
 
     Returns:
         The standard plan dict with ``mode='clip_assembly'``.
@@ -325,7 +423,8 @@ def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
             "validation_error": None,
         })
     return _finish(MODE_CLIP, segments, target_seconds=None, excluded=excluded,
-                   aspect_ratio=aspect_ratio)
+                   aspect_ratio=aspect_ratio, ordering_strategy=ordering_strategy,
+                   order_check=order_check)
 
 
 def build_moment_timeline(events: list[dict], *, target_seconds: float | None = None,
@@ -334,6 +433,7 @@ def build_moment_timeline(events: list[dict], *, target_seconds: float | None = 
                           focus: list[float | None] | None = None,
                           protect: list[bool] | None = None,
                           excluded=None, aspect_ratio: str = "",
+                          ordering_strategy: str = "", order_check: dict | None = None,
                           min_moment_seconds: float = MIN_MOMENT_SECONDS) -> dict:
     """MOMENT ASSEMBLY — ordered temporal moments, optionally optimised to a target.
 
@@ -360,6 +460,9 @@ def build_moment_timeline(events: list[dict], *, target_seconds: float | None = 
         aspect_ratio: The editor's requested OUTPUT aspect ratio, carried through to
             Delivery untouched (a delivery spec — no clip is cropped, resized or reframed
             here, and it never changes a moment's in/out points).
+        ordering_strategy: The agent's one-line statement of the SHAPE it arranged the
+            moments into, recorded on the plan so the choice is explicit and reviewable.
+        order_check: Result of :func:`compare_order` against the source chronology.
         min_moment_seconds: Absolute floor for any single trimmed moment.
 
     Returns:
@@ -448,7 +551,8 @@ def build_moment_timeline(events: list[dict], *, target_seconds: float | None = 
     return _finish(
         MODE_MOMENT, segments,
         target_seconds=target_seconds, raw_seconds=raw_seconds, excluded=excluded,
-        aspect_ratio=aspect_ratio,
+        aspect_ratio=aspect_ratio, ordering_strategy=ordering_strategy,
+        order_check=order_check,
         extra={
             "compression": {
                 "applied": report["absorbed"] > _TOL,

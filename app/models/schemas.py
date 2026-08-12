@@ -47,25 +47,10 @@ class VisionTags(BaseModel):
         description="Approximate number of distinct people visible (0 if none). "
                     "Do NOT identify who they are.",
     )
-    camera_motion: str = Field(
-        default="unknown",
-        description="Dominant camera movement across the frames: one of 'pan', "
-                    "'tilt', 'zoom', 'static', 'handheld', or 'unknown' if unclear.",
-    )
-    lighting: str = Field(
-        default="unknown",
-        description="Overall lighting character: one of 'natural', 'low_light', "
-                    "'backlit', 'studio', or 'unknown' if unclear.",
-    )
     mood: str = Field(
         default="unknown",
         description="Emotional tone conveyed by the imagery: one of 'calm', "
                     "'energetic', 'tense', 'cinematic', or 'unknown' if unclear.",
-    )
-    subject_position: str = Field(
-        default="unknown",
-        description="Where the main subject sits in the frame: one of 'center', "
-                    "'left', 'right', 'moving', or 'unknown' if unclear / no subject.",
     )
 
 
@@ -237,10 +222,7 @@ class SearchCandidate(BaseModel):
     keywords: Optional[str] = None
     description: Optional[str] = None
     people_count: Optional[int] = None
-    camera_motion: Optional[str] = None
-    lighting: Optional[str] = None
     mood: Optional[str] = None
-    subject_position: Optional[str] = None
     relevance: Optional[float] = None
     group_size: str = "unknown"
     suggestion: str = "neutral"
@@ -288,16 +270,31 @@ class TimelineSegment(BaseModel):
 class ExcludedMaterial(BaseModel):
     """Candidate material the Selection Agent deliberately left OUT of the edit.
 
-    Selected clips/moments are candidates, not guaranteed content: the agent drops what
-    does not serve the editing intent (or, in Moment Assembly, what could not survive the
-    target duration). Every drop is reported here as alternative/backup material — WHY it
-    was excluded and how it could still be used in another edit — so nothing disappears
-    silently.
+    This is a CURATED SHORTLIST (capped at ``timeline_service.MAX_BACKUP_ITEMS``), not an
+    inventory of everything unused: only material the agent genuinely weighed and rejected
+    AND that is a meaningful alternative editorial choice. Unrelated leftovers from
+    ``get_clip_events`` do not belong here. ``also``/``also_details`` group near-identical
+    rejected moments under one entry so grouping costs a single slot; the plan's
+    ``excluded_omitted`` counts anything trimmed past the cap.
+
+    The agent supplies only ``ref`` (an event id, or a clip's file name) plus its
+    reasoning; the Selection tool RESOLVES that against the catalogue to fill in
+    ``file_path`` / ``name`` / ``start_seconds`` / ``end_seconds`` / ``label``, so the
+    editor reads "warmup.mov 18.0s-26.0s — passing drill" rather than "Event 9". Those
+    fields stay ``None`` when nothing matched — an unresolved reference is shown as given,
+    never dressed up with an invented file or timecode.
     """
     ref: str = ""
     name: str = ""
     reason: str = ""
     suggested_use: str = ""
+    event_id: Optional[int] = None
+    file_path: Optional[str] = None
+    start_seconds: Optional[float] = None
+    end_seconds: Optional[float] = None
+    label: str = ""
+    also: list[str] = Field(default_factory=list)
+    also_details: list[dict] = Field(default_factory=list)
 
 
 class EditPlan(BaseModel):
@@ -314,13 +311,24 @@ class EditPlan(BaseModel):
     after it, and ``duration_status`` is 'unconstrained' | 'on_target' | 'under_target' |
     'over_target'.
 
-    ``aspect_ratio`` is the editor's OUTPUT specification ("16:9", "9:16", "1:1", or a
-    "4:3", "3:4"), carried through Selection untouched — Selection may let it influence
-    which footage it picks but never crops or resizes media. Delivery reads it from here
-    and scales each clip to FIT that frame with its own aspect preserved.
+    ``aspect_ratio`` is the editor's OUTPUT specification ("16:9", "9:16", "4:3", "3:4" or
+    "1:1"), carried through Selection untouched — Selection may let it influence which
+    footage it picks but never crops or resizes media. Delivery reads it from here and
+    scales each clip to FIT that frame with its own aspect preserved.
+
+    ``ordering_strategy`` is the agent's own one-line statement of the SHAPE it arranged
+    the material into (declared before it ordered anything), and ``order_check`` records
+    whether the emitted order turned out identical to the order the material was listed in
+    — ``{"checked", "unchanged", "reference", "items"}``. Ordering is the core editorial
+    act of this stage, so it is captured explicitly rather than left implicit in the
+    sequence of segments. An ``unchanged`` order is not an error (chronological suits
+    plenty of edits); it is flagged so a deliberate choice can be told apart from simply
+    echoing the candidate list.
     """
     mode: str = "clip_assembly"
     aspect_ratio: Optional[str] = None
+    ordering_strategy: str = ""
+    order_check: dict = Field(default_factory=dict)
     target_seconds: Optional[float] = None
     raw_seconds: float = 0.0
     total_seconds: float = 0.0
@@ -329,6 +337,7 @@ class EditPlan(BaseModel):
     valid: bool = True
     segments: list[TimelineSegment] = Field(default_factory=list)
     excluded: list[ExcludedMaterial] = Field(default_factory=list)
+    excluded_omitted: int = 0
     explanation: str = ""
 
 

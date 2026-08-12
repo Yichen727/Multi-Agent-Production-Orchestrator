@@ -1,4 +1,4 @@
-"""Vision service — GPT-5.4 frame analysis for automatic shot tagging.
+"""Vision service — GPT-5.5 frame analysis for automatic shot tagging.
 
 Turns sampled video frames into structured, searchable tags (shot type, objects,
 keywords, a one-line description, and an approximate people count). This is the
@@ -122,13 +122,8 @@ Rules:
   (subjects, actions, mood, environment). No invented proper nouns.
 - people_count: the approximate number of distinct people visible (0 if none). Do NOT
   attempt to identify who they are.
-- camera_motion: the dominant camera movement — 'pan', 'tilt', 'zoom', 'static',
-  'handheld', or 'unknown' if you cannot tell from a few frames.
-- lighting: 'natural', 'low_light', 'backlit', 'studio', or 'unknown'.
 - mood: the emotional tone of the imagery — 'calm', 'energetic', 'tense',
   'cinematic', or 'unknown'.
-- subject_position: where the main subject sits — 'center', 'left', 'right',
-  'moving', or 'unknown' if there is no clear subject.
 
 For every one of these semantic fields, prefer 'unknown' over a guess. These tags feed
 search and edit decisions, so a wrong label is worse than an honest 'unknown'.
@@ -146,8 +141,8 @@ def _sampling_context(frames_b64: list[str], duration_seconds: float | None,
     """Build an optional context block describing how the frames were sampled.
 
     Gives the model grounding (clip length, how many shots, where each frame sits
-    on the timeline) so it can better judge shot type / camera motion / whether
-    several distinct scenes are present. It is guidance only — the model is still
+    on the timeline) so it can better judge shot type / mood / whether several
+    distinct scenes are present. It is guidance only — the model is still
     told to describe ONLY what is visibly present and never to invent content.
     Returns "" when no context is available.
     """
@@ -175,7 +170,7 @@ def analyze_frames(frames_b64: list[str], duration_seconds: float | None = None,
                    scene_count: int | None = None,
                    sampled_timestamps: list[float] | None = None,
                    sampling_strategy: str | None = None) -> VisionTags | None:
-    """Analyse sampled frames with GPT-5.4 Vision and return structured tags.
+    """Analyse sampled frames with GPT-5.5 Vision and return structured tags.
 
     Args:
         frames_b64: Base64-encoded JPEG frames from one clip.
@@ -234,7 +229,7 @@ Rules:
 def analyze_event(frames_b64: list[str], start_seconds: float | None = None,
                   end_seconds: float | None = None,
                   clip_duration: float | None = None) -> EventTags | None:
-    """Analyse one temporal window's frames with GPT-5.4 and return action tags.
+    """Analyse one temporal window's frames with GPT-5.5 and return action tags.
 
     Unlike :func:`analyze_frames` (one static summary for the whole clip), this is called
     per event window with SEVERAL ordered frames from that window, so the model can report
