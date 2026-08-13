@@ -878,24 +878,14 @@ to the surrounding segments, and (c) what it does for the pacing/rhythm:
 
     (…as many steps as the intent needs — no more, no fewer.)
 
-    ---
-    🗂️ Not used — backup material   (omit this section entirely when there is none)
-
-    • samsung_9x16.mp4 (44.60s–49.72s)
-      Foldable phone close-up interaction.
-      Why not used: Strong phone moment, but vertical footage conflicts with the
-      horizontal-only requirement.
-      Could be used for: Portrait social version.
-
-    • samsung_ifa2025.mp4 (5.52s–11.08s)
-      Stage presentation with product reveal.
-      Why not used: No direct phone action.
-      Could be used for: IFA event recap.
-
-    Copy the file names and timecodes from the planner's output — never identify a dropped
-    moment by its event id, and never invent a timecode. Only the shortlist you sent in
-    `excluded_json` belongs here.
     Notes: <pacing, gaps, duration trade-offs, alternatives the editor should weigh>
+
+DO NOT write a "🗂️ Not used / backup material" section in this report. The shortlist you
+send in `excluded_json` is already presented to the editor separately, rendered from the
+PLAN itself (resolved file names + measured timecodes), so repeating it here duplicates
+that panel and risks drifting from the resolved values. Put every dropped candidate in
+`excluded_json` and nowhere else; if one drop is essential to understanding the STRUCTURE
+of the timeline, give it a single clause inside `Notes:` — never a list.
 
 Make clear this timeline is ONE proposal for the editor to approve, reorder, extend or
 reject. Invite them to adjust it.

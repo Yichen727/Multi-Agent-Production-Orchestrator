@@ -32,6 +32,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode, InjectedState
 
+from app.models.schemas import DeliveryResult
 from app.models.state import ProductionState
 from app.services.openai_service import llm
 from app.services.catalogue_resolver import (
@@ -46,7 +47,66 @@ from app.utils.logger import get_logger
 logger = get_logger("delivery_agent")
 
 
+# ── Structured result registry ─────────────────────────────────────────────────
+#
+# The compile tools return prose for the ReAct loop, but the UI needs the WRITTEN paths
+# (to reveal the file on disk / offer a download) and the sequence shape. Parsing them
+# back out of the agent's narration would trust model prose, so — exactly as the Ingest
+# stage does with ``IngestResult`` — the tool records a structured ``DeliveryResult`` here
+# and the orchestrator reads it after the run. In-process, single session, most-recent-run.
+
+_LAST_DELIVERY_RESULT: DeliveryResult | None = None
+
+
+def _record_delivery_result(result: DeliveryResult) -> DeliveryResult:
+    global _LAST_DELIVERY_RESULT
+    _LAST_DELIVERY_RESULT = result
+    return result
+
+
+def reset_last_delivery_result() -> None:
+    """Clear the recorded result before a run, so a stale success can never be re-read."""
+    global _LAST_DELIVERY_RESULT
+    _LAST_DELIVERY_RESULT = None
+
+
+def get_last_delivery_result() -> DeliveryResult | None:
+    """Structured outcome of the most recent compile this session, or ``None``."""
+    return _LAST_DELIVERY_RESULT
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _refuse(message: str, project_id: int | None = None) -> str:
+    """Record a FAILED compile and hand the refusal text back to the ReAct loop.
+
+    Recording the failure matters as much as recording the success: it stops the UI from
+    offering "open the exported file" for a compile that never wrote one.
+    """
+    _record_delivery_result(DeliveryResult(status="failure", project_id=project_id,
+                                           message=message))
+    return message
+
+
+def _record_success(result: dict, project_id: int, message: str) -> None:
+    """Record a written compile — real paths and the sequence shape the compiler reported."""
+    seq = result["timeline"]["sequence"]
+    _record_delivery_result(DeliveryResult(
+        status="success",
+        xml_path=result.get("xml_path"),
+        json_path=result.get("json_path"),
+        sequence_name=seq.get("name") or "",
+        project_id=project_id,
+        clip_count=seq.get("clip_count") or 0,
+        total_frames=seq.get("total_frames") or 0,
+        aspect_ratio=seq.get("aspect_ratio"),
+        width=seq.get("width") or 0,
+        height=seq.get("height") or 0,
+        letterboxed_clips=seq.get("letterboxed_clips") or 0,
+        pillarboxed_clips=seq.get("pillarboxed_clips") or 0,
+        message=message,
+    ))
 
 
 def _pid_from_state(state) -> int:
@@ -230,11 +290,12 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
     tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
     rows, problems = resolve_ordered(project_id, tokens)
     if problems:
-        return ("Refusing to compile — resolve these identifiers first (every media "
-                "reference must be a real catalogued clip):\n"
-                + "\n".join(f"  • {t}: {r}" for t, r in problems))
+        return _refuse("Refusing to compile — resolve these identifiers first (every media "
+                       "reference must be a real catalogued clip):\n"
+                       + "\n".join(f"  • {t}: {r}" for t, r in problems), project_id)
     if not rows:
-        return "No clips provided. Supply the ordered clip list from the Selection Agent."
+        return _refuse("No clips provided. Supply the ordered clip list from the Selection "
+                       "Agent.", project_id)
 
     role_list = _parse_roles(roles, len(rows))
     clips = _to_compiler_clips(rows, role_list, probe_audio=True)
@@ -244,17 +305,17 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
                                  project_id=project_id, aspect_ratio=aspect_ratio,
                                  write=True)
     except InvalidAspectRatio as e:
-        return f"Refusing to compile — unusable output aspect ratio: {e}"
+        return _refuse(f"Refusing to compile — unusable output aspect ratio: {e}", project_id)
     except Exception as e:  # keep the ReAct loop alive with a grounded error
         logger.error(f"Compile failed: {e}")
-        return f"Compile failed: {e}"
+        return _refuse(f"Compile failed: {e}", project_id)
 
     seq = result["timeline"]["sequence"]
     order_summary = " → ".join(
         f"{c['order']}.{(c['role'] + ':') if c['role'] else ''}{c['name']}"
         for c in result["timeline"]["clips"]
     )
-    return (
+    summary = (
         "✅ Premiere project compiled (FCP7 XML — import via File ▸ Import in Premiere Pro).\n"
         f"  XML : {result['xml_path']}\n"
         f"  JSON: {result['json_path']}\n"
@@ -263,6 +324,8 @@ def compile_premiere_project(ordered_identifiers: str, roles: str = None,
         f"  Output: {_frame_summary(seq)}\n"
         f"  Timeline order (preserved): {order_summary}"
     )
+    _record_success(result, project_id, f"{seq['clip_count']} clips compiled.")
+    return summary
 
 
 @tool
@@ -300,10 +363,11 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
     try:
         data = json.loads(segments_json)
     except (json.JSONDecodeError, TypeError) as e:
-        return f"Could not parse segments_json: {e}. Pass the Selection plan JSON verbatim."
+        return _refuse(f"Could not parse segments_json: {e}. Pass the Selection plan JSON "
+                       "verbatim.", project_id)
     segments = data.get("segments") if isinstance(data, dict) else data
     if not segments:
-        return "No segments to compile. Provide the Selection plan JSON."
+        return _refuse("No segments to compile. Provide the Selection plan JSON.", project_id)
 
     # C-06: refuse any segment the planner flagged invalid (real footage but nothing left
     # after trimming). Never silently emit or repair it.
@@ -312,8 +376,8 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         listing = "\n".join(
             f"  • #{s.get('order', '?')} {s.get('name') or s.get('file_path')}: "
             f"{s.get('validation_error') or 'invalid segment range'}" for s in invalid)
-        return ("Refusing to compile — the plan contains invalid segment(s); fix the trim "
-                f"or drop the clip in Selection first:\n{listing}")
+        return _refuse("Refusing to compile — the plan contains invalid segment(s); fix the "
+                       f"trim or drop the clip in Selection first:\n{listing}", project_id)
 
     clips, unresolved = [], []
     for i, seg in enumerate(segments, start=1):
@@ -348,8 +412,8 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         })
 
     if unresolved:
-        return ("Refusing to compile — these segments matched no catalogued clip: "
-                f"{unresolved}. Every media reference must be real.")
+        return _refuse("Refusing to compile — these segments matched no catalogued clip: "
+                       f"{unresolved}. Every media reference must be real.", project_id)
 
     # The delivery frame comes from the PLAN (the editor's UI spec), not from the model —
     # so the exported sequence is always the aspect ratio that was actually requested.
@@ -360,11 +424,11 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
                                  project_id=project_id, aspect_ratio=aspect_ratio,
                                  write=True)
     except InvalidAspectRatio as e:
-        return (f"Refusing to compile — the plan's output aspect ratio is unusable: {e} "
-                "Fix it in ③ Selection and re-generate the timeline.")
+        return _refuse(f"Refusing to compile — the plan's output aspect ratio is unusable: "
+                       f"{e} Fix it in ③ Selection and re-generate the timeline.", project_id)
     except Exception as e:
         logger.error(f"Segment compile failed: {e}")
-        return f"Compile failed: {e}"
+        return _refuse(f"Compile failed: {e}", project_id)
 
     seq = result["timeline"]["sequence"]
     # Cosmetic only — Delivery compiles both editing modes identically (order + in/out
@@ -376,7 +440,7 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         f"({c['used_seconds']:.1f}s)"
         for c in result["timeline"]["clips"]
     )
-    return (
+    summary = (
         f"✅ Premiere project compiled from {mode.upper()} timeline segments "
         "(FCP7 XML — import via File ▸ Import in Premiere Pro).\n"
         f"  XML : {result['xml_path']}\n"
@@ -386,6 +450,9 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         f"  Output: {_frame_summary(seq)}\n"
         f"  Segments (order + trim preserved): {order_summary}"
     )
+    _record_success(result, project_id,
+                    f"{seq['clip_count']} segments compiled from the {mode} timeline.")
+    return summary
 
 
 # ── Agent Assembly ───────────────────────────────────────────────────────────

@@ -52,6 +52,7 @@ from app.agents.selection_agent import (
 )
 from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
+    reset_last_delivery_result, get_last_delivery_result,
 )
 from app.services.retrieval_service import (hybrid_search, expand_query_terms,
                                             hoist_orientation)
@@ -412,7 +413,7 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
 
 
 def run_delivery(plan: dict, project_id, user_id,
-                 sequence_name: str = "MAPO Edit") -> str:
+                 sequence_name: str = "MAPO Edit"):
     """④ Delivery — compile the Selection timeline into a Premiere project.
 
     REQUIRES the structured plan from Selection (audit H-04): Delivery is driven ONLY by
@@ -423,6 +424,11 @@ def run_delivery(plan: dict, project_id, user_id,
     The plan also carries the editor's OUTPUT ASPECT RATIO. The compile tool reads it out
     of the plan JSON itself (not from a model-supplied argument), so the delivery frame is
     exactly the one the editor specified in the UI.
+
+    Returns ``(agent_text, DeliveryResult | None)``. The second value is the COMPILER's own
+    record of what it wrote (paths, raster, clip count) — recorded by the tool, not parsed
+    out of the agent's prose — so the UI can act on the real artefact (reveal it on disk)
+    only when a compile genuinely succeeded. Mirrors ``run_ingest``'s ``IngestResult``.
     """
     if not (plan and plan.get("segments")):
         raise ValueError(
@@ -446,8 +452,11 @@ def run_delivery(plan: dict, project_id, user_id,
         "messages": [HumanMessage(content=message)],
         "edit_timeline": plan,
     })
+    # Clear first: a stale success from an earlier export must never be mistaken for this
+    # run's outcome if this run refuses or crashes before writing anything.
+    reset_last_delivery_result()
     result = delivery_agent.invoke(state, config=_config("deliver", user_id, project_id))
-    return result["messages"][-1].content
+    return result["messages"][-1].content, get_last_delivery_result()
 
 
 logger.info("MAPO pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")

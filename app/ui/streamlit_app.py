@@ -28,6 +28,8 @@ Launch:
 """
 
 import base64
+import subprocess
+import sys
 import streamlit as st
 from pathlib import Path
 
@@ -131,6 +133,124 @@ def _backup_headline(item: dict) -> str:
     return f"{name} ({start:.2f}s–{end:.2f}s)"
 
 
+def _backup_span(item: dict) -> str:
+    """The MEASURED extent of one backup item, phrased for whichever unit it is.
+
+    A rejected moment reads as ``in → out · length``; a rejected whole clip reads as
+    ``full clip · length``; an item whose length was never measured says so rather than
+    display a 0.00s–0.00s range that looks like a real trim.
+    """
+    start, end = item.get("start_seconds"), item.get("end_seconds")
+    if end is None:
+        return "length unmeasured"
+    if not item.get("event_id") and not start:
+        return f"full clip · {end:.1f}s"
+    start = start or 0.0
+    return f"{start:.2f}s → {end:.2f}s · {end - start:.1f}s"
+
+
+def _render_backup_item(index: int, item: dict) -> None:
+    """One backup-material entry as its own card, in a fixed scannable order.
+
+    Header (rank · unit icon · file name · measured timecodes) → the moment's own action
+    label → the two editorial lines the agent owns: why it is not in the edit, and what it
+    could still serve. Grouped near-duplicates hang off the card as one line instead of
+    each claiming a slot, so the shortlist stays a shortlist.
+    """
+    with st.container(border=True):
+        kind = "🎯" if item.get("event_id") else "🎞️"
+        name = item.get("name") or item.get("ref") or "(unidentified)"
+        st.markdown(f"{kind} **{index}. {name}**  ·  {_backup_span(item)}")
+        if item.get("label"):
+            st.caption(item["label"])
+        if not item.get("file_path"):
+            st.caption("⚠ No catalogued clip matched this reference — shown as given.")
+        rows = [f"**Why not used** · {item.get('reason') or '*not stated*'}"]
+        if item.get("suggested_use"):
+            rows.append(f"**Could be used for** · {item['suggested_use']}")
+        st.markdown("  \n".join(rows))       # two spaces = one tight line break
+        group = item.get("also_details") or []
+        if group:
+            st.caption(f"⧉ Same call for {len(group)} near-duplicate(s): "
+                       + "; ".join(_backup_headline(g) for g in group))
+
+
+def _strip_backup_section(report: str) -> str:
+    """Drop any prose "not used / backup material" block from the agent's report.
+
+    Backup material is rendered ONCE, from the plan (resolved names + measured timecodes)
+    in its own expander. The agent is told not to repeat it in prose, but a model can
+    always drift, so the duplicate is removed at render time rather than shown twice.
+    Anything from a later ``Notes:``/heading line onwards is kept — only the list goes.
+    """
+    def _is_heading(ln: str) -> bool:
+        low = ln.strip().lstrip("#*_ ").lower()
+        return ("🗂" in ln or "backup material" in low
+                or low.startswith(("not used", "unused", "alternative material")))
+
+    lines = report.splitlines()
+    start = next((i for i, ln in enumerate(lines) if _is_heading(ln)), None)
+    if start is None:
+        return report
+    end = next((j for j in range(start + 1, len(lines))
+                if lines[j].lstrip().lower().startswith(("notes:", "🎬", "###", "## "))),
+               len(lines))
+    # Also swallow a "---" separator that only existed to introduce the dropped block.
+    while start > 0 and lines[start - 1].strip() in ("", "---", "***", "___"):
+        start -= 1
+    return "\n".join(lines[:start] + lines[end:]).strip()
+
+
+def _reveal_in_file_manager(target: str) -> str | None:
+    """Open the OS file manager with ``target`` selected, ready to drag into an NLE.
+
+    Returns ``None`` on success, or a short reason it could not be opened. This works only
+    when the browser and the Streamlit server are the SAME machine — which is the supported
+    ``python main.py`` local setup. A remote server cannot open a window on the viewer's
+    machine, so the caller reports the path instead of pretending it worked.
+    """
+    path = Path(target)
+    if not path.exists():
+        return "the file is no longer on disk"
+    try:
+        if sys.platform.startswith("win"):
+            # Explorer wants the flag and the path glued together; it also exits non-zero
+            # even on success, so fire-and-forget rather than check the return code.
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])   # no "select" equivalent
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def _render_export_actions(result) -> None:
+    """One click to reveal the exported project file, so it can be dragged into Premiere.
+
+    Gated on the COMPILER's own structured ``DeliveryResult`` (status success + a real path
+    that still exists), never on the agent's prose: a refused or failed compile must not
+    offer to open a file that was never written.
+    """
+    xml_path = getattr(result, "xml_path", None) if result else None
+    if not (xml_path and getattr(result, "status", None) == "success"):
+        return
+    if not Path(xml_path).exists():
+        st.caption(f"⚠ The exported file is no longer at its recorded path: {xml_path}")
+        return
+    name = Path(xml_path).name
+    if st.button(f"📂 Show {name} in folder", key="reveal_export",
+                 use_container_width=True,
+                 help="Opens the export folder with the file selected — drag it straight "
+                      "into Premiere Pro (works when the app runs on this machine)"):
+        problem = _reveal_in_file_manager(xml_path)
+        if problem:
+            st.warning(f"Could not open the folder ({problem}). The file is at: {xml_path}")
+        else:
+            st.caption(f"Opened {Path(xml_path).parent}")
+
+
 # ── Backend calls (thin wrappers over the orchestrator stages) ─────────────────
 
 
@@ -151,7 +271,11 @@ def run_selection(intent: str, selected_paths: list[str], project_id: str, user_
 
 
 def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
-    """④ Delivery — compile the STRUCTURED plan (required; no Bin-order fallback, H-04)."""
+    """④ Delivery — compile the STRUCTURED plan (required; no Bin-order fallback, H-04).
+
+    Returns ``(agent_text, DeliveryResult | None)``; the structured result carries the
+    written artefact paths so the UI can reveal the file on disk.
+    """
     return _orch().run_delivery(plan, project_id, user_id, sequence_name=sequence_name)
 
 
@@ -364,6 +488,7 @@ def main():
     st.session_state.setdefault("search_results", [])
     st.session_state.setdefault("selection_output", "")
     st.session_state.setdefault("delivery_output_text", "")
+    st.session_state.setdefault("delivery_result", None)
     st.session_state.setdefault("last_timeline_plan", None)
 
     locked = not st.session_state.ingest_done
@@ -514,30 +639,20 @@ def main():
                 st.caption(f"⚠ Order matches {plan['order_check']['reference']} — "
                            "check the agent's reasoning below for why that shape fits.")
         with st.container(border=True):
-            st.markdown(st.session_state.selection_output)
+            st.markdown(_strip_backup_section(st.session_state.selection_output))
         # Backup material, identified the way an editor reads it — source file + real
-        # timecodes, never a bare event id.
+        # timecodes, never a bare event id. This expander is the SINGLE place it appears.
         dropped = (plan or {}).get("excluded") or []
         if dropped:
             with st.expander(f"🗂️ Not used — backup material ({len(dropped)})",
                              expanded=False):
-                st.caption("The alternatives the agent weighed and rejected — not every "
-                           "unused clip.")
-                for x in dropped:
-                    st.markdown(f"**{_backup_headline(x)}**")
-                    if x.get("label"):
-                        st.markdown(x["label"])
-                    for g in x.get("also_details") or []:
-                        st.caption(f"Same call for {_backup_headline(g)}"
-                                   + (f" — {g['label']}" if g.get("label") else ""))
-                    if not x.get("file_path"):
-                        st.caption("No catalogued clip matched this reference.")
-                    st.markdown(f"- **Why not used:** {x.get('reason') or 'not stated'}")
-                    if x.get("suggested_use"):
-                        st.markdown(f"- **Could be used for:** {x['suggested_use']}")
+                st.caption("The alternatives the agent weighed and rejected, strongest "
+                           "first — not every unused clip. None of these is in the export.")
+                for i, x in enumerate(dropped, 1):
+                    _render_backup_item(i, x)
                 omitted = (plan or {}).get("excluded_omitted", 0)
                 if omitted:
-                    st.caption(f"{omitted} further item(s) were trimmed — the shortlist is "
+                    st.caption(f"＋{omitted} further item(s) were trimmed — the shortlist is "
                                "capped at the strongest alternatives.")
     st.divider()
 
@@ -570,6 +685,7 @@ def main():
     if st.session_state.get("delivery_output_text"):
         with st.container(border=True):
             st.markdown(st.session_state.delivery_output_text)
+        _render_export_actions(st.session_state.get("delivery_result"))
     st.divider()
 
     # ── Resolve actions (each button runs exactly one explicit pipeline stage) ──
@@ -635,14 +751,20 @@ def main():
         with st.spinner("Delivery Agent is compiling the Premiere project..."):
             try:
                 # H-04: Delivery is driven ONLY by the structured plan's ordered segments.
-                response = run_delivery(
+                # The DeliveryResult is the compiler's own record of what it wrote — it is
+                # what gates the "show in folder" action, not the agent's narration.
+                response, res = run_delivery(
                     st.session_state.get("last_timeline_plan"),
                     project_id, user_id, (seq_name.strip() or "MAPO Edit"))
                 st.session_state.delivery_output_text = response
+                st.session_state.delivery_result = res
                 st.session_state.messages.append({
                     "role": "user", "content": f"[Deliver] compile '{seq_name.strip() or 'MAPO Edit'}'"})
                 st.session_state.messages.append({"role": "assistant", "content": response})
             except Exception as e:
+                # No artefact was written — drop any earlier one so the reveal button can't
+                # point at a stale export.
+                st.session_state.delivery_result = None
                 st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
         st.rerun()
 
