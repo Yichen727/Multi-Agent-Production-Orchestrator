@@ -1,6 +1,6 @@
-"""MAPO Agents — the three specialised agents of the linear production pipeline.
+"""MAPO Agents — the four specialised agents of the linear production pipeline.
 
-    Ingest → Search → Selection
+    Ingest → Search → Selection → Delivery
 
-Ingest builds the catalogue; Search retrieves candidates; Selection ranks and explains.
+Ingest builds the catalogue; Search retrieves candidates; Selection makes timeline decisions; Delivery distributes the final output.
 """

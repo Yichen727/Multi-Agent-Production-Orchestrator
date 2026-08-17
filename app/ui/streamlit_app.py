@@ -532,7 +532,7 @@ def main():
     st.subheader("① Ingest")
     st.caption("Scan and catalogue the footage.")
     if st.session_state.ingest_done:
-        st.success("✅ Ingest completed. All clips are in the Bin (left sidebar).")
+        st.success("✅ Ingest completed. All clips are in the Media Pool.")
     run_ingest = st.button("🎬 Run Ingest Analysis", use_container_width=True,
                            help="Ingest Agent — scan, vision-tag, embed, catalogue")
     st.divider()
@@ -544,7 +544,7 @@ def main():
     if locked:
         st.info("🔒 Locked — run Ingest first.")
 
-    search_text = st.text_input("Search query", placeholder="e.g. energetic crowd celebration",
+    search_text = st.text_input("Search query", placeholder="e.g. Tech products",
                                 disabled=locked, key="search_query")
     s1, s2 = st.columns(2)
     with s1:
@@ -603,7 +603,7 @@ def main():
 
     intent_text = st.text_input(
         "Editing intent", key="intent", disabled=sel_disabled,
-        placeholder="e.g. Warm, unhurried travel vlog — atmosphere first, ending on the sunset",
+        placeholder="e.g. Fast-paced tech product promo, showcasing various functions",
         help="Describe style, emotion, pacing and purpose.")
     run_select = st.button("🎬 Generate Edit Timeline", use_container_width=True,
                            disabled=sel_disabled,

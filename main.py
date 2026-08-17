@@ -1,6 +1,6 @@
 """MAPO — Multi-Agent Production Orchestrator
 
-Launch the Streamlit UI (sole entry point):
+Launch the Streamlit UI:
     python main.py
 """
 
@@ -9,7 +9,6 @@ import sys
 
 
 def main():
-    """Launch the Streamlit UI — the only way to interact with MAPO."""
     subprocess.run(
         [sys.executable, "-m", "streamlit", "run", "app/ui/streamlit_app.py"],
     )

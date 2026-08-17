@@ -353,7 +353,7 @@ def get_catalogued_shots(project_id: int) -> dict:
 
     Each value is a dict of every column (including the source_mtime / source_size
     fingerprint). The Ingest Agent uses this to REUSE prior analysis — skipping the
-    expensive ffprobe/scene-detection/GPT-5.4 Vision work for files whose path is
+    expensive ffprobe/scene-detection/GPT-5.5 Vision work for files whose path is
     already catalogued and whose content is unchanged.
     """
     from sqlalchemy import text as _sql
@@ -460,7 +460,7 @@ def get_catalogued_events(project_id: int) -> dict:
     """Return existing events for a project, grouped by parent file path.
 
     Each value is the ordered list of that clip's event dicts. The Ingest Agent uses
-    this to REUSE events for unchanged clips (skipping the per-segment GPT-5.4 calls),
+    this to REUSE events for unchanged clips (skipping the per-segment GPT-5.5 calls),
     mirroring how ``get_catalogued_shots`` lets it reuse clip-level analysis.
     """
     from sqlalchemy import text as _sql

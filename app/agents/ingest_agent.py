@@ -48,12 +48,7 @@ from app.utils.logger import get_logger
 logger = get_logger("ingest_agent")
 
 
-# ── Structured ingest outcome (audit C-08) ─────────────────────────────────────
-#
-# ingest_footage still returns a human-readable summary for the LLM, but it ALSO records
-# a structured IngestResult here. The UI reads it (in-process, single-user) to gate the
-# later phases on real success + indexed_count > 0, instead of trusting that the agent
-# returned some text — an error string like "Directory not found" is non-empty too.
+# Structured result used by the UI to gate later stages.
 _LAST_INGEST_RESULT: IngestResult | None = None
 
 
@@ -64,29 +59,23 @@ def _record_ingest_result(result: IngestResult) -> IngestResult:
 
 
 def reset_last_ingest_result() -> None:
-    """Clear the recorded result. The UI calls this BEFORE a run so a stale success from
-    an earlier ingest can't unlock the pipeline when this run never reached the tool."""
+    """Clear the previous ingest result before a new run."""
     global _LAST_INGEST_RESULT
     _LAST_INGEST_RESULT = None
 
 
 def get_last_ingest_result() -> IngestResult | None:
-    """Structured result of the most recent ingest_footage run this session, or None."""
+    """Return the most recent ingest result."""
     return _LAST_INGEST_RESULT
 
 
 def _scan_dir(directory, state) -> Path:
-    """Resolve the footage directory: explicit arg → injected state → global default.
-
-    Reading ``state['footage_dir']`` (seeded per-run by the orchestrator) instead of a
-    mutated global ``settings.RAW_FOOTAGE_DIR`` keeps concurrent sessions isolated
-    (audit H-07). The global is only the last-resort fallback.
-    """
+    """Resolve the footage directory from the run state or default."""
     return Path(directory or (state or {}).get("footage_dir") or settings.RAW_FOOTAGE_DIR)
 
 
 def _resolve_pid(state, project_id: int) -> int:
-    """Project id: injected graph state wins over the model-supplied arg, else default 1."""
+    """Resolve project ID, preferring injected state."""
     pid = (state or {}).get("project_id")
     if pid is None:
         pid = project_id
@@ -98,13 +87,10 @@ def _resolve_pid(state, project_id: int) -> int:
 
 # ── Tools: ingest / media preparation ─────────────────────────────────────────
 
-
-# Hard bounds for the directory scan. They guarantee the scan always terminates in
-# bounded time and memory — even for a huge tree or a symlink/junction cycle, which
-# would otherwise make a symlink-following rglob recurse forever and peg the CPU.
-_MAX_SCAN_FILES = 2000     # stop collecting once this many matches are found
-_MAX_SCAN_DIRS = 50_000    # stop walking once this many directories are visited
-_SCAN_PREVIEW = 50         # cap the number of files listed in the returned text
+# Scan safety limits.
+_MAX_SCAN_FILES = 2000    
+_MAX_SCAN_DIRS = 50_000   
+_SCAN_PREVIEW = 50        
 
 
 @tool
@@ -231,19 +217,13 @@ def generate_proxy_for_file(file_path: str) -> str:
         return f"Proxy generation failed: {e}"
 
 
-# Probing + vision per file is the slow part of ingest; cap it so a huge folder
-# can't hang the agent or run up an unbounded API bill.
+# Per-run ingest limit
 _MAX_INGEST_FILES = 200
 
-# Temporal event extraction bounds. Each event window is a separate GPT-5.4 call, so the
-# per-clip window count is budgeted — but the budget SCALES WITH DURATION instead of being
-# a flat 12: a fixed cap forced a long clip's windows to be coarsened far more than a short
-# one's, for no reason other than the constant. Windows over budget are merged (never
-# dropped) by build_event_windows, so coverage is always complete; the budget only sets
-# how fine the granularity gets.
-_MIN_EVENTS_PER_CLIP = 12        # floor, so even a short clip gets a usable event layer
-_MAX_EVENTS_PER_CLIP = 40        # ceiling, so one long clip can't dominate the API bill
-_SECONDS_PER_EVENT = 6.0         # target event granularity
+# Duration-scaled event extraction limits.
+_MIN_EVENTS_PER_CLIP = 12        
+_MAX_EVENTS_PER_CLIP = 40        
+_SECONDS_PER_EVENT = 6.0       
 _FRAMES_PER_EVENT = 3
 
 
@@ -265,11 +245,7 @@ _EVENT_REUSE_COLUMNS = (
 
 def _event_semantic_text(action: str | None, state_change: str | None,
                          keywords: str) -> str:
-    """Assemble the per-event text that gets embedded for moment-level search.
-
-    Combines the action sentence, the state change, and the event keywords. Returns ""
-    when there is nothing real to embed so no vector is stored (never an empty string).
-    """
+    """Build the text embedded for moment-level search."""
     parts = []
     if action:
         parts.append(action)
@@ -281,24 +257,13 @@ def _event_semantic_text(action: str | None, state_change: str | None,
 
 
 def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> list[dict]:
-    """Extract ordered temporal events for one clip (the 'what happens' layer).
-
-    Segments the clip into event windows (scene cuts + long-scene sub-division, budgeted
-    by :func:`_event_budget`), sends several ordered frames per window to GPT-5.4, and
-    returns event dicts ready for ``replace_project_events`` — each with a real start/end,
-    an action description, and its own semantic embedding. Only windows the model actually
-    described are kept; a window that fails analysis is skipped rather than stored as a
-    fabricated event.
-
-    All of the clip's event embeddings are fetched in ONE batched call (the embeddings API
-    is batch-native) rather than one call per event.
-    """
+    """Extract ordered temporal events and their embeddings for one clip."""
     windows = build_event_windows(duration, cut_times,
                                   max_events=_event_budget(duration))
     if not windows:
         return []
     events: list[dict] = []
-    pending: list[tuple[int, str]] = []   # (index in events, text to embed)
+    pending: list[tuple[int, str]] = []   # (event index, embedding text)
     order = 0
     for (start, end) in windows:
         frames = extract_frames_in_window_b64(path, start, end, count=_FRAMES_PER_EVENT)
@@ -312,7 +277,7 @@ def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> li
         keywords = ",".join(dict.fromkeys(kws))
         action = (tags.action or "").strip()
         state_change = (tags.state_change or "").strip()
-        # Skip an empty event — the model saw the frames but reported nothing usable.
+        # Skip an empty event 
         if not action and not keywords:
             continue
         order += 1
@@ -332,14 +297,13 @@ def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> li
         if sem:
             pending.append((len(events) - 1, sem))
 
-    # One embedding call for the whole clip's events.
+    # Batch embeddings for the clip's events.
     if pending:
         vecs = embed_texts([text for _, text in pending])
         if vecs and len(vecs) == len(pending):
             for (idx, _), vec in zip(pending, vecs):
                 events[idx]["embedding"] = json.dumps(vec)
         elif vecs:
-            # Never risk pairing a vector with the wrong event — store none instead.
             logger.error(f"Event embedding count mismatch for {path} "
                          f"({len(pending)} text(s) → {len(vecs)} vector(s)); "
                          "storing no event vectors for this clip.")
@@ -347,14 +311,7 @@ def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> li
 
 
 def _find_video_files(scan_dir: Path) -> tuple[list[Path], bool]:
-    """Bounded, single-pass, symlink-safe walk for supported video files.
-
-    Returns ``(files, truncated)``. ``truncated`` is True when the scan hit
-    ``_MAX_INGEST_FILES``. The caller MUST NOT perform the destructive catalogue rewrite
-    when truncated (audit C-07): ``replace_project_shots`` deletes the project's rows and
-    writes only what it is given, so writing a silently-capped first-N set would erase
-    the rest of the catalogue and report success.
-    """
+    """Find supported videos and report whether the scan was truncated."""
     exts = {"." + e.strip().lower().lstrip(".") for e in settings.SUPPORTED_VIDEO_FORMATS}
     found: list[Path] = []
     truncated = False
@@ -407,12 +364,7 @@ def detect_new_footage(directory: str = None, project_id: int = 1,
 
 
 def _semantic_text(description: str | None, keywords: str, mood: str | None) -> str:
-    """Assemble the text that gets embedded for semantic search.
-
-    Combines the vision description, keyword tags, and mood into one editor-facing
-    sentence. Returns "" when there is nothing real to embed, so the caller stores no
-    vector rather than embedding an empty/fabricated string.
-    """
+    """Build the text embedded for semantic search."""
     parts = []
     if description:
         parts.append(description)
@@ -424,7 +376,7 @@ def _semantic_text(description: str | None, keywords: str, mood: str | None) -> 
 
 
 def _file_fingerprint(path: Path) -> tuple[float | None, int | None]:
-    """Return (mtime, size) for a file, or (None, None) if it can't be stat'd."""
+    """Return file modification time and size."""
     try:
         st = path.stat()
         return st.st_mtime, st.st_size
@@ -433,13 +385,7 @@ def _file_fingerprint(path: Path) -> tuple[float | None, int | None]:
 
 
 def _can_reuse(cached: dict, mtime: float | None, size: int | None) -> bool:
-    """Decide whether a catalogued row can be reused instead of re-analysed.
-
-    Reuse when the file's content looks unchanged: size matches and mtime is within
-    1s of what was stored. If the stored fingerprint is missing (older ingest), we
-    still reuse on a path match — the user asked to skip re-analysis for already
-    analysed paths — unless the size we can read now clearly differs.
-    """
+    """Return whether a cached catalogue row can be reused."""
     c_size = cached.get("source_size")
     c_mtime = cached.get("source_mtime")
     if c_size is not None and size is not None and c_size != size:
@@ -458,7 +404,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
 
     INCREMENTAL BY DEFAULT: a file whose path is already catalogued and whose
     content is unchanged (same size + modification time) is REUSED as-is — its
-    ffprobe metadata and GPT-5.4 Vision tags are kept, so no FFmpeg or LLM work runs
+    ffprobe metadata and GPT-5.5 Vision tags are kept, so no FFmpeg or LLM work runs
     for it again. Only new or modified files go through full analysis. This keeps
     repeated ingests fast and avoids re-spending Vision API calls.
 
@@ -468,11 +414,11 @@ def ingest_footage(directory: str = None, project_id: int = 1,
          (portrait/landscape/square, rotation-aware), fps, codec, audio presence,
          duration.
       3. SHOT/SCENE DETECTION — FFmpeg scene-change cut count.
-      4. VISION TAGGING (if analyze_content) — GPT-5.4 watches sampled frames and
+      4. VISION TAGGING (if analyze_content) — GPT-5.5 watches sampled frames and
          returns a description, shot type, objects, searchable keywords, and an
          approximate people count.
       5. TEMPORAL EVENT EXTRACTION (if analyze_events) — the clip is split into event
-         windows (scene cuts + long-scene sub-division) and GPT-5.4 describes WHAT
+         windows (scene cuts + long-scene sub-division) and GPT-5.5 describes WHAT
          HAPPENS in each (action + change), stored as ordered ``clip_events`` with real
          start/end timecodes and their own embeddings for moment-level search.
       6. (optional) PROXY generation for each clip.
@@ -486,7 +432,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
     Args:
         directory: Footage directory to ingest. Defaults to the run's footage directory.
         project_id: Project to (re)build the catalogue for.
-        analyze_content: Run GPT-5.4 Vision tagging on sampled frames (default True).
+        analyze_content: Run GPT-5.5 Vision tagging on sampled frames (default True).
         generate_proxies: Also generate a low-res proxy per clip (slow; default False).
         analyze_events: Extract temporal 'what happens' events per clip (default True;
             requires analyze_content / an API key — skipped otherwise).
@@ -551,7 +497,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         path = str(f)
         mtime, size = _file_fingerprint(f)
 
-        # ── Reuse path: skip all probing / LLM work for unchanged, known files ──
+        # Reuse unchanged files.
         cached = cache.get(path)
         if cached is not None and _can_reuse(cached, mtime, size):
             row = {col: cached.get(col) for col in (
@@ -571,7 +517,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                 orientation_counts.get(row.get("orientation") or "unknown", 0) + 1
             )
             # Carry this clip's previously-extracted events forward unchanged (no new
-            # per-window GPT-5.4 calls), so a re-ingest keeps the temporal layer intact.
+            # per-window GPT-5.5 calls), so a re-ingest keeps the temporal layer intact.
             cached_events = events_cache.get(path) or []
             if cached_events:
                 for ev in cached_events:
@@ -579,7 +525,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                 clips_with_events += 1
             continue
 
-        # ── Analyse path: new or changed file ──────────────────────────────────
+        # Analyse new or changed files.
         meta = probe_video_metadata(path)
         if not meta["ok"]:
             unreadable += 1
@@ -738,7 +684,7 @@ def ingest_footage(directory: str = None, project_id: int = 1,
         f"Orientation — {breakdown}."
     )
     if do_vision:
-        summary += f"\nVision-tagged {tagged} newly analysed clip(s) with GPT-5.4."
+        summary += f"\nVision-tagged {tagged} newly analysed clip(s) with GPT-5.5."
         summary += (
             f"\nFrame sampling — {scene_sampled} clip(s) via scene midpoints, "
             f"{even_sampled} via adaptive even sampling; "
@@ -875,7 +821,7 @@ tool on the footage directory. One call runs the whole pipeline per clip:
 - extract REAL technical metadata (dimensions, orientation, fps, codec, audio,
   duration)
 - detect shot/scene cuts (FFmpeg)
-- VISION TAGGING: GPT-5.4 watches sampled frames and returns a semantic description,
+- VISION TAGGING: GPT-5.5 watches sampled frames and returns a semantic description,
   shot type, objects, searchable keywords, an approximate people count, plus the mood
 - SEMANTIC EMBEDDING: the description + keywords + mood are embedded into a vector so
   Search can do semantic recall, not just literal keyword matching
@@ -883,12 +829,12 @@ It then replaces the project's catalogue with those rows. You may also call
 `detect_new_footage` first to see what is new, and `export_metadata_json` afterwards.
 
 INCREMENTAL — ingest is cheap to re-run: files already analysed and unchanged are
-REUSED automatically (no re-probing, no GPT-5.4 calls), and only new or modified files
+REUSED automatically (no re-probing, no GPT-5.5 calls), and only new or modified files
 are analysed. Do NOT pass force_reanalyze unless the user explicitly wants every clip
 re-analysed from scratch.
 
 CRITICAL — only report what the tools actually measured or the vision model actually
-saw. The pipeline records true technical facts plus GPT-5.4's frame observations; it
+saw. The pipeline records true technical facts plus GPT-5.5's frame observations; it
 does NOT identify *who* people are, and any step that cannot run leaves its fields
 'unclassified'. NEVER invent file names, shot types, keywords, counts, or scores that
 the tools did not return.
