@@ -40,22 +40,6 @@ You pick the output frame explicitly — **16:9 / 9:16 / 4:3 / 3:4 / 1:1** — a
 
 ---
 
-## What's real vs. not implemented
-
-| Real | Not implemented |
-|---|---|
-| ffprobe technical metadata | Whisper transcription |
-| FFmpeg scene-cut detection | Face / speaker **identity** recognition (people are counted, never identified) |
-| GPT-5.5 Vision clip tagging + temporal event extraction | Audio event detection |
-| Semantic embeddings + hybrid (vector + keyword) search | Automated quality scoring (quality is your call) |
-| Premiere-importable FCP7 XML export | PostgreSQL datastore (SQLite is used instead) |
-
-The rule throughout: **store only what a tool measured or the vision model actually saw; leave the rest unclassified; never fabricate.** No invented filenames, no made-up scores. Relevance percentages describe how strong the catalogue's evidence is, not ground truth — content-derived matches are capped below 100%, while measured filters (orientation, duration) can report a true 100%.
-
-Each project is isolated: every query and export is scoped to the current project, so one project can never see or compile another's media.
-
----
-
 ## Getting started
 
 ### Prerequisites
@@ -139,13 +123,3 @@ app/
 tests/                               # pytest suite
 ```
 
-## Testing
-
-```bash
-pytest tests/ -v                                    # all tests
-pytest tests/test_agents.py::test_shot_query -v     # a single test
-```
-
-Tests run against an in-memory database with a deterministic demo catalogue, so they never touch your real one.
-
-See [CLAUDE.md](CLAUDE.md) for the contributor guide and architectural detail.
