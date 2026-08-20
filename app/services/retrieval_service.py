@@ -11,7 +11,7 @@ the old set of fragmented per-attribute SQL tools with one function that combine
     3. LEXICAL OVERLAP — WHOLE-WORD (never substring) matching of the query terms
        against a row's keywords/description, tiered by whether a term is the user's own
        or came from synonym expansion. It also carries retrieval alone when embeddings
-       are unavailable (no API key, or the demo seed which has no vectors).
+       are unavailable (no API key, or rows ingested before the embedding step).
 
 Relevance is tiered by how trustworthy the evidence is: ffprobe-MEASURED constraints
 (orientation, duration) can report a full 1.0, while anything derived from the vision
@@ -561,7 +561,7 @@ def _best_event_by_path(project_id, wanted_paths: set, terms: QueryTerms,
 def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None,
                   shot_type: str = None, orientation: str = None, people: int = None,
                   min_duration: float = None, max_duration: float = None,
-                  top_k: int = 20) -> list[dict]:
+                  top_k: int = 100) -> list[dict]:
     """Unified hybrid retrieval: SQL hard filters + EVENT-AWARE semantic/lexical recall.
 
     The retrieval unit is always the CLIP (Search browses footage; Selection cuts moments
@@ -592,7 +592,12 @@ def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None
         orientation: 'portrait' | 'landscape' | 'square' (synonyms vertical/horizontal).
         people: Minimum number of people visible.
         min_duration / max_duration: Duration window in seconds.
-        top_k: Maximum number of candidates to return.
+        top_k: Maximum number of candidates to return (default 100). This is only the
+            FINAL slice — filtering, clip-vector scoring and event scoring already run
+            over every matching row in the project, so raising it costs no extra DB or
+            embedding work; it only widens what the UI/agent has to render. Kept
+            generous so a large catalogue is not silently truncated mid-relevance —
+            weak matches simply land in the collapsed 'low' tier.
 
     Returns:
         A list of CLIP candidate dicts, each carrying real catalogue metadata plus a

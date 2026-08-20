@@ -1,11 +1,11 @@
-"""Database service — SQLAlchemy setup with production schema and demo data.
+"""Database service — SQLAlchemy setup with the production schema.
 
 The catalogue is a SQLite database. By default it is **persisted to a file**
 (``settings.METADATA_DB_PATH``) so real ingested rows survive app restarts — this is
 what makes the Ingest Agent's incremental reuse work across sessions (unchanged files
-are not re-probed / re-tagged on a later run). The demo catalogue is seeded ONLY when
-the database is empty, so a real ingest is never clobbered by the demo data on the next
-launch. Tests point ``METADATA_DB_PATH`` at ``:memory:`` for isolation.
+are not re-probed / re-tagged on a later run). Nothing is ever seeded: a fresh database
+starts EMPTY and only a real ingest puts rows in it, so every row in the catalogue traces
+back to a measured file. Tests point ``METADATA_DB_PATH`` at ``:memory:`` for isolation.
 """
 
 import json
@@ -30,13 +30,14 @@ logger = get_logger("database_service")
 # catalogues is tracked separately. The ``CREATE INDEX IF NOT EXISTS`` statements, by
 # contrast, DO apply retroactively to an existing file.
 _SCHEMA_DDL = """
+        -- One row per project, carrying only what the system actually knows: the id, a
+        -- name, and how many clips the last ingest catalogued. `clip_count` is maintained
+        -- by replace_project_shots — the ONLY writer of `shots` — inside the same
+        -- transaction as the insert, so it cannot drift out of sync with the rows it counts.
         CREATE TABLE IF NOT EXISTS projects (
             project_id INTEGER PRIMARY KEY,
             project_name TEXT NOT NULL,
-            client_name TEXT,
-            created_date TEXT,
-            frame_rate REAL,
-            resolution TEXT
+            clip_count INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS shots (
@@ -101,38 +102,6 @@ _SCHEMA_DDL = """
 """
 
 
-# Tables from earlier designs that no agent or pipeline stage reads or writes any more:
-# quality_assessments and transitions belonged to the removed Quality Agent, and
-# user_preferences was never wired to anything. Dropped idempotently so a pre-existing
-# on-disk catalogue is simplified too, not just a fresh one.
-_DROP_UNUSED_TABLES = """
-        DROP TABLE IF EXISTS quality_assessments;
-        DROP TABLE IF EXISTS transitions;
-        DROP TABLE IF EXISTS user_preferences;
-"""
-
-
-# Demo catalogue — seeded ONLY when the shots table is empty (fresh database), so a
-# real ingest is never overwritten on the next launch.
-_DEMO_SEED = """
-        INSERT INTO projects VALUES
-            (1, 'Demo Project - Short Film', 'Atomized Studios', '2025-06-01', 24.0, '3840x2160');
-
-        INSERT INTO shots
-            (shot_id, project_id, file_path, shot_type,
-             duration_seconds, keywords,
-             width, height, orientation, fps, codec, has_audio, scene_count,
-             description, people_count, mood,
-             embedding, source_mtime, source_size)
-        VALUES
-            (1, 1, '/footage/scene01/take01.mov', 'wide_shot', 12.5, 'exterior,daylight,establishing', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior establishing wide of the location in daylight.', 0, 'calm', NULL, NULL, NULL),
-            (2, 1, '/footage/scene01/take02.mov', 'wide_shot', 13.1, 'exterior,daylight', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Exterior daylight wide, second take.', 0, 'calm', NULL, NULL, NULL),
-            (3, 1, '/footage/scene01/take03.mov', 'close_up', 8.2, 'dialogue,interior', 3840, 2160, 'landscape', 24.0, 'prores', 1, 1, 'Interior close-up of a subject delivering dialogue.', 1, 'tense', NULL, NULL, NULL),
-            (4, 1, '/footage/scene02/take01.mov', 'establishing', 20.0, 'aerial,cityscape', 3840, 2160, 'landscape', 24.0, 'prores', 0, 3, 'Aerial establishing shot over a cityscape.', 0, 'cinematic', NULL, NULL, NULL),
-            (5, 1, '/footage/scene02/take02.mov', 'medium_shot', 15.3, 'dialogue,two-shot', 3840, 2160, 'landscape', 24.0, 'prores', 1, 2, 'Interior medium two-shot during dialogue.', 2, 'calm', NULL, NULL, NULL);
-"""
-
-
 # Columns added to `shots` after the original schema shipped. `CREATE TABLE IF NOT
 # EXISTS` will not alter a pre-existing on-disk table, so these are applied as an
 # idempotent ALTER TABLE ADD COLUMN migration — additive, nullable, safe on every launch.
@@ -142,33 +111,35 @@ _ADDED_SHOT_COLUMNS = (
     ("audio_bit_depth", "INTEGER"),
 )
 
-# Semantic columns removed from `shots`: nothing downstream read them (only `mood` is
-# still used, in the embedded semantic text and the candidate preview), so they were pure
-# schema weight. A fresh DB simply never creates them; a pre-existing on-disk table has
-# them dropped here so `SELECT *` tools stop surfacing dead fields to the LLM.
-_REMOVED_SHOT_COLUMNS = ("camera_motion", "lighting", "subject_position")
-
 
 def _migrate_shot_columns(connection) -> None:
-    """Reconcile the `shots` columns on both fresh and pre-existing databases.
+    """Add any newer `shots` columns missing from a pre-existing database.
 
-    Adds the newer nullable columns (``CREATE TABLE IF NOT EXISTS`` will not alter an
-    existing table) and drops the removed semantic ones. ``DROP COLUMN`` needs SQLite
-    3.35+; on an older library the drop is skipped and the column just stays inert
-    (nothing writes or reads it), so the catalogue still works.
+    ``CREATE TABLE IF NOT EXISTS`` will not alter an existing table, so the columns added
+    after the original schema shipped are applied here instead. Purely additive and
+    nullable, hence safe to run on every launch.
     """
     existing = {row[1] for row in connection.execute("PRAGMA table_info(shots)").fetchall()}
     for name, decl in _ADDED_SHOT_COLUMNS:
         if name not in existing:
             connection.execute(f"ALTER TABLE shots ADD COLUMN {name} {decl}")
-    for name in _REMOVED_SHOT_COLUMNS:
-        if name in existing:
-            try:
-                connection.execute(f"ALTER TABLE shots DROP COLUMN {name}")
-            except sqlite3.OperationalError as e:
-                logger.warning(f"Could not drop the unused shots.{name} column ({e}); "
-                               "leaving it in place — nothing reads or writes it.")
     connection.commit()
+
+
+def _migrate_project_columns(connection) -> None:
+    """Add `clip_count` to a pre-existing `projects` table.
+
+    Back-filled from the rows already in `shots`, so an existing catalogue reports the
+    truth immediately rather than 0 until the next ingest.
+    """
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(projects)").fetchall()}
+    if "clip_count" not in existing:
+        connection.execute("ALTER TABLE projects ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            "UPDATE projects SET clip_count = ("
+            "    SELECT COUNT(*) FROM shots WHERE shots.project_id = projects.project_id)"
+        )
+        connection.commit()
 
 
 def _apply_pragmas(connection, *, in_memory: bool) -> None:
@@ -190,7 +161,7 @@ def _apply_pragmas(connection, *, in_memory: bool) -> None:
 
 
 def _create_engine(db_target: str):
-    """Open a SQLite database, ensure the schema, and seed demo data if empty.
+    """Open a SQLite database and ensure the schema (no data is ever seeded).
 
     Args:
         db_target: A filesystem path for a persistent catalogue, or ':memory:' for an
@@ -213,21 +184,15 @@ def _create_engine(db_target: str):
     """
     in_memory = db_target == ":memory:"
 
-    # Bootstrap connection: PRAGMAs, then schema + first-run seed.
+    # Bootstrap connection: PRAGMAs, then schema.
     connection = sqlite3.connect(db_target, check_same_thread=False)
     _apply_pragmas(connection, in_memory=in_memory)
     connection.executescript(_SCHEMA_DDL)
-    connection.executescript(_DROP_UNUSED_TABLES)
     _migrate_shot_columns(connection)
+    _migrate_project_columns(connection)
 
-    # Seed the demo catalogue only when the database is brand new (no shots). This is
-    # what lets real ingested rows persist across restarts without the demo clobbering
-    # them on the next launch.
-    existing = connection.execute("SELECT COUNT(*) FROM shots").fetchone()[0]
-    if existing == 0:
-        connection.executescript(_DEMO_SEED)
-        logger.info("Empty catalogue — seeded demo data.")
-
+    # No seeding: a fresh catalogue stays EMPTY until a real ingest writes measured rows,
+    # so nothing downstream can ever retrieve a clip that does not exist on disk.
     connection.commit()
 
     if in_memory:
@@ -296,9 +261,10 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
 
     Deletes the project's existing shots, then inserts ``rows`` (each a dict whose
     keys are a subset of ``_SHOT_COLUMNS``; missing keys are stored as NULL). This
-    is how REAL footage metadata, probed from the user's files, enters the database
-    — replacing the demo seed once the user runs ingest. Attributes that were not
-    measured should simply be omitted rather than guessed.
+    is the ONLY way rows enter the database: REAL footage metadata, probed from the
+    user's files. Attributes that were not measured should simply be omitted rather
+    than guessed. Also refreshes the parent project's ``clip_count`` in the same
+    transaction.
 
     Args:
         project_id: Project whose catalogue is being (re)built.
@@ -316,8 +282,7 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
     with _engine.begin() as conn:
         # Ensure a parent projects row exists so the shots.project_id FK (now enforced,
         # audit H-08) is satisfied. Materialising the project on first ingest also avoids
-        # orphan shots. INSERT OR IGNORE leaves an existing project (e.g. the demo
-        # project 1) untouched.
+        # orphan shots. INSERT OR IGNORE leaves an already-registered project untouched.
         conn.execute(
             _sql("INSERT OR IGNORE INTO projects (project_id, project_name) "
                  "VALUES (:pid, :name)"),
@@ -328,8 +293,32 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
             params = {c: row.get(c) for c in _SHOT_COLUMNS}
             params["project_id"] = project_id
             conn.execute(insert_sql, params)
+        # Keep projects.clip_count in step with the rows just written. Same transaction as
+        # the DELETE + INSERTs, and this is the only place `shots` is ever written, so the
+        # count can never disagree with the catalogue.
+        conn.execute(
+            _sql("UPDATE projects SET clip_count = :n WHERE project_id = :pid"),
+            {"n": len(rows), "pid": project_id},
+        )
 
     return len(rows)
+
+
+def get_project_info(project_id: int) -> dict | None:
+    """Return a project's registry row, or None if the project was never ingested.
+
+    Keys: ``project_id``, ``project_name``, ``clip_count`` (how many clips the last
+    ingest catalogued — maintained by ``replace_project_shots``).
+    """
+    from sqlalchemy import text as _sql
+
+    with _engine.begin() as conn:
+        row = conn.execute(
+            _sql("SELECT project_id, project_name, clip_count "
+                 "FROM projects WHERE project_id = :pid"),
+            {"pid": project_id},
+        ).first()
+        return dict(row._mapping) if row else None
 
 
 def get_catalogued_paths(project_id: int) -> set[str]:

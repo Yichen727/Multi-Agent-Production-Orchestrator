@@ -33,12 +33,11 @@ from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode, InjectedState
-from sqlalchemy import text as _sql
 
 from app.models.state import ProductionState
 from app.services.openai_service import llm
 from app.services.database_service import (
-    db, get_catalogued_events, get_events_by_ids,
+    get_catalogued_events, get_events_by_ids, get_project_info,
 )
 from app.services.catalogue_resolver import (
     resolve_one, resolve_ordered, AmbiguousIdentifier,
@@ -669,20 +668,15 @@ def generate_delivery_summary(
     The project is taken from the injected graph state (not model-supplied).
     """
     project_id = _pid_from_state(state)
-    project = db.run(
-        _sql("SELECT project_name, client_name, frame_rate, resolution "
-             "FROM projects WHERE project_id = :pid"),
-        parameters={"pid": project_id}, include_columns=True,
-    )
-    shot_count = db.run(
-        _sql("SELECT COUNT(*) as total FROM shots WHERE project_id = :pid"),
-        parameters={"pid": project_id}, include_columns=True,
-    )
+    project = get_project_info(project_id)
+    if not project:
+        return (f"Project {project_id} is not in the catalogue — nothing has been ingested "
+                "for it, so there is nothing to summarise.")
 
     return f"""Delivery Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Project: {project}
-Total Shots: {shot_count}
+Project: {project['project_name']} (id {project['project_id']})
+Total Shots: {project['clip_count']}
 Status: Ready for review
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
