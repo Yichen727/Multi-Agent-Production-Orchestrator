@@ -14,7 +14,8 @@ Selection model:
     - The Bin's checkboxes ARE the selection (single source of truth); "Select all"
       ticks/unticks the whole pool in one click.
     - Search is a decision aid: it ranks matches into 🟡 suggested / ⚪ neutral /
-      🔴 low and shows a reason + thumbnail; its ➕/➖ ticks/unticks the clip in the Bin.
+      🔴 low and shows a reason + thumbnail; its ➕/➖ ticks/unticks the clip in the Bin,
+      and each tier has ➕/➖ "all" buttons for adding a whole tier in one click.
     - Selection treats the ticked Bin clips as CANDIDATES and orchestrates them into an
       edit timeline in one of two modes — 🎞️ Clip Assembly (complete clips, original
       durations, no target duration) or 🎯 Moment Assembly (moments inside clips, with an
@@ -73,9 +74,19 @@ def _set_bin(path: str, value: bool):
     """on_click callback: set a Bin clip's selected state before the rerun.
 
     Makes the Search ➕/➖ toggle persistent — it flips to ➖ and stays until the user
-    clicks ➖, unticks the clip in the Bin, or clears the search marks.
+    clicks ➖ or unticks the clip in the Bin.
     """
     st.session_state[_bin_key(path)] = value
+
+
+def _set_bin_many(paths: list[str], value: bool):
+    """on_click callback: tick/untick a WHOLE tier of search results at once.
+
+    Same mechanism as ``_set_bin``, applied to every path in one go — that is what makes
+    "add all 🟡 Suggested to the Media Pool" a single click instead of one ➕ per card.
+    """
+    for path in paths:
+        st.session_state[_bin_key(path)] = value
 
 
 def _clear_all_selections():
@@ -289,17 +300,12 @@ def do_search(query: str, project_id: str, user_id: str):
     """② Search — rank/mark matching CLIPS via the orchestrator's Search stage.
 
     Delegates to ``run_search``, which invokes the Search Agent (falling back to direct
-    hybrid retrieval when the LLM is unavailable), then marks 🟡 suggested / ⚪ neutral
-    clips in the Bin. The unit is always the whole clip; a match driven by a moment inside
-    a clip carries a ``matched_event`` hint shown as the card's reason. Never touches
-    selection.
+    hybrid retrieval when the LLM is unavailable); each candidate carries its own
+    🟡 suggested / ⚪ neutral / 🔴 low marker, which is what the result cards group by. The
+    unit is always the whole clip; a match driven by a moment inside a clip carries a
+    ``matched_event`` hint shown as the card's reason. Never touches selection.
     """
-    candidates = _orch().run_search(query, project_id, user_id)
-    st.session_state.suggested = {
-        c["file_path"]: c.get("relevance")
-        for c in candidates if c.get("suggestion") in ("suggested", "neutral")
-    }
-    st.session_state.search_results = candidates
+    st.session_state.search_results = _orch().run_search(query, project_id, user_id)
 
 
 # ── Preview / thumbnail helpers ─────────────────────────────────────────────
@@ -391,9 +397,6 @@ def render_bin(project_id, locked):
         st.info("🔒 Run Ingest to populate the Bin.")
         return
 
-    only_matches = st.checkbox("Only search matches", value=False,
-                               help="Show only the last search's matches (and ticked clips)")
-
     shots = st.session_state.bin_shots
     if not shots:
         st.info("Bin is empty. Run Ingest to populate it.")
@@ -404,14 +407,12 @@ def render_bin(project_id, locked):
     st.checkbox("Select all", key="select_all_bin", on_change=_toggle_select_all,
                 help="Tick or untick every clip in the pool")
 
-    sugg = st.session_state.get("suggested", {})
-
-    # FIXED file-name / ingestion order — ticking never moves a row.
+    # FIXED file-name / ingestion order — ticking never moves a row. The pool always
+    # shows the WHOLE catalogue: filtering it by the last search would hide clips the
+    # editor may still want, and Search already has its own tiered result list.
     for c in shots:
         path = c["file_path"]
         name = Path(path).name
-        if only_matches and path not in sugg and not st.session_state.get(_bin_key(path)):
-            continue
         col_name, col_play = st.columns([0.8, 0.2])
         with col_name:
             st.checkbox(name, key=_bin_key(path))
@@ -446,6 +447,23 @@ def render_search_results():
         if not items:
             continue
         with st.expander(f"{header} ({len(items)})", expanded=_EXPANDED.get(tier, False)):
+            # Bulk controls for the whole tier — one click instead of one ➕ per card,
+            # which matters when a query returns dozens of matches. They write the SAME
+            # bin_<path> keys as the per-card ➕/➖, so the sidebar Bin, the card icons and
+            # ③ Selection's count all stay in sync automatically.
+            paths_in_tier = [c["file_path"] for c in items]
+            bulk_add, bulk_del, _ = st.columns([1.4, 1.4, 3.2])
+            with bulk_add:
+                st.button(f"➕ Add all ({len(items)})", key=f"srch_add_{tier}",
+                          use_container_width=True,
+                          help="Tick every clip in this tier in the Media Pool",
+                          on_click=_set_bin_many, args=(paths_in_tier, True))
+            with bulk_del:
+                st.button(f"➖ Remove all ({len(items)})", key=f"srch_del_{tier}",
+                          use_container_width=True,
+                          help="Untick every clip in this tier in the Media Pool",
+                          on_click=_set_bin_many, args=(paths_in_tier, False))
+
             for c in items:
                 path = c["file_path"]
                 name = Path(path).name
@@ -484,7 +502,6 @@ def main():
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("ingest_done", False)
     st.session_state.setdefault("bin_shots", [])
-    st.session_state.setdefault("suggested", {})
     st.session_state.setdefault("search_results", [])
     st.session_state.setdefault("selection_output", "")
     st.session_state.setdefault("delivery_output_text", "")
@@ -554,8 +571,8 @@ def main():
             else:
                 st.warning("Enter a search query first.")
     with s2:
-        if st.button("✖ Clear marks", use_container_width=True, disabled=locked):
-            st.session_state.suggested = {}
+        if st.button("✖ Clear results", use_container_width=True, disabled=locked,
+                     help="Drop the last search's result cards (Media Pool ticks stay)"):
             st.session_state.search_results = []
     render_search_results()
     st.divider()
