@@ -12,14 +12,14 @@ Four agents run in a fixed order, driven from a [Streamlit](https://streamlit.io
 
 ```
 ①  Ingest   →  ②  Search   →  [ Curation ]  →  ③  Selection   →  ④  Deliver
-  catalogue     find clips    tick the Bin      edit timeline      Premiere XML
+  catalogue     find clips   tick Media Pool    edit timeline     Premiere XML
 ```
 
 | Stage | What it does |
 |---|---|
 | **① Ingest** | Probes each file with ffprobe (resolution, orientation, fps, codec, audio, duration), detects scene cuts with FFmpeg, and sends sampled frames to GPT-5.5 Vision for tags (shot type, objects, keywords, description, people count, mood). It also splits every clip into ordered **events** — "what happens", with real start/end timecodes. Everything lands in a local catalogue. Re-running skips unchanged files. |
 | **② Search** | Type what you're looking for; you get back **whole clips**, ranked with a relevance % and a suggestion marker (🟡 suggested / ⚪ neutral / 🔴 low). A clip can surface because of a single moment inside it — the card then shows a "contains: …" reason. |
-| **Curation** | Tick the clips you want to use in the sidebar **Bin** (Select-all available). Only ticked clips reach Selection. |
+| **Curation** | Tick the clips you want to use in the sidebar **Media Pool** (Select-all available). Only ticked clips reach Selection. |
 | **③ Selection** | An AI assistant editor: it takes your ticked clips as *candidates*, drops what doesn't serve your intent (and tells you why, as backup material), and lays the rest out as an explained timeline. |
 | **④ Deliver** | Compiles the timeline into an FCP7 XML (`xmeml` v5) + JSON, written to `app/data/output/exports`. Order and trims are preserved exactly — nothing is re-edited here. |
 
@@ -105,10 +105,10 @@ A running transcript of what the agents did is available in the collapsed **🛠
 
 ### UI Overview
 
-The interface is split into two areas (corresponding to §4.5.1):
+The interface is split into two areas:
 
 - **Sidebar (left)**: project configuration, footage folder, and the Media Pool (Bin).
-- **Main workspace (full width)**: the four production stages arranged top-to-bottom — `① Ingest → ② Search → ③ Selection → ④ Deliver` — each stage renders its own output inline beneath it; at the very bottom is the collapsible `🛠️ Debug log`.
+- **Main workspace (full width)**: the four production stages arranged top-to-bottom.
 
 **Stage-locking mechanism**: downstream operations stay disabled (🔒 Locked) until the required preceding stage completes:
 
@@ -234,18 +234,6 @@ The result renders inline in the Selection section:
 | Streamlit | Open-source UI framework / optional hosting | UI framework; optional hosting on Streamlit Community Cloud | no account for local runs; platform account for hosting |
 | Adobe Premiere Pro | target NLE (provided by the user, not a system dependency) | imports the FCP7 XML project | user's own software |
 
-### Deliverables Checklist
-
-| # | Deliverable | Status | To do |
-| --- | --- | --- | --- |
-| 1 | Source code | ✅ full codebase in the repository; README/appendix point to GitHub: `github.com/Yichen727/Multi-Agent-Production-Orchestrator` | sync the repo, cut a release |
-| 2 | Local run + hosting deployment instructions | ✅ local: README Getting started + this manual | add hosting/deployment docs (Streamlit Community Cloud / server / Docker) |
-| 3 | Backend service access details | ✅ no hosted backend: service contract in `config.py` / `.env` template (OpenAI key, local SQLite, optional LangSmith) | actual keys are provided by the author; no credentials are shipped |
-| 4 | App usage guidance + prompt best practices | ✅ this document | — |
-| 5 | Build / architecture / codebase technical docs | ✅ README (structure) + dissertation Ch4 (architecture) | optional: standalone Architecture & Codebase doc |
-| 6 | Third-party services / APIs / tools details | ✅ third-party table in this manual | none (no paid services besides OpenAI) |
-
----
 
 ## Project structure
 
