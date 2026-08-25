@@ -11,8 +11,8 @@ An AI-assisted film/video **post-production pipeline** built on [LangGraph](http
 Four agents run in a fixed order, driven from a [Streamlit](https://streamlit.io/) UI. You stay in control at two points: which clips participate, and when to export.
 
 ```
-①  Ingest   →  ②  Search   →  [ Curation (you) ]  →  ③  Selection   →  ④  Deliver
-   catalogue     find clips        tick the Bin           edit timeline      Premiere XML
+①  Ingest   →  ②  Search   →  [ Curation ]  →  ③  Selection   →  ④  Deliver
+  catalogue     find clips    tick the Bin      edit timeline      Premiere XML
 ```
 
 | Stage | What it does |

@@ -1,29 +1,4 @@
-"""Production Orchestrator — the explicit four-stage pipeline driver.
-
-This module IS the orchestration layer (audit H-06). MAPO is a strict, user-driven
-linear pipeline and the orchestrator drives it as a fixed state machine — there is no
-LLM "supervisor" routing between agents. Each stage is an explicit function that invokes
-exactly one specialised ReAct sub-agent (or, for Search, the retrieval service directly):
-
-    ① run_ingest    → ingest_agent      (build the catalogue)
-    ② run_search    → retrieval_service (hybrid recall — retrieval only)
-    ③ run_selection → selection_agent   (intent-driven edit timeline; the editor picks
-                                         CLIP ASSEMBLY or MOMENT ASSEMBLY)
-    ④ run_delivery  → delivery compiler  (compile the timeline → Premiere FCP7 XML;
-                                          DETERMINISTIC — the plan leaves no decision to
-                                          make, so no LLM is invoked and no tokens spent)
-
-The Streamlit UI is a thin presentation layer that calls these functions in order; the
-code path, the architecture diagram, and the thesis description are therefore the same
-(no "documented supervisor, actually bypassed by the UI" discrepancy).
-
-HUMAN-IN-THE-LOOP (audit C-09): there is ONE HITL mechanism — the editor's direct
-control in the UI. The **curation checkboxes** decide which candidate clips participate,
-and the explicit **Export** button is what triggers Delivery. There is no separate
-LangGraph ``interrupt()`` approval gate (the old one was dead code — it fired on state
-fields no agent wrote, and the UI never resumed it), so it has been removed rather than
-left as a misleading no-op.
-"""
+"""Production Orchestrator — explicit four-stage MAPO pipeline."""
 
 import hashlib
 import json
@@ -37,11 +12,6 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 from app.models.state import ProductionState
 
-# The four agents of the linear pipeline:
-#   Ingest    = scan, classify, catalogue footage (build the knowledge base)
-#   Search    = retrieval-only candidate search
-#   Selection = intent-aware editorial orchestration (edit timeline)
-#   Delivery  = compile the timeline into a Premiere-importable project (FCP7 XML)
 from app.agents.ingest_agent import (
     ingest_assistant, ingest_tool_node, should_continue_ingest,
     reset_last_ingest_result, get_last_ingest_result,
@@ -53,11 +23,7 @@ from app.agents.selection_agent import (
     selection_assistant, selection_tool_node, should_continue_selection,
 )
 from app.agents.delivery_agent import (
-    delivery_assistant, delivery_tool_node, should_continue_delivery,
-    reset_last_delivery_result, get_last_delivery_result,
-    # The deterministic compile core — Delivery needs no LLM, so run_delivery calls it
-    # directly rather than paying tokens for a model that only relays the plan.
-    compile_plan,
+    compile_plan, reset_last_delivery_result, get_last_delivery_result,
 )
 from app.services.retrieval_service import (hybrid_search, expand_query_terms,
                                             hoist_orientation)
@@ -99,23 +65,16 @@ def _build_agent_graph(name, assistant_fn, tool_node, should_continue_fn):
 ingest_agent = _build_agent_graph("ingest", ingest_assistant, ingest_tool_node, should_continue_ingest)
 search_agent = _build_agent_graph("search", search_assistant, search_tool_node, should_continue_search)
 selection_agent = _build_agent_graph("selection", selection_assistant, selection_tool_node, should_continue_selection)
-delivery_agent = _build_agent_graph("delivery", delivery_assistant, delivery_tool_node, should_continue_delivery)
 
-logger.info("All 4 sub-agent graphs compiled (fixed-pipeline orchestration, no supervisor).")
-
-
-# ASCII-only log lines below: the Windows console codec (gbk) cannot encode emoji/arrows.
+# Delivery is deterministic and does not require an agent graph.
+logger.info("3 sub-agent graphs compiled + deterministic delivery compiler "
+            "(fixed-pipeline orchestration, no supervisor).")
 
 
 # ── Shared state / config helpers ─────────────────────────────────────────────
 
-
 def _base_state(project_id, extra: dict | None = None) -> dict:
-    """A fresh ProductionState for one stage invocation.
-
-    project_id and footage_dir are carried ON state (not via a mutated global), so
-    concurrent sessions stay isolated (audit H-07).
-    """
+    """Create isolated initial state for one pipeline stage."""
     state: dict = {
         "project_id": str(project_id),
         "messages": [],
@@ -132,28 +91,7 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
 
 
 def _config(stage: str, user_id, project_id, tag: str | None = None) -> dict:
-    """A per-INVOCATION runnable config: a FRESH thread id plus the user id.
-
-    Every stage call gets its own checkpointer thread. Each stage invocation is already
-    self-contained — ``_base_state`` seeds ``messages`` with the one HumanMessage carrying
-    everything the agent needs — so there is nothing to gain from replaying an earlier
-    run's history, and two concrete things to lose:
-
-      * A CORRUPTED history is replayed forever. When a tool call raises (the parallel
-        ToolNode threads hitting the shared-SQLite race, for example), the checkpoint keeps
-        the assistant message whose ``tool_calls`` never got their ToolMessages. Re-running
-        the stage on that same thread re-sends that history and OpenAI rejects the whole
-        request: "An assistant message with 'tool_calls' must be followed by tool messages
-        responding to each 'tool_call_id'". The stage then stays broken until the process
-        restarts, even though the original bug is gone.
-      * History grows without bound. Re-running Selection with a new intent used to append
-        to the previous run's transcript — stale timelines in context, and the token bill
-        for them.
-
-    ``tag`` is an optional human-readable discriminator (e.g. a query digest) kept in the
-    thread id for log/debug traceability only; it never makes two invocations share a
-    thread.
-    """
+    """Create a fresh checkpoint thread for one stage invocation."""
     parts = [p for p in ("mapo", stage, str(user_id), str(project_id), tag,
                          uuid.uuid4().hex[:12]) if p]
     return {"configurable": {
@@ -170,30 +108,17 @@ def _pid(project_id) -> int:
 
 
 def _qhash(query: str) -> str:
-    """A stable short digest of a query, used only to LABEL that search's agent thread.
-
-    Every stage invocation already gets its own thread (see ``_config``), so this is a
-    debugging aid — it makes a search's checkpoint thread identifiable in the logs — not
-    the isolation mechanism."""
+    """Return a short digest used to identify a search invocation."""
     return hashlib.md5((query or "").encode("utf-8")).hexdigest()[:8]
 
 
-# Timeline-planning tools whose ToolMessage carries the structured plan Delivery consumes.
-# There is one planner per user-facing editing mode — CLIP ASSEMBLY and MOMENT ASSEMBLY —
-# and both emit the same fenced ```json plan shape, so the extractor accepts either
-# (audit H-03) and Delivery compiles them identically.
+# ── Structured output extraction ─────────────────────────────────────────────
+
 _PLAN_TOOLS = (None, "plan_clip_assembly", "plan_moment_assembly")
 
 
 def _extract_plan(messages) -> dict | None:
-    """Pull the structured timeline plan from a planning TOOL output.
-
-    Reads the plan out of the plan_clip_assembly / plan_moment_assembly ToolMessage — the
-    tool's own output, which the model cannot rewrite — rather than scraping the
-    assistant's prose. So the model reformatting its narration can never corrupt or hide
-    the plan Delivery receives (audit H-03). Returns the most recent structured plan, or
-    ``None`` if none was produced.
-    """
+    """Extract the latest structured timeline plan from a planning tool output."""
     for m in reversed(messages):
         if not isinstance(m, ToolMessage):
             continue
@@ -210,20 +135,11 @@ def _extract_plan(messages) -> dict | None:
     return None
 
 
-# Search tools whose ToolMessage carries the structured candidate list the UI renders.
 _SEARCH_TOOLS = (None, "search_catalogue", "list_all_shots")
 
 
 def _extract_candidates(messages) -> list[dict] | None:
-    """Pull the structured candidate list from the search TOOL output.
-
-    Mirrors ``_extract_plan``: reads the fenced ```json array the ``search_catalogue`` /
-    ``list_all_shots`` ToolMessage carries (the tool's OWN output, which the model cannot
-    rewrite), so the model reformatting its narration can never corrupt or hide the
-    candidates the UI renders. Returns the most recent list (possibly empty, when the
-    search genuinely matched nothing), or ``None`` when the agent never ran a search tool —
-    in which case ``run_search`` falls back to deterministic direct retrieval.
-    """
+    """Extract the latest structured candidate list from a search tool output."""
     for m in reversed(messages):
         if not isinstance(m, ToolMessage):
             continue
@@ -240,16 +156,11 @@ def _extract_candidates(messages) -> list[dict] | None:
     return None
 
 
-# ── The four pipeline stages (the ONE real orchestration path) ─────────────────
+# ── Pipeline stages ─────────────────────────────────────────────────────────────
 
 
 def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
-    """① Ingest — invoke the Ingest sub-agent to build the catalogue.
-
-    The footage directory is passed on state (``footage_dir``), never by mutating a
-    global setting (audit H-07). Returns ``(narration, IngestResult | None)``; the
-    caller unlocks later stages ONLY on a real structured success (audit C-08).
-    """
+    """① Ingest — analyse footage and build the project catalogue."""
     reset_last_ingest_result()
     msg = (f"Run ingest analysis on the footage directory '{directory}' for project "
            f"{project_id}. Call the ingest_footage tool now to build the catalogue.")
@@ -262,13 +173,7 @@ def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
 
 
 def _search_direct(query: str, project_id) -> list[dict]:
-    """Deterministic retrieval — query understanding (orientation hoist + synonym
-    expansion) feeding ``hybrid_search`` directly, with no LLM agent in the loop.
-
-    This is the fallback the Search stage uses when the Search Agent is unavailable
-    (no API key), errors, or completes a turn without actually searching — so the UI
-    always receives candidates.
-    """
+    """Run deterministic hybrid retrieval for a search query."""
     residual, orientation = hoist_orientation(query, None)
     core, related = (expand_query_terms(residual)
                      if residual and residual.strip() else ("", ""))
@@ -278,21 +183,7 @@ def _search_direct(query: str, project_id) -> list[dict]:
 
 
 def run_search(query: str, project_id, user_id="editor") -> list[dict]:
-    """② Search — invoke the Search sub-agent to retrieve candidate clips.
-
-    The Search Agent translates the natural-language query into a structured
-    ``search_catalogue`` call; the structured candidate list is read back from that tool's
-    ToolMessage (via ``_extract_candidates``), NOT from the model's prose, so the UI
-    receives the exact ``hybrid_search`` rows it renders. Retrieval stays CLIP-level: the
-    returned unit is always a whole clip (choosing a moment within it is Selection's job).
-    Recall is event-aware inside ``hybrid_search`` — a clip surfaces when a moment inside
-    it matches, attached as a ``matched_event`` hint — but it never returns a moment and
-    never ranks a "best" clip.
-
-    Degrades gracefully (audit-consistent with the rest of the system): with no API key,
-    an agent error, or an agent turn that never searched, it falls back to the
-    deterministic ``_search_direct`` path so the UI always gets results.
-    """
+    """② Search — retrieve candidate clips using the search agent or fallback."""
     if settings.OPENAI_API_KEY:
         try:
             config = _config("search", user_id, project_id, _qhash(query))
@@ -308,7 +199,7 @@ def run_search(query: str, project_id, user_id="editor") -> list[dict]:
 
 
 def _normalise_editing_mode(mode) -> str:
-    """Coerce a UI mode label ("Moment Assembly") to its canonical id, defaulting to clip."""
+    """Convert a UI editing mode to its canonical identifier."""
     raw = str(mode or "").strip().lower().replace(" ", "_")
     return MODE_MOMENT if raw == MODE_MOMENT else MODE_CLIP
 
@@ -317,30 +208,7 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
                   editing_mode: str = MODE_CLIP,
                   target_seconds: float | None = None,
                   aspect_ratio: str = "") -> tuple[str, dict | None]:
-    """③ Selection — invoke the Selection sub-agent on the curated clips.
-
-    Returns ``(narration, structured_plan | None)``. The structured plan is read from the
-    planning tool's output (audit H-03), never from the model's prose.
-
-    The EDITOR chooses the mode in the UI — there are exactly two, and they differ only in
-    the unit of editing:
-
-      * ``clip_assembly`` — whole clips at their original length, no trimming and no
-        duration control (``target_seconds`` does not apply and is dropped here).
-      * ``moment_assembly`` — moments inside clips, with an OPTIONAL target duration
-        applied as an optimisation over the moments the agent already chose.
-
-    ``aspect_ratio`` is the editor's OUTPUT specification ("16:9", "9:16", "1:1" or a
-    "4:3", "3:4" or "1:1") — an explicit user input, never inferred from the intent.
-    Selection may let it influence WHICH footage it picks, but never modifies media; the
-    label is stamped onto the plan so Delivery can adapt the timeline to that frame. An
-    unusable value raises ``InvalidAspectRatio`` rather than silently delivering a
-    different frame than the one requested.
-
-    The mode, target and aspect ratio ride on state (``editing_mode`` / ``target_seconds``
-    / ``aspect_ratio``) as well as in the message, so the Selection tools enforce the
-    editor's choices rather than trusting the model to honour them.
-    """
+    """③ Selection — create an ordered editorial timeline from curated clips."""
     mode = _normalise_editing_mode(editing_mode)
     aspect = normalise_aspect_label(aspect_ratio)   # raises on an unusable value
     target = None
@@ -419,43 +287,13 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
 
 def run_delivery(plan: dict, project_id, user_id,
                  sequence_name: str = "MAPO Edit"):
-    """④ Delivery — compile the Selection timeline into a Premiere project. NO LLM.
-
-    REQUIRES the structured plan from Selection (audit H-04): Delivery is driven ONLY by
-    the explicit ordered segments the Selection Agent produced. There is NO fallback to
-    the Bin/media-pool order — without a structured plan there is no defined edit order
-    to compile, so this raises rather than invent one.
-
-    DETERMINISTIC BY DESIGN — this is the one stage with no model in the loop. Delivery is
-    a pure compiler: the plan already fixes what to compile, in what order, with which
-    trims, at which frame, so there is no decision left for an LLM to make. It therefore
-    calls ``compile_plan`` (the Delivery Agent's own compile core) directly instead of
-    invoking the ReAct graph. Routing it through the agent used to cost ~20-30k tokens per
-    export for zero decisions: the plan JSON went into the prompt, the model had to echo it
-    back verbatim as the tool argument, and then the whole thing was re-sent (prompt + tool
-    call + tool result) for a closing narration. That also made a long plan corruptible by
-    the model. The ``delivery_agent`` graph and its tools are still built and exported
-    (same three-part contract as the other agents), so an agent-driven compile remains
-    available — the production path just does not need one.
-
-    The plan also carries the editor's OUTPUT ASPECT RATIO, read straight out of the plan
-    dict, so the delivery frame is exactly the one the editor specified in the UI.
-
-    ``user_id`` is accepted for signature symmetry with the other stages; with no agent
-    invocation there is no per-user thread to key.
-
-    Returns ``(summary_text, DeliveryResult | None)``. The second value is the COMPILER's
-    own record of what it wrote (paths, raster, clip count) — never parsed out of prose —
-    so the UI can act on the real artefact (reveal it on disk) only when a compile
-    genuinely succeeded. Mirrors ``run_ingest``'s ``IngestResult``.
-    """
+    """④ Delivery — compile the Selection plan into a Premiere project."""
     if not (plan and plan.get("segments")):
         raise ValueError(
             "Delivery requires a structured timeline plan (ordered segments) from "
             "Selection. Generate the edit timeline in ③ Selection first — there is no "
             "implicit media-pool-order fallback.")
-    # Clear first: a stale success from an earlier export must never be mistaken for this
-    # run's outcome if this run refuses or crashes before writing anything.
+
     reset_last_delivery_result()
     summary = compile_plan(plan, sequence_name=sequence_name, project_id=_pid(project_id))
     return summary, get_last_delivery_result()

@@ -1,31 +1,17 @@
-"""MAPO — Streamlit UI (the only operating entry point).
+"""MAPO — Streamlit UI.
 
-Layout: the Bin (media pool) lives in the LEFT SIDEBAR, under the footage folder,
-because it is the shared data pool for the whole workflow; the workflow runs full-width
-in the main area:
+The UI is a thin presentation layer over the four-stage pipeline:
 
-    SIDEBAR  ⚙️ settings · 📁 footage folder · 🗂️ Bin (Select-all · [checkbox | ▶] per clip)
-    MAIN     ① Ingest → ② Search → ③ Selection → ④ Deliver → 🛠️ Debug log (collapsed)
+    Sidebar: Settings · Footage · Media Pool
+    Main:    ① Ingest → ② Search → ③ Selection → ④ Deliver
 
-Each stage renders its OWN output inline (the timeline under ③, the export result under
-④); the running agent transcript is demoted to a collapsed debug log at the bottom.
-
-Selection model:
-    - The Bin's checkboxes ARE the selection (single source of truth); "Select all"
-      ticks/unticks the whole pool in one click.
-    - Search is a decision aid: it ranks matches into 🟡 suggested / ⚪ neutral /
-      🔴 low and shows a reason + thumbnail; its ➕/➖ ticks/unticks the clip in the Bin,
-      and each tier has ➕/➖ "all" buttons for adding a whole tier in one click.
-    - Selection treats the ticked Bin clips as CANDIDATES and orchestrates them into an
-      edit timeline in one of two modes — 🎞️ Clip Assembly (complete clips, original
-      durations, no target duration) or 🎯 Moment Assembly (moments inside clips, with an
-      optional target duration). The agent decides what actually belongs. The Output
-      aspect ratio picked here is a delivery SPEC that rides along to ④.
-    - Deliver compiles that timeline into a Premiere Pro–importable project (FCP7 XML),
-      preserving clip order exactly — a pure export step, no re-editing.
+The Media Pool is the single source of truth for selected clips.
+Selection produces a structured timeline, and Delivery deterministically
+compiles that plan into a Premiere Pro–compatible FCP7 XML project.
 
 Launch:
-    python main.py   (or)   streamlit run app/ui/streamlit_app.py
+    python main.py
+    streamlit run app/ui/streamlit_app.py
 """
 
 import base64

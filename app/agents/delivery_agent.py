@@ -1,60 +1,17 @@
-"""Delivery Agent — compile the edit timeline into a Premiere Pro project file.
-
-The FINAL stage of the MAPO pipeline (Ingest → Search → Selection → **Delivery**).
-
-It takes the ordered edit timeline the Selection Agent produced — laid out in whatever
-structure fit the editor's intent (no fixed narrative arc) — and compiles it, in that
-exact order, into a Premiere Pro–importable project: an **FCP7 XML** (``xmeml`` v5)
-document that Adobe Premiere Pro imports natively (File ▸ Import), plus a neutral JSON
-intermediate.
-
-STRICT ROLE — this agent is a PROJECT COMPILER, not an editor:
-    - It NEVER re-orders, ranks, or drops clips. The order it is given IS the timeline
-      order (establishing → buildup → climax → reaction → ending, as laid out upstream).
-    - It NEVER fabricates media. Every clip must resolve to a real catalogued file; each
-      is referenced by its ABSOLUTE path. If any identifier does not resolve, it refuses
-      rather than invent a filename.
-    - Time is mapped from real durations: unless explicit in/out points are supplied, the
-      full clip is used and clips are laid end-to-end (a straight assembly).
-    - Track layout: V1 = video, A1 = original/ambient audio, A2 = secondary audio only
-      when a file genuinely carries a second audio stream.
-
-The heavy lifting (XML/JSON generation) lives in
-``app.services.premiere_export_service``; the tools here just resolve the ordered clips
-against the catalogue and hand them to the compiler.
-"""
+"""Delivery — compile the edit timeline into a Premiere Pro project file."""
 
 import json
-from typing import Annotated
-
-from langchain_core.messages import SystemMessage
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode, InjectedState
 
 from app.models.schemas import DeliveryResult
-from app.models.state import ProductionState
-from app.services.openai_service import llm
-from app.services.catalogue_resolver import (
-    resolve_one, resolve_ordered, AmbiguousIdentifier,
-)
-from app.services.premiere_export_service import (
-    build_timeline, compile_project, InvalidAspectRatio,
-)
+from app.services.catalogue_resolver import resolve_one, AmbiguousIdentifier
+from app.services.premiere_export_service import compile_project, InvalidAspectRatio
 from app.services.ffmpeg_service import count_audio_streams
 from app.utils.logger import get_logger
 
 logger = get_logger("delivery_agent")
 
 
-# ── Structured result registry ─────────────────────────────────────────────────
-#
-# The compile tools return prose for the ReAct loop, but the UI needs the WRITTEN paths
-# (to reveal the file on disk / offer a download) and the sequence shape. Parsing them
-# back out of the agent's narration would trust model prose, so — exactly as the Ingest
-# stage does with ``IngestResult`` — the tool records a structured ``DeliveryResult`` here
-# and the orchestrator reads it after the run. In-process, single session, most-recent-run.
-
+# Store the result of the most recent delivery run for the UI/orchestrator.
 _LAST_DELIVERY_RESULT: DeliveryResult | None = None
 
 
@@ -65,32 +22,27 @@ def _record_delivery_result(result: DeliveryResult) -> DeliveryResult:
 
 
 def reset_last_delivery_result() -> None:
-    """Clear the recorded result before a run, so a stale success can never be re-read."""
+    """Clear the previous delivery result."""
     global _LAST_DELIVERY_RESULT
     _LAST_DELIVERY_RESULT = None
 
 
 def get_last_delivery_result() -> DeliveryResult | None:
-    """Structured outcome of the most recent compile this session, or ``None``."""
+    """Return the result of the most recent delivery run."""
     return _LAST_DELIVERY_RESULT
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-
 def _refuse(message: str, project_id: int | None = None) -> str:
-    """Record a FAILED compile and hand the refusal text back to the ReAct loop.
-
-    Recording the failure matters as much as recording the success: it stops the UI from
-    offering "open the exported file" for a compile that never wrote one.
-    """
+    """Record a failed delivery and return the error message."""
     _record_delivery_result(DeliveryResult(status="failure", project_id=project_id,
                                            message=message))
     return message
 
 
 def _record_success(result: dict, project_id: int, message: str) -> None:
-    """Record a written compile — real paths and the sequence shape the compiler reported."""
+    """Store structured information about a successful export."""
     seq = result["timeline"]["sequence"]
     _record_delivery_result(DeliveryResult(
         status="success",
@@ -110,65 +62,15 @@ def _record_success(result: dict, project_id: int, message: str) -> None:
 
 
 def _as_pid(value) -> int:
-    """Coerce a project id to an int, defaulting to 1 when it is missing/unusable."""
+    """Convert project ID to int, defaulting to 1."""
     try:
         return int(value)
     except (TypeError, ValueError):
         return 1
 
 
-def _pid_from_state(state) -> int:
-    """Current project id from the injected graph state (defaults to 1).
-
-    The model never supplies this — the ToolNode injects it from ``ProductionState`` —
-    so Delivery resolves media, and names its output file, ONLY within the current
-    project (audit C-04). Cross-project or ambiguous identifiers cannot be compiled.
-    """
-    return _as_pid((state or {}).get("project_id"))
-
-
-def _to_compiler_clips(rows: list[dict], roles: list[str] | None,
-                       probe_audio: bool) -> list[dict]:
-    """Shape resolved catalogue rows into the compiler's clip dicts (real data only)."""
-    clips = []
-    for i, r in enumerate(rows):
-        streams = None
-        if probe_audio and r.get("file_path"):
-            n = count_audio_streams(r["file_path"])
-            # Trust the probe only when it finds something; otherwise fall back to the
-            # catalogue's has_audio flag (never invent a second stream).
-            streams = n if n > 0 else (1 if r.get("has_audio") else 0)
-        clips.append({
-            "file_path": r["file_path"],
-            "shot_id": r.get("shot_id"),
-            "duration_seconds": r.get("duration_seconds") or 0.0,
-            "fps": r.get("fps") or None,
-            "width": r.get("width") or None,
-            "height": r.get("height") or None,
-            "has_audio": bool(r.get("has_audio")),
-            "audio_streams": streams,
-            "audio_channels": r.get("audio_channels") or None,
-            "audio_sample_rate": r.get("audio_sample_rate") or None,
-            "audio_bit_depth": r.get("audio_bit_depth") or None,
-            "role": (roles[i] if roles and i < len(roles) else ""),
-        })
-    return clips
-
-
-def _parse_roles(roles: str | None, count: int) -> list[str] | None:
-    if not roles:
-        return None
-    parsed = [r.strip() for r in roles.split(",")]
-    return parsed[:count]
-
-
 def _frame_summary(seq: dict) -> str:
-    """One line describing the delivery frame and how clips were fitted into it.
-
-    Reports the requested aspect ratio, the raster, and how many clips end up
-    letterboxed/pillarboxed — the honest consequence of scaling to fit rather than
-    cropping. Nothing here is a creative choice; it is the compiler stating what it did.
-    """
+    """Summarise the output frame and any fit adjustments."""
     parts = [f"{seq['width']}x{seq['height']}"]
     if seq.get("aspect_ratio"):
         parts.insert(0, f"frame {seq['aspect_ratio']}")
@@ -184,229 +86,25 @@ def _frame_summary(seq: dict) -> str:
     return line
 
 
-# ── Tools ──────────────────────────────────────────────────────────────────────
-
-
-@tool
-def preview_delivery_timeline(ordered_identifiers: str, roles: str = None,
-                              sequence_name: str = "MAPO Edit",
-                              aspect_ratio: str = None,
-                              state: Annotated[dict, InjectedState] = None) -> str:
-    """Dry-run the timeline compile: resolve the ordered clips and show the layout.
-
-    Use this BEFORE compiling to confirm every clip resolves and to see the computed
-    in/out points, sequence timestamps, and track assignment — WITHOUT writing a file.
-    Order is preserved exactly as given. Resolution is scoped to the current project.
-
-    Args:
-        ordered_identifiers: Comma-separated shot IDs and/or file names/paths IN
-            TIMELINE ORDER (first = first clip on the timeline). This must be the exact
-            order the Selection Agent laid out — do NOT re-sort.
-        roles: Optional comma-separated free-form timeline-step labels aligned 1:1 with
-            the clips (e.g. "cold open, hero moment, outro" — whatever the Selection
-            Agent used, if anything). Purely descriptive; never reorders.
-        sequence_name: Name for the sequence.
-        aspect_ratio: The editor's requested OUTPUT aspect ratio ("16:9", "9:16", "1:1",
-            "4:3", "3:4" or "1:1"). Pass ONLY the value the editor actually specified — never
-            invent one, and never infer one from the editing intent. Omit it when none was
-            given. Clips are scaled to FIT this frame (aspect preserved, no crop, no
-            stretch), so the preview shows which clips will be letterboxed/pillarboxed.
-
-    Returns:
-        A grounded, numbered preview of the timeline, or a clear error listing any
-        identifiers that did not resolve (or that were ambiguous).
-    """
-    project_id = _pid_from_state(state)
-    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
-    rows, problems = resolve_ordered(project_id, tokens)
-    if problems:
-        return ("Cannot build the timeline — resolve these identifiers first (no media "
-                "will be fabricated):\n"
-                + "\n".join(f"  • {t}: {r}" for t, r in problems))
-    if not rows:
-        return "No clips provided. Give the ordered clip list from the Selection Agent."
-
-    role_list = _parse_roles(roles, len(rows))
-    clips = _to_compiler_clips(rows, role_list, probe_audio=False)
-    try:
-        timeline = build_timeline(clips, sequence_name=sequence_name,
-                                  aspect_ratio=aspect_ratio)
-    except InvalidAspectRatio as e:
-        return f"Cannot build the timeline — unusable output aspect ratio: {e}"
-
-    seq = timeline["sequence"]
-    lines = [
-        f"🎬 Timeline preview — {seq['name']}",
-        f"   {seq['clip_count']} clips · {seq['total_seconds']:.1f}s "
-        f"· {seq['timebase']} fps",
-        f"   Output: {_frame_summary(seq)}",
-        "",
-    ]
-    for c in timeline["clips"]:
-        role = f"[{c['role']}] " if c["role"] else ""
-        audio = ("A1+A2" if c["audio_streams"] >= 2
-                 else "A1" if c["audio_streams"] == 1 else "no audio")
-        fit = c["frame_fit"]
-        fit_note = f"  · {fit['note']}" if fit["mode"] not in ("exact", "unknown") else ""
-        lines.append(
-            f"  {c['order']}. {role}{c['name']}  "
-            f"@ {c['seq_start_seconds']:.1f}s–{c['seq_end_seconds']:.1f}s  "
-            f"(in {c['in_seconds']:.1f}s / out {c['out_seconds']:.1f}s)  "
-            f"· V1 + {audio}{fit_note}"
-        )
-    lines.append("")
-    lines.append("Order is exactly as provided. Call compile_premiere_project to write the file.")
-    return "\n".join(lines)
-
-
-@tool
-def compile_premiere_project(ordered_identifiers: str, roles: str = None,
-                             sequence_name: str = "MAPO Edit",
-                             aspect_ratio: str = None,
-                             state: Annotated[dict, InjectedState] = None) -> str:
-    """Compile the ordered timeline into a Premiere-importable FCP7 XML (+ JSON).
-
-    Resolves each identifier to its real catalogued clip, maps time sequentially from
-    the measured durations, assigns tracks (V1 video, A1 original audio, A2 only when a
-    clip has a genuine second audio stream), and writes an ``xmeml`` v5 XML that Adobe
-    Premiere Pro imports natively — plus a JSON intermediate. Order is PRESERVED exactly;
-    no clip is re-ranked or dropped. Media resolution and the output filename are both
-    scoped to the current project.
-
-    Args:
-        ordered_identifiers: Comma-separated shot IDs and/or file names/paths IN
-            TIMELINE ORDER (first = first clip). Use the exact order from the Selection
-            Agent's timeline — never re-sort.
-        roles: Optional comma-separated free-form timeline-step labels aligned 1:1 with
-            the clips (recorded as clip comments; descriptive only).
-        sequence_name: Name for the Premiere sequence.
-        aspect_ratio: The editor's requested OUTPUT aspect ratio ("16:9", "9:16", "1:1",
-            "4:3", "3:4" or "1:1"). Pass ONLY the value the editor actually specified — never
-            invent one and never infer one from the editing intent. Omit it when none was
-            given. The sequence is built at that frame and each clip is SCALED TO FIT it
-            with its own aspect preserved (letterbox/pillarbox where the ratios differ —
-            never cropped, never stretched).
-
-    Returns:
-        The paths to the written .xml (Premiere import) and .json files plus a summary,
-        or a clear error naming any identifiers that did not resolve (or were ambiguous).
-    """
-    project_id = _pid_from_state(state)
-    tokens = [t.strip() for t in (ordered_identifiers or "").split(",") if t.strip()]
-    rows, problems = resolve_ordered(project_id, tokens)
-    if problems:
-        return _refuse("Refusing to compile — resolve these identifiers first (every media "
-                       "reference must be a real catalogued clip):\n"
-                       + "\n".join(f"  • {t}: {r}" for t, r in problems), project_id)
-    if not rows:
-        return _refuse("No clips provided. Supply the ordered clip list from the Selection "
-                       "Agent.", project_id)
-
-    role_list = _parse_roles(roles, len(rows))
-    clips = _to_compiler_clips(rows, role_list, probe_audio=True)
-
-    try:
-        result = compile_project(clips, sequence_name=sequence_name,
-                                 project_id=project_id, aspect_ratio=aspect_ratio,
-                                 write=True)
-    except InvalidAspectRatio as e:
-        return _refuse(f"Refusing to compile — unusable output aspect ratio: {e}", project_id)
-    except Exception as e:  # keep the ReAct loop alive with a grounded error
-        logger.error(f"Compile failed: {e}")
-        return _refuse(f"Compile failed: {e}", project_id)
-
-    seq = result["timeline"]["sequence"]
-    order_summary = " → ".join(
-        f"{c['order']}.{(c['role'] + ':') if c['role'] else ''}{c['name']}"
-        for c in result["timeline"]["clips"]
-    )
-    summary = (
-        "✅ Premiere project compiled (FCP7 XML — import via File ▸ Import in Premiere Pro).\n"
-        f"  XML : {result['xml_path']}\n"
-        f"  JSON: {result['json_path']}\n"
-        f"  Sequence '{seq['name']}': {seq['clip_count']} clips · "
-        f"{seq['total_seconds']:.1f}s · {seq['timebase']} fps\n"
-        f"  Output: {_frame_summary(seq)}\n"
-        f"  Timeline order (preserved): {order_summary}"
-    )
-    _record_success(result, project_id, f"{seq['clip_count']} clips compiled.")
-    return summary
-
-
-@tool
-def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edit",
-                              state: Annotated[dict, InjectedState] = None) -> str:
-    """Compile STRUCTURED timeline segments (from the Selection plan) into Premiere FCP7 XML.
-
-    This is the preferred delivery path: it consumes the Selection Agent's timeline plan
-    directly, so in/out points and order are honoured exactly. Each segment already
-    carries its file, in_point, out_point and optional label — this tool resolves the real
-    media, applies those points, and writes the XML (+ JSON). It NEVER re-orders, drops,
-    or re-times a segment. The plan's editing mode (clip_assembly / moment_assembly)
-    changes nothing here — both compile identically. Media resolution and the output
-    filename are scoped to the current project.
-
-    OUTPUT ASPECT RATIO: if the plan carries an ``aspect_ratio``, that is the editor's
-    delivery spec and it is read straight from the JSON (you never supply or override it).
-    The sequence is built at that frame and every clip is SCALED TO FIT it with its own
-    aspect preserved — never stretched, never auto-cropped; where the ratios differ the
-    whole image is kept and the spare frame area becomes letterboxing/pillarboxing.
-
-    Args:
-        segments_json: JSON — either the full plan object from the Selection planner
-            (``{"mode":..., "aspect_ratio":..., "segments":[...]}``) or a bare list of
-            segment objects. Each segment needs ``file_path`` or ``shot_id``; optional
-            ``in_point`` / ``out_point`` (seconds) and ``label``.
-        sequence_name: Name for the Premiere sequence.
-
-    Returns:
-        The written .xml / .json paths + a summary (including the delivery frame and how
-        many clips are letterboxed/pillarboxed), or a clear error naming any segment whose
-        media did not resolve, was ambiguous, or was flagged invalid upstream.
-    """
-    return compile_plan(segments_json, sequence_name=sequence_name,
-                        project_id=_pid_from_state(state))
-
+# ── Compile ────────────────────────────────────────────────────────────────────
 
 def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str:
-    """Compile a Selection timeline plan into the Premiere project — the DETERMINISTIC core.
-
-    This is the whole of the Delivery stage: resolve each segment's media inside the
-    project, honour the plan's order and in/out points exactly, take the output aspect
-    ratio from the plan, write the FCP7 XML + JSON, and record a ``DeliveryResult``. It is
-    pure Python — no LLM, no tokens — because compiling a finished timeline involves no
-    decision: the plan already says what to compile, in what order, at what frame.
-
-    It is called two ways, and both run this identical path:
-      * ``run_delivery`` in the orchestrator calls it DIRECTLY (the production path),
-      * the ``compile_timeline_segments`` tool delegates to it, so the Delivery ReAct
-        agent still works if an agent-driven run is ever wanted.
-
-    Args:
-        plan: The Selection plan — a dict (``{"mode":…, "aspect_ratio":…, "segments":[…]}``),
-            a bare list of segment dicts, or the JSON string of either.
-        sequence_name: Name for the Premiere sequence.
-        project_id: The project whose catalogue every segment must resolve within.
-
-    Returns:
-        A human-readable summary of what was written, or a refusal explaining exactly
-        which segment(s) could not be compiled. Never fabricates a media reference.
-    """
+    """Compile a Selection plan into a Premiere Pro project."""
     project_id = _as_pid(project_id)
+
+    # Accept either a dict/list or a JSON representation of the plan.
     if isinstance(plan, (str, bytes)):
         try:
             data = json.loads(plan)
         except (json.JSONDecodeError, TypeError) as e:
-            return _refuse(f"Could not parse segments_json: {e}. Pass the Selection plan JSON "
-                           "verbatim.", project_id)
+            return _refuse(f"Could not parse the timeline plan JSON: {e}", project_id)
     else:
         data = plan
     segments = data.get("segments") if isinstance(data, dict) else data
     if not segments or not isinstance(segments, list):
         return _refuse("No segments to compile. Provide the Selection plan JSON.", project_id)
 
-    # C-06: refuse any segment the planner flagged invalid (real footage but nothing left
-    # after trimming). Never silently emit or repair it.
+    # Reject invalid segments rather than silently repairing them.
     invalid = [s for s in segments if s.get("valid") is False]
     if invalid:
         listing = "\n".join(
@@ -442,7 +140,6 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
             "audio_sample_rate": row.get("audio_sample_rate") or None,
             "audio_bit_depth": row.get("audio_bit_depth") or None,
             "role": seg.get("label") or "",
-            # Honour the plan's trims. out_point None → compiler uses the full clip.
             "in_point": seg.get("in_point"),
             "out_point": seg.get("out_point"),
         })
@@ -451,8 +148,6 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
         return _refuse("Refusing to compile — these segments matched no catalogued clip: "
                        f"{unresolved}. Every media reference must be real.", project_id)
 
-    # The delivery frame comes from the PLAN (the editor's UI spec), not from the model —
-    # so the exported sequence is always the aspect ratio that was actually requested.
     aspect_ratio = data.get("aspect_ratio") if isinstance(data, dict) else None
 
     try:
@@ -467,8 +162,6 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
         return _refuse(f"Compile failed: {e}", project_id)
 
     seq = result["timeline"]["sequence"]
-    # Cosmetic only — Delivery compiles both editing modes identically (order + in/out
-    # points preserved); the mode merely tells the editor how the timeline was generated.
     mode = (data.get("mode") if isinstance(data, dict) else None) or "clip_assembly"
     mode = mode.replace("_", " ")
     order_summary = " → ".join(
@@ -489,87 +182,3 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
     _record_success(result, project_id,
                     f"{seq['clip_count']} segments compiled from the {mode} timeline.")
     return summary
-
-
-# ── Agent Assembly ───────────────────────────────────────────────────────────
-
-delivery_tools = [
-    preview_delivery_timeline,
-    compile_premiere_project,
-    compile_timeline_segments,
-]
-
-llm_with_delivery = llm.bind_tools(delivery_tools)
-delivery_tool_node = ToolNode(delivery_tools)
-
-DELIVERY_PROMPT = """You are the DELIVERY AGENT in the MAPO system — the FINAL stage
-(Ingest → Search → Selection → Delivery). You are a PROJECT COMPILER, not an editor.
-
-INPUT: an ordered edit timeline from the Selection Agent — a sequence of clips (by file
-name or shot id) laid out as ordered timeline steps. The structure is whatever fit the
-editor's intent (it is NOT a fixed narrative arc), and each step may or may not carry a
-free-form label. Your job is to turn that exact sequence into a Premiere Pro–importable
-project file, in exactly the order given.
-
-HARD RULES:
-1. PRESERVE ORDER EXACTLY. The order the Selection Agent gives you IS the timeline order.
-   NEVER re-rank, re-sort, or drop a clip. Pass the clips to the tools in that same order.
-2. NEVER FABRICATE. Only ever compile clips that resolve to a real catalogued file. If
-   an identifier does not resolve, the tool will tell you — report it and ask the editor
-   to fix the list. Do NOT invent file names, durations, or timings.
-3. You do NOT make creative choices (no trimming, no reordering, no quality judgement).
-   Time mapping uses the full measured clip duration laid end-to-end unless explicit
-   in/out points are provided.
-4. OUTPUT ASPECT RATIO is the editor's delivery SPEC. It arrives with the timeline (in the
-   plan's `aspect_ratio` field, which `compile_timeline_segments` reads by itself). NEVER
-   invent one, never infer one from the edit's content, and never change the one you were
-   given. If none was specified, omit it and the frame is inferred from the footage.
-   You ADAPT the timeline to that frame, non-destructively: every clip is SCALED TO FIT
-   with its own aspect preserved. Footage is NEVER stretched to fill the frame and NEVER
-   auto-cropped to match it — where the source and target ratios differ the whole image is
-   kept and the leftover frame area becomes letterboxing (bars top/bottom) or
-   pillarboxing (bars left/right). The tools report how many clips that affects; pass it on
-   to the editor plainly rather than presenting it as a problem or "fixing" it by cropping.
-
-WORKFLOW:
-- PREFERRED — if the Selection Agent provided STRUCTURED timeline segments (its plan JSON
-  object, with per-segment in/out points), call `compile_timeline_segments` with that JSON
-  verbatim. It honours the in/out points and the exact order, whichever editing mode built
-  them (clip_assembly or moment_assembly — they compile identically). This is the right
-  path whenever segments are available.
-- FALLBACK — if you only have a plain ordered clip list (no segments/trims), call
-  `preview_delivery_timeline` to confirm every clip resolves, then
-  `compile_premiere_project` with the SAME ordered list. On THIS path only, pass
-  `aspect_ratio` yourself — and only if the editor stated one.
-- Either way: report the output paths back to the editor. If any clip/segment fails to
-  resolve, STOP and report exactly which identifiers were bad — never substitute or
-  invent a clip.
-
-TRACK LAYOUT (handled by the compiler; explain it to the editor): V1 = main video,
-A1 = original/ambient audio, A2 = secondary audio only when a clip truly has a second
-audio stream.
-
-OUTPUT: confirm the sequence was compiled, give the .xml path (for File ▸ Import in
-Premiere Pro) and the .json path, restate the preserved clip order, and state the delivery
-frame — the aspect ratio, the raster, and which clips are letterboxed/pillarboxed because
-their source shape differs from it (the full image is kept in every case).
-
-Prior user preferences: {memory}"""
-
-
-def delivery_assistant(state: ProductionState, config: RunnableConfig):
-    """Delivery Agent reasoning node."""
-    memory = state.get("loaded_preferences", "None")
-    prompt = DELIVERY_PROMPT.format(memory=memory)
-    response = llm_with_delivery.invoke(
-        [SystemMessage(prompt)] + state["messages"]
-    )
-    return {"messages": [response]}
-
-
-def should_continue_delivery(state: ProductionState, config: RunnableConfig) -> str:
-    """Router for the Delivery Agent ReAct loop."""
-    last = state["messages"][-1]
-    if not hasattr(last, "tool_calls") or not last.tool_calls:
-        return "end"
-    return "continue"

@@ -1,28 +1,10 @@
-"""Project-scoped catalogue identifier resolution (shared by Selection & Delivery).
-
-Resolves a ``shot_id`` or a file-path / file-name identifier to EXACTLY ONE real
-catalogued clip WITHIN A GIVEN PROJECT. Two guarantees the pipeline depends on:
-
-  * PROJECT ISOLATION (audit C-03 / C-04) — every query is filtered by ``project_id``,
-    so an identifier can never resolve to another project's media. Numeric shot IDs and
-    file names are both scoped; project membership is never inferred from the identifier.
-  * NO SILENT AMBIGUITY (audit H-01) — a file name that matches more than one clip raises
-    :class:`AmbiguousIdentifier` (listing the candidate shot IDs) instead of silently
-    taking the first row (the old ``LIKE '%tok%' ... ORDER BY shot_id LIMIT 1`` behaviour
-    that quietly confused two ``take01.mov`` files). Callers surface the conflict so the
-    editor disambiguates with a shot_id.
-
-Matching order for a non-numeric token is most-specific-first: exact full path → exact
-file name (basename, either path separator) → loose substring. Never fabricates: an
-identifier that matches nothing resolves to ``None``. All SQL uses bound parameters, and
-LIKE metacharacters in the token are escaped, so a token can never alter the query shape.
-"""
+"""Project-scoped catalogue identifier resolution for Selection and Delivery."""
 
 from sqlalchemy import text as _sql
 
 from app.services.database_service import _engine
 
-# Metadata pulled for a resolved clip — the superset both Selection and Delivery need.
+# Metadata required by Selection and Delivery.
 _DEFAULT_COLUMNS = (
     "shot_id, file_path, shot_type, duration_seconds, orientation, fps, "
     "width, height, codec, has_audio, keywords, description, "
@@ -32,12 +14,7 @@ _DEFAULT_COLUMNS = (
 
 
 class AmbiguousIdentifier(Exception):
-    """A file-name identifier matched more than one clip in the project.
-
-    Carries the offending ``token`` and the list of candidate ``(shot_id, file_path)``
-    tuples so the caller can tell the editor exactly which clips collided.
-    """
-
+    """Raised when an identifier matches multiple clips in a project."""
     def __init__(self, token: str, candidates: list[tuple]):
         self.token = token
         self.candidates = candidates
@@ -49,26 +26,24 @@ class AmbiguousIdentifier(Exception):
 
 
 def _escape_like(term: str) -> str:
-    """Escape LIKE metacharacters so a token can't act as a wildcard (ESCAPE '\\')."""
+    """Escape LIKE metacharacters."""
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _basename(path) -> str:
-    """Final path component, treating both '/' and '\\' as separators."""
+    """Return the final path component using either path separator."""
     return str(path).replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _match_by_path(conn, project_id, token: str, columns: str) -> list:
+    """Find path-based matches within a project."""
     base = f"SELECT {columns} FROM shots WHERE project_id = :pid AND "
 
-    # 1) exact full path (no wildcards — cannot be ambiguous by definition, but a
-    #    catalogue without the UNIQUE constraint could still hold dupes, so return all).
     rows = conn.execute(_sql(base + "file_path = :t"),
                         {"pid": project_id, "t": token}).fetchall()
     if rows:
         return rows
 
-    # 2) pull a loose (escaped) substring superset, then keep only exact basename matches.
     esc = _escape_like(token)
     superset = conn.execute(
         _sql(base + "file_path LIKE :c ESCAPE '\\'"),
@@ -78,17 +53,11 @@ def _match_by_path(conn, project_id, token: str, columns: str) -> list:
     if exact_base:
         return exact_base
 
-    # 3) fall back to the loose substring superset.
     return superset
 
 
 def resolve_one(project_id, token, *, columns: str = _DEFAULT_COLUMNS) -> dict | None:
-    """Resolve a single identifier to one catalogue row within ``project_id``.
-
-    ``token`` is a numeric shot_id or a file path / name. Returns the row dict, or
-    ``None`` when nothing matches. Raises :class:`AmbiguousIdentifier` when a file-name
-    token matches more than one clip (never silently picks the first).
-    """
+    """Resolve one identifier to a catalogue row within a project."""
     token = (str(token) if token is not None else "").strip()
     if not token:
         return None
@@ -113,17 +82,7 @@ def resolve_one(project_id, token, *, columns: str = _DEFAULT_COLUMNS) -> dict |
 
 
 def resolve_ordered(project_id, tokens, *, columns: str = _DEFAULT_COLUMNS):
-    """Resolve tokens IN ORDER within a project, preserving order and repeats.
-
-    Returns ``(rows, problems)``:
-      - ``rows``   — resolved row dicts, each tagged with ``_identifier`` (the token that
-        matched it); order preserved, repeats kept.
-      - ``problems`` — ``(token, reason)`` tuples for tokens that did not resolve to
-        exactly one clip (unresolved or ambiguous).
-
-    A caller that must not fabricate should REFUSE when ``problems`` is non-empty rather
-    than proceed with a partial / mis-ordered list.
-    """
+    """Resolve identifiers in order while preserving repeats."""
     rows: list[dict] = []
     problems: list[tuple[str, str]] = []
     for tok in tokens:

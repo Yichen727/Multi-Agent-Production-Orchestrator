@@ -1,4 +1,4 @@
-"""LLM initialization and management."""
+"""OpenAI LLM and embedding utilities."""
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from app.config import settings
@@ -8,15 +8,7 @@ logger = get_logger("openai_service")
 
 
 def get_llm(model: str = None, temperature: float = 0) -> ChatOpenAI:
-    """Create a ChatOpenAI instance.
-
-    Args:
-        model: Model name override. Defaults to settings.LLM_MODEL.
-        temperature: Sampling temperature.
-
-    Returns:
-        Configured ChatOpenAI instance.
-    """
+    """Create a configured ChatOpenAI instance."""
     model = model or settings.LLM_MODEL
     llm = ChatOpenAI(model_name=model, temperature=temperature)
     logger.info(f"LLM initialized: {model}")
@@ -24,26 +16,17 @@ def get_llm(model: str = None, temperature: float = 0) -> ChatOpenAI:
 
 
 def get_llm_fast() -> ChatOpenAI:
-    """Get the cost-optimized fallback model for simpler tasks."""
+    """Return the configured fallback model."""
     return get_llm(model=settings.LLM_MODEL_FALLBACK)
 
-
-# Pre-initialized instances for import convenience
 llm = get_llm()
 llm_fast = get_llm_fast()
 
-
-# ── Embeddings (semantic retrieval layer) ─────────────────────────────────────
-
+# Embeddings (semantic retrieval layer)
 _embeddings_client = None
 
-
 def get_embeddings() -> OpenAIEmbeddings | None:
-    """Return a cached OpenAIEmbeddings client, or None without an API key.
-
-    Used to build the semantic vector space that powers hybrid search. Kept behind
-    this single accessor so callers never construct an embeddings client directly.
-    """
+    """Return the cached embedding client, or None if unavailable."""
     global _embeddings_client
     if not settings.OPENAI_API_KEY:
         return None
@@ -54,12 +37,7 @@ def get_embeddings() -> OpenAIEmbeddings | None:
 
 
 def embed_texts(texts: list[str]) -> list[list[float]] | None:
-    """Embed a batch of texts, or return None if embeddings are unavailable.
-
-    Returns one vector per input text. Returns ``None`` (never a fabricated vector)
-    when there is no API key, the input is empty, or the call fails — callers should
-    then fall back to lexical matching rather than pretend a vector exists.
-    """
+    """Embed texts for semantic retrieval, returning None on failure."""
     if not texts:
         return None
     client = get_embeddings()
@@ -68,6 +46,6 @@ def embed_texts(texts: list[str]) -> list[list[float]] | None:
         return None
     try:
         return client.embed_documents(texts)
-    except Exception as e:  # network / model / quota — degrade gracefully
+    except Exception as e: 
         logger.error(f"Embedding failed: {e}")
         return None

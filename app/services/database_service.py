@@ -1,12 +1,4 @@
-"""Database service — SQLAlchemy setup with the production schema.
-
-The catalogue is a SQLite database. By default it is **persisted to a file**
-(``settings.METADATA_DB_PATH``) so real ingested rows survive app restarts — this is
-what makes the Ingest Agent's incremental reuse work across sessions (unchanged files
-are not re-probed / re-tagged on a later run). Nothing is ever seeded: a fresh database
-starts EMPTY and only a real ingest puts rows in it, so every row in the catalogue traces
-back to a measured file. Tests point ``METADATA_DB_PATH`` at ``:memory:`` for isolation.
-"""
+"""Database service — SQLite catalogue and persistence helpers."""
 
 import json
 import sqlite3
@@ -20,15 +12,8 @@ from app.utils.logger import get_logger
 logger = get_logger("database_service")
 
 
-# Schema DDL — always applied (idempotent via IF NOT EXISTS), so an existing file just
-# gains any missing tables and indexes.
-#
-# NOTE (audit H-09): the ``UNIQUE (project_id, file_path)`` constraint below stops the
-# same clip being catalogued twice in one project. Because ``CREATE TABLE IF NOT EXISTS``
-# does NOT alter an already-existing table, this constraint only takes effect on a FRESH
-# database (and every ``:memory:`` test run); a proper migration for pre-existing on-disk
-# catalogues is tracked separately. The ``CREATE INDEX IF NOT EXISTS`` statements, by
-# contrast, DO apply retroactively to an existing file.
+# ── Schema ────────────────────────────────────────────────────────────────────
+
 _SCHEMA_DDL = """
         -- One row per project, carrying only what the system actually knows: the id, a
         -- name, and how many clips the last ingest catalogued. `clip_count` is maintained
@@ -101,10 +86,6 @@ _SCHEMA_DDL = """
         CREATE INDEX IF NOT EXISTS idx_events_file ON clip_events(file_path);
 """
 
-
-# Columns added to `shots` after the original schema shipped. `CREATE TABLE IF NOT
-# EXISTS` will not alter a pre-existing on-disk table, so these are applied as an
-# idempotent ALTER TABLE ADD COLUMN migration — additive, nullable, safe on every launch.
 _ADDED_SHOT_COLUMNS = (
     ("audio_channels", "INTEGER"),
     ("audio_sample_rate", "INTEGER"),
@@ -113,12 +94,7 @@ _ADDED_SHOT_COLUMNS = (
 
 
 def _migrate_shot_columns(connection) -> None:
-    """Add any newer `shots` columns missing from a pre-existing database.
-
-    ``CREATE TABLE IF NOT EXISTS`` will not alter an existing table, so the columns added
-    after the original schema shipped are applied here instead. Purely additive and
-    nullable, hence safe to run on every launch.
-    """
+    """Add missing columns to an existing shots table."""
     existing = {row[1] for row in connection.execute("PRAGMA table_info(shots)").fetchall()}
     for name, decl in _ADDED_SHOT_COLUMNS:
         if name not in existing:
@@ -127,11 +103,7 @@ def _migrate_shot_columns(connection) -> None:
 
 
 def _migrate_project_columns(connection) -> None:
-    """Add `clip_count` to a pre-existing `projects` table.
-
-    Back-filled from the rows already in `shots`, so an existing catalogue reports the
-    truth immediately rather than 0 until the next ingest.
-    """
+    """Add and backfill clip_count on existing projects."""
     existing = {row[1] for row in connection.execute("PRAGMA table_info(projects)").fetchall()}
     if "clip_count" not in existing:
         connection.execute("ALTER TABLE projects ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0")
@@ -143,17 +115,7 @@ def _migrate_project_columns(connection) -> None:
 
 
 def _apply_pragmas(connection, *, in_memory: bool) -> None:
-    """Set the connection PRAGMAs (audit H-08) on a raw sqlite3 connection.
-
-    Applied to EVERY connection (bootstrap and pooled), while no transaction is open —
-    ``PRAGMA journal_mode`` / ``foreign_keys`` cannot change inside one, and both are
-    per-connection settings, so a pooled connection that skipped them would silently
-    lose FK enforcement (and with it the ``clip_events`` ON DELETE CASCADE).
-      - ``foreign_keys=ON`` — actually enforce the declared FK relationships.
-      - ``busy_timeout`` — wait rather than fail immediately under brief write contention.
-      - ``journal_mode=WAL`` — concurrent readers + one writer (file databases only; WAL
-        is not applicable to ``:memory:`` and is skipped there).
-    """
+    """Configure SQLite connection settings."""
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     if not in_memory:
@@ -161,38 +123,18 @@ def _apply_pragmas(connection, *, in_memory: bool) -> None:
 
 
 def _create_engine(db_target: str):
-    """Open a SQLite database and ensure the schema (no data is ever seeded).
+    """Create the SQLite engine and initialise the schema.
 
-    Args:
-        db_target: A filesystem path for a persistent catalogue, or ':memory:' for an
-            ephemeral one (used by tests).
-
-    THREAD SAFETY (why a file catalogue is NOT StaticPool): LangGraph's ``ToolNode``
-    executes an assistant turn's parallel tool calls in a THREAD POOL, so two catalogue
-    queries can run at the same instant (e.g. Selection calling ``get_candidate_details``
-    and ``get_clip_events`` together on a large curated set). A single shared DBAPI
-    connection cannot serve them concurrently: their cursor traffic interleaves and a row
-    ends up read against another statement's column metadata, surfacing as
-    ``IndexError: tuple index out of range`` deep inside SQLAlchemy. So a FILE database is
-    opened through SQLAlchemy's normal pool — every checkout gets its OWN sqlite3
-    connection (WAL already allows concurrent readers alongside one writer), and the pool
-    guarantees a connection is only ever used by one thread at a time.
-
-    ``:memory:`` keeps the single-shared-connection StaticPool: an in-memory database
-    exists only for the life of the connection that created it, so a per-checkout pool
-    would hand out empty databases. That path is for the (single-threaded) tests.
+    File databases use SQLAlchemy's normal connection pool for thread safety.
+    In-memory databases use StaticPool so all operations share one connection.
     """
     in_memory = db_target == ":memory:"
 
-    # Bootstrap connection: PRAGMAs, then schema.
     connection = sqlite3.connect(db_target, check_same_thread=False)
     _apply_pragmas(connection, in_memory=in_memory)
     connection.executescript(_SCHEMA_DDL)
     _migrate_shot_columns(connection)
     _migrate_project_columns(connection)
-
-    # No seeding: a fresh catalogue stays EMPTY until a real ingest writes measured rows,
-    # so nothing downstream can ever retrieve a clip that does not exist on disk.
     connection.commit()
 
     if in_memory:
@@ -203,31 +145,22 @@ def _create_engine(db_target: str):
             connect_args={"check_same_thread": False},
         )
 
-    # File catalogue: hand the bootstrap connection back and let the pool open one
-    # connection per checkout (see THREAD SAFETY above). check_same_thread=False because
-    # a pooled connection may be reused by a different thread on a later checkout.
     connection.close()
+
     engine = create_engine(
         f"sqlite+pysqlite:///{Path(db_target).resolve().as_posix()}",
         connect_args={"check_same_thread": False},
     )
 
     @event.listens_for(engine, "connect")
-    def _set_pragmas(dbapi_connection, _record):  # every NEW pooled connection
+    def _set_pragmas(dbapi_connection, _record): 
         _apply_pragmas(dbapi_connection, in_memory=False)
 
     return engine
 
 
 def get_database():
-    """Build the metadata database instance.
-
-    Persists to ``settings.METADATA_DB_PATH`` (a file) by default so real ingested
-    rows survive restarts; set it to ':memory:' for an ephemeral database. Swap to
-    PostgreSQL for true production by changing DATABASE_URL in .env.
-
-    Returns the SQLAlchemy engine and a LangChain ``SQLDatabase`` over it.
-    """
+    """Create the metadata database and LangChain SQL wrapper."""
     target = str(settings.METADATA_DB_PATH)
     if target != ":memory:":
         Path(target).parent.mkdir(parents=True, exist_ok=True)
@@ -238,13 +171,9 @@ def get_database():
     logger.info(f"Metadata database ready ({where}).")
     return engine, database
 
-
-# Singleton instances. ``db`` is the read-oriented LangChain wrapper agents query
-# with db.run("SELECT ..."); ``_engine`` is used for the write path (real ingestion).
 _engine, db = get_database()
 
-
-# Columns accepted by replace_project_shots, in the order the catalogue expects.
+# ── Shot operations ───────────────────────────────────────────────────────────
 _SHOT_COLUMNS = (
     "project_id", "file_path", "shot_type",
     "duration_seconds",
@@ -257,22 +186,7 @@ _SHOT_COLUMNS = (
 
 
 def replace_project_shots(project_id: int, rows: list[dict]) -> int:
-    """Replace the catalogue for a project with freshly ingested rows.
-
-    Deletes the project's existing shots, then inserts ``rows`` (each a dict whose
-    keys are a subset of ``_SHOT_COLUMNS``; missing keys are stored as NULL). This
-    is the ONLY way rows enter the database: REAL footage metadata, probed from the
-    user's files. Attributes that were not measured should simply be omitted rather
-    than guessed. Also refreshes the parent project's ``clip_count`` in the same
-    transaction.
-
-    Args:
-        project_id: Project whose catalogue is being (re)built.
-        rows: List of shot metadata dicts.
-
-    Returns:
-        The number of rows inserted.
-    """
+    """Replace all catalogue shots for a project."""
     from sqlalchemy import text as _sql
 
     placeholders = ", ".join(f":{c}" for c in _SHOT_COLUMNS)
@@ -280,9 +194,6 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
     insert_sql = _sql(f"INSERT INTO shots ({columns}) VALUES ({placeholders})")
 
     with _engine.begin() as conn:
-        # Ensure a parent projects row exists so the shots.project_id FK (now enforced,
-        # audit H-08) is satisfied. Materialising the project on first ingest also avoids
-        # orphan shots. INSERT OR IGNORE leaves an already-registered project untouched.
         conn.execute(
             _sql("INSERT OR IGNORE INTO projects (project_id, project_name) "
                  "VALUES (:pid, :name)"),
@@ -293,9 +204,7 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
             params = {c: row.get(c) for c in _SHOT_COLUMNS}
             params["project_id"] = project_id
             conn.execute(insert_sql, params)
-        # Keep projects.clip_count in step with the rows just written. Same transaction as
-        # the DELETE + INSERTs, and this is the only place `shots` is ever written, so the
-        # count can never disagree with the catalogue.
+        
         conn.execute(
             _sql("UPDATE projects SET clip_count = :n WHERE project_id = :pid"),
             {"n": len(rows), "pid": project_id},
@@ -305,11 +214,7 @@ def replace_project_shots(project_id: int, rows: list[dict]) -> int:
 
 
 def get_project_info(project_id: int) -> dict | None:
-    """Return a project's registry row, or None if the project was never ingested.
-
-    Keys: ``project_id``, ``project_name``, ``clip_count`` (how many clips the last
-    ingest catalogued — maintained by ``replace_project_shots``).
-    """
+    """Return project metadata, or None if it has not been ingested."""
     from sqlalchemy import text as _sql
 
     with _engine.begin() as conn:
@@ -322,11 +227,7 @@ def get_project_info(project_id: int) -> dict | None:
 
 
 def get_catalogued_paths(project_id: int) -> set[str]:
-    """Return the set of file paths already catalogued for a project.
-
-    Used by the Ingest Agent's "detect new footage" step to tell which files on
-    disk are new versus already ingested.
-    """
+    """Return file paths already catalogued for a project."""
     from sqlalchemy import text as _sql
 
     with _engine.begin() as conn:
@@ -338,13 +239,7 @@ def get_catalogued_paths(project_id: int) -> set[str]:
 
 
 def get_catalogued_shots(project_id: int) -> dict:
-    """Return existing catalogue rows for a project, keyed by file path.
-
-    Each value is a dict of every column (including the source_mtime / source_size
-    fingerprint). The Ingest Agent uses this to REUSE prior analysis — skipping the
-    expensive ffprobe/scene-detection/GPT-5.5 Vision work for files whose path is
-    already catalogued and whose content is unchanged.
-    """
+    """Return existing catalogue rows keyed by file path."""
     from sqlalchemy import text as _sql
 
     with _engine.begin() as conn:
@@ -355,11 +250,7 @@ def get_catalogued_shots(project_id: int) -> dict:
         return {row._mapping["file_path"]: dict(row._mapping) for row in result}
 
 
-# ── Temporal events (Tier 2: event-based ingestion) ────────────────────────────
-
-# Columns accepted by replace_project_events, in the order the table expects. shot_id is
-# resolved from the (project_id, file_path) of the freshly written shots, so callers pass
-# file_path and need not know the autoincremented id.
+# ── Temporal events ───────────────────────────────────────────────────────────
 _EVENT_COLUMNS = (
     "project_id", "shot_id", "file_path", "event_order",
     "start_seconds", "end_seconds", "duration_seconds",
@@ -368,22 +259,7 @@ _EVENT_COLUMNS = (
 
 
 def replace_project_events(project_id: int, events: list[dict]) -> int:
-    """Replace the temporal events for a project with a freshly built set.
-
-    Each event dict carries a ``file_path`` (its parent clip); the parent ``shot_id`` is
-    looked up from the shots table for this project at write time, so events stay linked
-    even though ``replace_project_shots`` reassigns shot ids on every rebuild. Call this
-    AFTER ``replace_project_shots`` (which cascade-deletes the old events). Events whose
-    file has no catalogued shot are skipped rather than orphaned.
-
-    Args:
-        project_id: Project whose events are being (re)built.
-        events: Ordered event dicts (keys a subset of ``_EVENT_COLUMNS`` minus the
-            resolved ``shot_id``); ``subjects`` may be a list (stored as JSON text).
-
-    Returns:
-        The number of event rows inserted.
-    """
+    """Replace all temporal events for a project."""
     from sqlalchemy import text as _sql
 
     placeholders = ", ".join(f":{c}" for c in _EVENT_COLUMNS)
@@ -398,8 +274,7 @@ def replace_project_events(project_id: int, events: list[dict]) -> int:
                 {"pid": project_id},
             )
         }
-        # Cascade may already have cleared these when shots were replaced; make the
-        # rebuild idempotent regardless of call order.
+        
         conn.execute(_sql("DELETE FROM clip_events WHERE project_id = :pid"),
                      {"pid": project_id})
         inserted = 0
@@ -407,7 +282,7 @@ def replace_project_events(project_id: int, events: list[dict]) -> int:
             fp = ev.get("file_path")
             sid = shot_ids.get(fp)
             if sid is None:
-                continue  # no parent shot for this file — never orphan an event
+                continue  
             params = {c: ev.get(c) for c in _EVENT_COLUMNS}
             params["project_id"] = project_id
             params["shot_id"] = sid
@@ -421,12 +296,7 @@ def replace_project_events(project_id: int, events: list[dict]) -> int:
 
 
 def get_events_by_ids(project_id: int, event_ids: list[int]) -> dict:
-    """Return events (by id) for a project, keyed by event_id, with source duration.
-
-    Scoped to ``project_id`` so an event id can never resolve across projects. Each value
-    carries the event fields plus the parent clip's ``source_duration`` (for in/out
-    range validation). Ids not found simply do not appear in the result.
-    """
+    """Return events by ID, scoped to a project."""
     from sqlalchemy import text as _sql
 
     if not event_ids:
@@ -446,12 +316,7 @@ def get_events_by_ids(project_id: int, event_ids: list[int]) -> dict:
 
 
 def get_catalogued_events(project_id: int) -> dict:
-    """Return existing events for a project, grouped by parent file path.
-
-    Each value is the ordered list of that clip's event dicts. The Ingest Agent uses
-    this to REUSE events for unchanged clips (skipping the per-segment GPT-5.5 calls),
-    mirroring how ``get_catalogued_shots`` lets it reuse clip-level analysis.
-    """
+    """Return existing events grouped by parent file path."""
     from sqlalchemy import text as _sql
 
     grouped: dict[str, list[dict]] = {}

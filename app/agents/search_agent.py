@@ -1,14 +1,4 @@
-"""Search Agent — unified hybrid retrieval over the production catalogue.
-
-The SECOND stage of the MAPO pipeline (Ingest → Search → Selection). Given a
-natural-language query, it retrieves matching candidate clips via ONE unified tool
-(`search_catalogue`) backed by the hybrid retrieval service: SQL hard filters +
-vector semantic recall (with a lexical fallback). It NEVER ranks or recommends a
-"best" clip — that is the Selection Agent's responsibility.
-
-The LLM's only job here is to translate the user's request into a STRUCTURED query
-(keywords + optional filters); it no longer picks between many tools.
-"""
+"""Search Agent — unified hybrid retrieval over the production catalogue."""
 
 import json
 from pathlib import Path
@@ -28,11 +18,7 @@ logger = get_logger("search_agent")
 
 
 def _pid_from_state(state) -> int:
-    """Current project id from the injected graph state (defaults to 1).
-
-    Injected by the ToolNode from ``ProductionState`` — the model never fills it — so a
-    search is always confined to the current project's catalogue (audit C-02).
-    """
+    """Get the current project ID."""
     try:
         return int((state or {}).get("project_id"))
     except (TypeError, ValueError):
@@ -45,7 +31,7 @@ _SUGGESTION_MARK = {"suggested": "🟡", "neutral": "⚪", "low": "🔴"}
 
 
 def _format_candidates(candidates: list[dict]) -> str:
-    """Render candidate dicts as a grounded, numbered text list for the agent."""
+    """Format candidates as a numbered list."""
     if not candidates:
         return ("No clips matched. Broaden the keywords or relax the filters, or use "
                 "list_all_shots to see what is catalogued.")
@@ -68,8 +54,7 @@ def _format_candidates(candidates: list[dict]) -> str:
         rel = c.get("relevance")
         rel_str = f" — relevance {rel*100:.0f}%" if rel is not None else ""
         lines.append(f"  {i}. {mark} {name} — {', '.join(bits)}{rel_str}")
-        # Event-aware recall: when a MOMENT inside the clip drove the match, note it as
-        # context (the result is still the whole clip — Selection decides the cut).
+        # Show the matching event as context; selection handles the actual cut.
         ev = c.get("matched_event")
         if ev and ev.get("action"):
             lines.append(f"      ↳ contains: {ev['action']} "
@@ -78,14 +63,7 @@ def _format_candidates(candidates: list[dict]) -> str:
 
 
 def _render(candidates: list[dict]) -> str:
-    """Return the readable candidate list for the LLM PLUS a machine-readable JSON block.
-
-    The fenced ```json array carries the exact ``hybrid_search`` rows. The orchestrator
-    reads the candidates back from THIS tool output (via ``_extract_candidates``), not from
-    the model's prose — so the UI receives the real structured candidates (relevance,
-    suggestion, matched_event, ...) it renders, and the model reformatting its narration
-    can never corrupt them. Mirrors how the Selection planners emit their structured plan.
-    """
+    """Format candidates for the LLM and preserve the raw results as JSON."""
     text = _format_candidates(candidates)
     return text + "\n\n```json\n" + json.dumps(candidates, default=str) + "\n```"
 
@@ -98,30 +76,19 @@ def search_catalogue(keywords: str = None, core_keywords: str = None,
                      shot_type: str = None, orientation: str = None, people: int = None,
                      min_duration: float = None, max_duration: float = None,
                      state: Annotated[dict, InjectedState] = None) -> str:
-    """Unified hybrid search over the catalogue — the ONE search tool.
-
-    Combines structured SQL filters with semantic vector recall (falling back to
-    lexical matching when embeddings are unavailable). Fill only the arguments the
-    query implies; leave the rest as None.
+    """Search the catalogue using hybrid semantic and structured retrieval.
 
     Args:
-        core_keywords: The things the USER LITERALLY ASKED FOR, translated to English —
-            the entities/subjects/actions themselves, comma-separated, NO synonyms
-            (user says "手机" or "phone" → "phone"). Matching these counts as strong
-            evidence, so putting a synonym here would overstate a match. Always fill
-            this whenever the request has any content component.
-        keywords: The FULL retrieval term set — ``core_keywords`` PLUS your synonym
-            expansion (e.g. "phone, mobile phone, smartphone, cellphone"). Comma-
-            separated. Expansion widens recall only; it can never certify a match.
-        shot_type: e.g. wide_shot, close_up, establishing, medium_shot, aerial.
-        orientation: 'portrait' | 'landscape' | 'square' (vertical/horizontal ok).
-        people: Minimum number of people visible (use for "clips with people").
-        min_duration: Minimum clip length in seconds.
-        max_duration: Maximum clip length in seconds.
+        core_keywords: User's literal content terms, without synonyms.
+        keywords: Core terms plus controlled synonym expansion.
+        shot_type: Shot type filter.
+        orientation: Portrait, landscape, or square.
+        people: Minimum visible people count.
+        min_duration: Minimum duration in seconds.
+        max_duration: Maximum duration in seconds.
 
     Returns:
-        A numbered list of matching clips with real metadata, a suggestion marker,
-        and a grounded relevance %. Retrieval only — never a "best" pick.
+        Matching clips with metadata and relevance information.
     """
     candidates = hybrid_search(
         _pid_from_state(state), keywords=keywords or core_keywords,
@@ -134,11 +101,7 @@ def search_catalogue(keywords: str = None, core_keywords: str = None,
 
 @tool
 def list_all_shots(state: Annotated[dict, InjectedState] = None) -> str:
-    """List every catalogued shot with its metadata (ground-truth check).
-
-    Useful when the query asks for "all clips" or to see exactly what is catalogued.
-    Scoped to the current project.
-    """
+    """List all clips in the current project's catalogue."""
     return _render(hybrid_search(_pid_from_state(state), top_k=200))
 
 
@@ -153,79 +116,52 @@ llm_with_search = llm.bind_tools(search_tools)
 search_tool_node = ToolNode(search_tools)
 
 SEARCH_PROMPT = """You are the SEARCH AGENT in the MAPO system.
-Your role: RETRIEVE candidate clips from the catalogue that match a query.
+Your role is to retrieve candidate clips from the catalogue that match a query.
 
-You retrieve CLIPS (whole files), never moments or timecodes. Deciding WHICH MOMENT of a
-clip to use is the Selection stage's job, not yours — you help the editor browse and
-shortlist footage. You translate the user's request into a STRUCTURED query and call
-`search_catalogue` once (use `list_all_shots` only for an "all clips" / ground-truth
-check). Report ONLY what the tool returns. The catalogue is the single source of truth.
+You retrieve whole clips. Final moment selection is handled by the Selection Agent.
+Translate the user's request into a structured query and call `search_catalogue` once.
+Use `list_all_shots` only for "all clips" or catalogue checks.
+Report only tool results. The catalogue is the source of truth.
 
-`search_catalogue` recall is EVENT-AWARE under the hood: a clip is returned when its
-overall content OR a specific moment inside it matches your query, so a query like
-"celebration" finds a clip even if only one beat of it is celebratory. When a moment drove
-the match, the result carries a "contains: ..." note — relay it as CONTEXT, but the unit
-you return is always the whole clip.
+EVENT-AWARE RETRIEVAL:
+A clip may match through its overall content or a temporal event inside it.
+When `matched_event` is returned, relay its "contains" information as context.
+The returned unit remains the whole clip.
 
-HOW TO BUILD THE QUERY:
-- Put the user's OWN terms (translated to English, no synonyms) into `core_keywords`,
-  and those same terms PLUS your expansion into `keywords`. Both, every time there is a
-  content component — the system scores a core-term match far higher than a synonym
-  match, so mislabelling a synonym as core inflates relevance.
-- Put hard constraints into their OWN arguments: orientation, shot_type, people,
-  min_duration / max_duration. Leave everything else as None.
-- STRUCTURED WORDS ARE NOT KEYWORDS. Orientation words (horizontal/landscape,
-  vertical/portrait, square) and shot-type words (wide, close-up, aerial, medium,
-  establishing) describe FORMAT, not content — route them to `orientation` / `shot_type`
-  and NEVER also place them in `keywords`. Putting them in `keywords` produces a
-  misleadingly low relevance %, because they don't appear in the clip's content tags.
-- If the request is ONLY a format constraint (e.g. "find all horizontal shots"), call
-  the tool with just that argument (orientation="horizontal") and NO keywords. Those
-  results come back at 100% — correct, because orientation and duration are MEASURED
-  facts, so every returned clip matches exactly.
-- Content relevance never reaches 100%: tags come from a vision model that can be wrong,
-  so a strong content match tops out around 95%. Never present a % as certainty.
+QUERY:
+- `core_keywords`: user's own content terms, translated to English, without synonyms.
+- `keywords`: `core_keywords` plus controlled synonym expansion.
+- Use dedicated fields for `orientation`, `shot_type`, `people`,
+  `min_duration`, and `max_duration`.
+- Keep orientation and shot-type terms in their dedicated fields.
+- For format-only queries, use only the relevant structured filters.
+- Content relevance is model-based and should not be presented as certainty.
 
-KEYWORDS EXPANSION — MANDATORY, BUT DISCIPLINED:
-The catalogue is tagged in English with one wording out of many, so never search the
-user's raw word alone — but expansion is a RECALL device, not a licence to drift.
-Every term you add to `keywords` must be able to REPLACE a core term: a synonym, an
-alternative name, a spelling/singular-plural variant, or a specific type of it.
-  - CONCRETE things (objects, people, places): synonyms and sub-types ONLY. Never widen
-    them to a category, a context, or things that merely appear nearby.
-      "手机" / "phone" → core: phone | keywords: phone, mobile phone, smartphone,
-      cellphone, telephone
-      WRONG: device, gadget, electronics, technology, communication, screen — and NEVER
-      a word that merely CONTAINS the core word with another meaning (microphone,
-      headphone, earphone).
-  - ABSTRACT ideas (mood, atmosphere, weather, scenery, activity) MAY widen to closely
-    related terms:
-      "celebration" → core: celebration | keywords: celebration, party, cheering,
-      applause, festival
-An over-broad expansion does real damage: it pulls in unrelated footage and makes it
-look like a strong match.
+KEYWORD EXPANSION:
+- Concrete objects, people, and places: synonyms, variants, and specific sub-types.
+- Abstract concepts such as mood, atmosphere, weather, scenery, and activity:
+  closely related terms are allowed.
+- Keep expansions semantically close and useful for recall.
 
-ANTI-HALLUCINATION RULES:
-- NEVER invent file names, shot IDs, numbers, or relevance figures. Every clip you list
-  must come from a tool result in this conversation.
-- If the tool returns no rows, report that NO clips matched (after trying a wider
-  synonym set). Do not pad the answer.
-- Fields may be 'unclassified' / missing when the system has not analysed content; say
-  so plainly rather than guessing.
+Examples:
+- "phone" → core: phone | keywords: phone, mobile phone, smartphone, cellphone
+- "celebration" → core: celebration | keywords: celebration, party, cheering,
+  applause, festival
 
-OUTPUT: relay the tool's numbered candidate list. The 🟡/⚪/🔴 markers are the system's
-relevance suggestion, not a verdict.
+GROUNDING:
+- Report only filenames, IDs, metadata, and scores returned by tools.
+- If no results are returned, report no matches.
+- Treat missing or `unclassified` fields as unknown.
 
-CRITICAL BOUNDARY: you RETRIEVE only. You do NOT rank clips as "best", make editorial
-judgements, or recommend which clip to use — that is the Selection Agent's job. When a
-query implies a creative choice, return all reasonable candidates and note that final
-selection happens downstream.
+OUTPUT:
+Relay the numbered candidate list and preserve the 🟡/⚪/🔴 suggestion markers.
+Do not make editorial recommendations.
 
 Prior user preferences: {memory}"""
 
 
 def search_assistant(state: ProductionState, config: RunnableConfig):
-    """Search Agent reasoning node."""
+    """Run the Search Agent."""
     memory = state.get("loaded_preferences", "None")
     prompt = SEARCH_PROMPT.format(memory=memory)
     response = llm_with_search.invoke(
