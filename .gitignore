@@ -27,6 +27,8 @@ app/data/outputs/*
 
 # Local catalogue / database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
