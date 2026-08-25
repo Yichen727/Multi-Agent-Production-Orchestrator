@@ -9,7 +9,9 @@ exactly one specialised ReAct sub-agent (or, for Search, the retrieval service d
     ② run_search    → retrieval_service (hybrid recall — retrieval only)
     ③ run_selection → selection_agent   (intent-driven edit timeline; the editor picks
                                          CLIP ASSEMBLY or MOMENT ASSEMBLY)
-    ④ run_delivery  → delivery_agent     (compile the timeline → Premiere FCP7 XML)
+    ④ run_delivery  → delivery compiler  (compile the timeline → Premiere FCP7 XML;
+                                          DETERMINISTIC — the plan leaves no decision to
+                                          make, so no LLM is invoked and no tokens spent)
 
 The Streamlit UI is a thin presentation layer that calls these functions in order; the
 code path, the architecture diagram, and the thesis description are therefore the same
@@ -53,6 +55,9 @@ from app.agents.selection_agent import (
 from app.agents.delivery_agent import (
     delivery_assistant, delivery_tool_node, should_continue_delivery,
     reset_last_delivery_result, get_last_delivery_result,
+    # The deterministic compile core — Delivery needs no LLM, so run_delivery calls it
+    # directly rather than paying tokens for a model that only relays the plan.
+    compile_plan,
 )
 from app.services.retrieval_service import (hybrid_search, expand_query_terms,
                                             hoist_orientation)
@@ -414,49 +419,46 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
 
 def run_delivery(plan: dict, project_id, user_id,
                  sequence_name: str = "MAPO Edit"):
-    """④ Delivery — compile the Selection timeline into a Premiere project.
+    """④ Delivery — compile the Selection timeline into a Premiere project. NO LLM.
 
     REQUIRES the structured plan from Selection (audit H-04): Delivery is driven ONLY by
     the explicit ordered segments the Selection Agent produced. There is NO fallback to
     the Bin/media-pool order — without a structured plan there is no defined edit order
     to compile, so this raises rather than invent one.
 
-    The plan also carries the editor's OUTPUT ASPECT RATIO. The compile tool reads it out
-    of the plan JSON itself (not from a model-supplied argument), so the delivery frame is
-    exactly the one the editor specified in the UI.
+    DETERMINISTIC BY DESIGN — this is the one stage with no model in the loop. Delivery is
+    a pure compiler: the plan already fixes what to compile, in what order, with which
+    trims, at which frame, so there is no decision left for an LLM to make. It therefore
+    calls ``compile_plan`` (the Delivery Agent's own compile core) directly instead of
+    invoking the ReAct graph. Routing it through the agent used to cost ~20-30k tokens per
+    export for zero decisions: the plan JSON went into the prompt, the model had to echo it
+    back verbatim as the tool argument, and then the whole thing was re-sent (prompt + tool
+    call + tool result) for a closing narration. That also made a long plan corruptible by
+    the model. The ``delivery_agent`` graph and its tools are still built and exported
+    (same three-part contract as the other agents), so an agent-driven compile remains
+    available — the production path just does not need one.
 
-    Returns ``(agent_text, DeliveryResult | None)``. The second value is the COMPILER's own
-    record of what it wrote (paths, raster, clip count) — recorded by the tool, not parsed
-    out of the agent's prose — so the UI can act on the real artefact (reveal it on disk)
-    only when a compile genuinely succeeded. Mirrors ``run_ingest``'s ``IngestResult``.
+    The plan also carries the editor's OUTPUT ASPECT RATIO, read straight out of the plan
+    dict, so the delivery frame is exactly the one the editor specified in the UI.
+
+    ``user_id`` is accepted for signature symmetry with the other stages; with no agent
+    invocation there is no per-user thread to key.
+
+    Returns ``(summary_text, DeliveryResult | None)``. The second value is the COMPILER's
+    own record of what it wrote (paths, raster, clip count) — never parsed out of prose —
+    so the UI can act on the real artefact (reveal it on disk) only when a compile
+    genuinely succeeded. Mirrors ``run_ingest``'s ``IngestResult``.
     """
     if not (plan and plan.get("segments")):
         raise ValueError(
             "Delivery requires a structured timeline plan (ordered segments) from "
             "Selection. Generate the edit timeline in ③ Selection first — there is no "
             "implicit media-pool-order fallback.")
-    aspect_note = (
-        f"\n\nThe plan's output aspect ratio is {plan['aspect_ratio']}; the tool reads it "
-        "from the JSON and scales each clip to fit that frame (aspect preserved, no crop, "
-        "no stretch). Do not override it."
-    ) if plan.get("aspect_ratio") else ""
-    message = (
-        f"Compile the timeline into a Premiere Pro project named '{sequence_name}'.\n\n"
-        "The Selection Agent produced these STRUCTURED timeline segments. Call "
-        "compile_timeline_segments with segments_json set to EXACTLY this JSON — do not "
-        "re-order, add, drop, or re-time any segment:\n\n"
-        f"{json.dumps(plan)}"
-        f"{aspect_note}"
-    )
-    state = _base_state(project_id, {
-        "messages": [HumanMessage(content=message)],
-        "edit_timeline": plan,
-    })
     # Clear first: a stale success from an earlier export must never be mistaken for this
     # run's outcome if this run refuses or crashes before writing anything.
     reset_last_delivery_result()
-    result = delivery_agent.invoke(state, config=_config("deliver", user_id, project_id))
-    return result["messages"][-1].content, get_last_delivery_result()
+    summary = compile_plan(plan, sequence_name=sequence_name, project_id=_pid(project_id))
+    return summary, get_last_delivery_result()
 
 
 logger.info("MAPO pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")

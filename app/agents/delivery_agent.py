@@ -109,6 +109,14 @@ def _record_success(result: dict, project_id: int, message: str) -> None:
     ))
 
 
+def _as_pid(value) -> int:
+    """Coerce a project id to an int, defaulting to 1 when it is missing/unusable."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _pid_from_state(state) -> int:
     """Current project id from the injected graph state (defaults to 1).
 
@@ -116,10 +124,7 @@ def _pid_from_state(state) -> int:
     so Delivery resolves media, and names its output file, ONLY within the current
     project (audit C-04). Cross-project or ambiguous identifiers cannot be compiled.
     """
-    try:
-        return int((state or {}).get("project_id"))
-    except (TypeError, ValueError):
-        return 1
+    return _as_pid((state or {}).get("project_id"))
 
 
 def _to_compiler_clips(rows: list[dict], roles: list[str] | None,
@@ -359,14 +364,45 @@ def compile_timeline_segments(segments_json: str, sequence_name: str = "MAPO Edi
         many clips are letterboxed/pillarboxed), or a clear error naming any segment whose
         media did not resolve, was ambiguous, or was flagged invalid upstream.
     """
-    project_id = _pid_from_state(state)
-    try:
-        data = json.loads(segments_json)
-    except (json.JSONDecodeError, TypeError) as e:
-        return _refuse(f"Could not parse segments_json: {e}. Pass the Selection plan JSON "
-                       "verbatim.", project_id)
+    return compile_plan(segments_json, sequence_name=sequence_name,
+                        project_id=_pid_from_state(state))
+
+
+def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str:
+    """Compile a Selection timeline plan into the Premiere project — the DETERMINISTIC core.
+
+    This is the whole of the Delivery stage: resolve each segment's media inside the
+    project, honour the plan's order and in/out points exactly, take the output aspect
+    ratio from the plan, write the FCP7 XML + JSON, and record a ``DeliveryResult``. It is
+    pure Python — no LLM, no tokens — because compiling a finished timeline involves no
+    decision: the plan already says what to compile, in what order, at what frame.
+
+    It is called two ways, and both run this identical path:
+      * ``run_delivery`` in the orchestrator calls it DIRECTLY (the production path),
+      * the ``compile_timeline_segments`` tool delegates to it, so the Delivery ReAct
+        agent still works if an agent-driven run is ever wanted.
+
+    Args:
+        plan: The Selection plan — a dict (``{"mode":…, "aspect_ratio":…, "segments":[…]}``),
+            a bare list of segment dicts, or the JSON string of either.
+        sequence_name: Name for the Premiere sequence.
+        project_id: The project whose catalogue every segment must resolve within.
+
+    Returns:
+        A human-readable summary of what was written, or a refusal explaining exactly
+        which segment(s) could not be compiled. Never fabricates a media reference.
+    """
+    project_id = _as_pid(project_id)
+    if isinstance(plan, (str, bytes)):
+        try:
+            data = json.loads(plan)
+        except (json.JSONDecodeError, TypeError) as e:
+            return _refuse(f"Could not parse segments_json: {e}. Pass the Selection plan JSON "
+                           "verbatim.", project_id)
+    else:
+        data = plan
     segments = data.get("segments") if isinstance(data, dict) else data
-    if not segments:
+    if not segments or not isinstance(segments, list):
         return _refuse("No segments to compile. Provide the Selection plan JSON.", project_id)
 
     # C-06: refuse any segment the planner flagged invalid (real footage but nothing left

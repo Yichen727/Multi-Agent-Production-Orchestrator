@@ -1,13 +1,38 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
 
+# Media / raw footage
 *.mp4
 *.mov
+*.avi
+*.mkv
+*.m4v
 
+# MAPO runtime data
+app/data/raw_footage/*
+!app/data/raw_footage/.gitkeep
+
+app/data/outputs/*
+!app/data/outputs/.gitkeep
+
+# Local catalogue / database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
 .DS_Store
 
+# Claude Code
 CLAUDE.md
 .claude/
