@@ -48,7 +48,6 @@ You pick the output frame explicitly — **16:9 / 9:16 / 4:3 / 3:4 / 1:1** — a
 - **FFmpeg / ffprobe** on `PATH` — required for ingest (probing, scene detection, frame sampling). Without it, ingest cannot build a real catalogue.
 - An **OpenAI API key** — for vision tagging, embeddings, and the agents.
 
-> **Note:** without an API key the app still launches and the UI stays interactive, but all AI-assisted features are unavailable (Ingest can only do local probing). Without ffprobe, Ingest cannot build a real catalogue at all.
 
 ### Install
 
@@ -61,13 +60,15 @@ pip install -r requirements.txt
 Create a `.env` in the project root:
 
 ```dotenv
+# Required — add your own OpenAI API key
 OPENAI_API_KEY=sk-...
 
-# Optional — defaults shown
+# defaults shown
 LLM_MODEL=gpt-5.5
 LLM_MODEL_FALLBACK=gpt-5.5-mini
 VISION_MODEL=gpt-5.5
 EMBEDDING_MODEL=text-embedding-3-small
+
 METADATA_DB_PATH=./app/data/mapo_catalogue.db
 RAW_FOOTAGE_DIR=./app/data/raw_footage
 PROCESSED_OUTPUT_DIR=./app/data/output
@@ -80,9 +81,7 @@ PROCESSED_OUTPUT_DIR=./app/data/output
 ### Run
 
 ```bash
-python main.py                            # the only supported entry point (spawns Streamlit)
-# equivalently:
-streamlit run app/ui/streamlit_app.py
+python main.py                            # the only supported entry point 
 ```
 
 ### Then, in the browser
@@ -183,15 +182,13 @@ The result renders inline in the Selection section:
 #### Search query
 
 - Describe **the content itself**: objects, scenes, people, actions, atmosphere.
-- Be as specific as possible; broad concepts (e.g. "football match") require more semantic reasoning than specific objects (e.g. "phone") and are slower and more token-hungry (measured in dissertation §5.3: phone-type queries ≈ 13–20 s / 11–17k tokens; football-scene queries ≈ 46–50 s / 38–40k tokens).
-- A `contains: …` reason means a moment inside the clip drove the recall — use it to judge whether the whole clip is worth adopting.
+- Example: "Find all clips showing mobile phone"
 
 #### Editing intent — the most important field
 
 - **Describe style, emotion, pacing, and purpose**, not technical operations.
-- ✅ Good: "Fast-paced tech product promo, showcasing various functions".
-- ❌ Avoid operational instructions such as "trim the 2nd clip by 3 seconds", "put them in time order", or "add more slow-motion" — Selection is an "assistant editor" that decides what to keep, how to order, and how to pace, and explains its reasoning; it has no fixed narrative template.
-- Different stylistic intents can produce substantially different edits from the same footage (verified in dissertation §5.2.4).
+- Example: "Fast-paced tech product promo, showcasing various functions".
+
 
 #### Mode and parameter selection
 
@@ -203,6 +200,7 @@ The result renders inline in the Selection section:
 
 > The aspect ratio is an **output spec** — do not put it in the editing intent; writing "vertical" in the intent does not change the output frame. The frame is set by the UI option.
 
+
 ### Debug & Maintenance
 
 - **🛠️ Debug log (N messages)**: collapsible panel at the bottom of the main area; it records the raw exchanges of every agent (the key Selection/Delivery outputs already render in their own sections; this is the full transcript for troubleshooting).
@@ -211,6 +209,7 @@ The result renders inline in the Selection section:
 - **Known limitations**:
   - The fingerprint is `mtime + size`, not a content hash — an in-place replacement that preserves both would be treated as unchanged and reuse the old result; force re-analysis is the explicit override.
   - `📂 Show in folder` works only in local runs; under remote deployment the button degrades to showing the file path.
+
 
 ### FAQ
 
@@ -225,6 +224,7 @@ The result renders inline in the Selection section:
 | `📂 Show in folder` does nothing | The app is not running on this machine (remote deployment); use the displayed absolute path |
 | No OpenAI key | The app runs, but Search/Selection/vision analysis are unavailable; Ingest can only do local probing |
 | Thumbnails / inline playback unavailable | The codec does not support inline preview; this is a normal graceful degradation |
+
 
 ### Third-party Services & Dependencies
 
