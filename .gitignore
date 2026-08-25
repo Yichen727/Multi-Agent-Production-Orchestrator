@@ -24,6 +24,9 @@ app/data/raw_footage/*
 
 app/data/outputs/*
 !app/data/outputs/.gitkeep
+!app/data/output/exports/
+app/data/output/exports/*
+!app/data/output/exports/.gitkeep
 
 # Local catalogue / database
 *.db
