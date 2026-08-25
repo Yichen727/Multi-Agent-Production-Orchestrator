@@ -87,11 +87,11 @@ streamlit run app/ui/streamlit_app.py
 
 ### Then, in the browser
 
-1. **① Ingest** — set the footage folder and click *Run Ingest Analysis*. Later phases stay locked until ingest actually indexes something.
-2. **② Search** — type a query, review the ranked clips, ➕ the ones you like into the Bin.
-3. **Curate** — fine-tune the Bin in the sidebar.
-4. **③ Selection** — choose **Editing Mode**, **Output aspect ratio**, an optional **Target Duration** (Moment Assembly only), and describe your **Editing Intent** (style, emotion, pacing, purpose — not technical operations). The agent returns an explained timeline.
-5. **④ Deliver** — enabled once a timeline exists. Exports the XML, then offers a **📂 Show in folder** button so you can drag it into Premiere (**File ▸ Import**).
+**① Ingest** — set the footage folder and click *Run Ingest Analysis*. Later phases stay locked until ingest actually indexes something.
+**② Search** — type a query, review the ranked clips, ➕ the ones you like into the Bin.
+**Curate** — fine-tune the Media Pool in the sidebar.
+**③ Selection** — choose **Editing Mode**, **Output aspect ratio**, an optional **Target Duration** (Moment Assembly only), and describe your **Editing Intent** (style, emotion, pacing, purpose — not technical operations). The agent returns an explained timeline.
+**④ Deliver** — enabled once a timeline exists. Exports the XML, then offers a **📂 Show in folder** button so you can drag it into Premiere (**File ▸ Import**).
 
 A running transcript of what the agents did is available in the collapsed **🛠️ Debug log** at the bottom. **Reset Pipeline** clears everything.
 
@@ -107,7 +107,7 @@ A running transcript of what the agents did is available in the collapsed **🛠
 
 The interface is split into two areas:
 
-- **Sidebar (left)**: project configuration, footage folder, and the Media Pool (Bin).
+- **Sidebar (left)**: project configuration, footage folder, and the Media Pool.
 - **Main workspace (full width)**: the four production stages arranged top-to-bottom.
 
 **Stage-locking mechanism**: downstream operations stay disabled (🔒 Locked) until the required preceding stage completes:
