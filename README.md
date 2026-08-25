@@ -48,6 +48,8 @@ You pick the output frame explicitly — **16:9 / 9:16 / 4:3 / 3:4 / 1:1** — a
 - **FFmpeg / ffprobe** on `PATH` — required for ingest (probing, scene detection, frame sampling). Without it, ingest cannot build a real catalogue.
 - An **OpenAI API key** — for vision tagging, embeddings, and the agents.
 
+> **Note:** without an API key the app still launches and the UI stays interactive, but all AI-assisted features are unavailable (Ingest can only do local probing). Without ffprobe, Ingest cannot build a real catalogue at all.
+
 ### Install
 
 ```bash
@@ -69,6 +71,10 @@ EMBEDDING_MODEL=text-embedding-3-small
 METADATA_DB_PATH=./app/data/mapo_catalogue.db
 RAW_FOOTAGE_DIR=./app/data/raw_footage
 PROCESSED_OUTPUT_DIR=./app/data/output
+
+# Optional — LangSmith observability
+# LANGSMITH_API_KEY=...
+# LANGSMITH_TRACING=true
 ```
 
 ### Run
@@ -88,6 +94,156 @@ streamlit run app/ui/streamlit_app.py
 5. **④ Deliver** — enabled once a timeline exists. Exports the XML, then offers a **📂 Show in folder** button so you can drag it into Premiere (**File ▸ Import**).
 
 A running transcript of what the agents did is available in the collapsed **🛠️ Debug log** at the bottom. **Reset Pipeline** clears everything.
+
+> A control-by-control walkthrough, prompt best practices, and FAQ follow in the [📖 User Manual](#-user-manual) below.
+
+---
+
+## 📖 User Manual
+
+> This section is the detailed usage guide. It corresponds to Chapter 4.5 User Interface Design of the dissertation and matches the actual controls in `app/ui/streamlit_app.py`; all interface copy is quoted verbatim. System requirements, installation, and `.env` configuration are covered in **Getting started** above.
+
+### UI Overview
+
+The interface is split into two areas (corresponding to §4.5.1):
+
+- **Sidebar (left)**: project configuration, footage folder, and the Media Pool (Bin).
+- **Main workspace (full width)**: the four production stages arranged top-to-bottom — `① Ingest → ② Search → ③ Selection → ④ Deliver` — each stage renders its own output inline beneath it; at the very bottom is the collapsible `🛠️ Debug log`.
+
+**Stage-locking mechanism**: downstream operations stay disabled (🔒 Locked) until the required preceding stage completes:
+
+- Search / Selection / Deliver are all locked until **Ingest succeeds**;
+- Selection requires at least 1 clip ticked in the Media Pool;
+- Deliver additionally requires Selection to produce a **structured timeline** (narration text alone is not enough).
+
+### Step-by-step Walkthrough
+
+Corresponds to the five steps of §4.5.2; the following reflects the actual UI.
+
+#### Step 1 · Project Setup and Footage Ingestion (① Ingest)
+
+1. In the sidebar `⚙️ Project Settings`, enter a **Project ID** (default `1`) and an **Editor ID** (default `editor_01`). Both are used for project-level data isolation.
+2. In `📁 Footage`, set **Full path to the folder containing your video files** (default `./app/data/raw_footage`). If the folder exists, the UI shows `✓ Found N video files`; otherwise it warns `⚠ Folder not found`. Supported formats: `mp4, mov, avi, mxf, r3d, braw`.
+3. Click `🎬 Run Ingest Analysis` in the main area. Ingestion performs: ffprobe probing → FFmpeg scene detection → GPT-5.5 Vision tagging (shot type / objects / keywords / description / people count / mood) → temporal event splitting ("what happens", with real timecodes) → embedding → SQLite catalogue write.
+4. On success the Media Pool is populated and downstream stages unlock; a `partial_success` status shows a warning. On failure (e.g. missing folder), the pipeline **does not unlock**, and the reason is shown in the UI.
+
+> **Ingestion notes:**
+>
+> - Per-run limit of **200 video files**; exceeding it **refuses the run** (the existing catalogue is never deleted and replaced with only the first 200 files), so split the footage folder into batches or raise the limit.
+> - **Incremental reuse**: unchanged files (same modification-time + size fingerprint) reuse their cached analysis, skipping FFmpeg/LLM calls; deleted source files drop out of the catalogue. A re-run typically takes about 5 seconds and consumes almost no tokens.
+
+#### Step 2 · Search (② Search)
+
+1. Type what you are looking for in **Search query** (e.g. `e.g. Tech products`) and click `🔍 Search`.
+2. Results are grouped into three relevance tiers: `🟡 Suggested` (expanded by default) / `⚪ Neutral` / `🔴 Low` (collapsed by default).
+3. Each result card shows: **clip name · relevance % · duration**, plus a `💡` retrieval reason. When a match is driven by a **moment inside the clip**, the reason reads `contains: … (~ss–sss)`.
+4. Add/remove clips from the Media Pool: use the per-card `➕` / `➖`, or the per-tier `➕ Add all (N)` / `➖ Remove all (N)` for one-click bulk actions.
+5. `✖ Clear results` only clears the result cards — it does **not** untick clips already selected in the Media Pool.
+
+> Search is a **decision aid** only: it ranks and labels candidates but never decides the edit; the retrieval unit is always a **whole clip** (choosing moments inside clips is Selection's job).
+
+#### Step 3 · Candidate Curation
+
+- Tick the clips you want to use in the sidebar `🎞️ Media Pool` (the ticks are the candidate set — the "single source of truth"). `Select all` ticks/unticks the whole pool in one click; `Clear ✕` clears all selections; `↻ Refresh` reloads the pool.
+- Each row's `▶` opens a preview popover (inline playback + metadata).
+- **Optional shortcut**: skip Search and tick the entire Media Pool, letting Selection evaluate the full set against the editing intent. This means less manual work and one fewer retrieval stage, but Selection must consider more material, so reasoning time may increase.
+
+#### Step 4 · Edit Timeline Generation (③ Selection)
+
+1. **Editing mode** (radio):
+   - `🎞️ Clip Assembly` — Combine complete clips. The whole clip is the editing unit, original durations are kept, **no trimming**, no target duration.
+   - `🎯 Moment Assembly` — Select moments from within clips. Temporal events inside clips are the editing unit, with an **optional target duration**.
+2. **Output aspect ratio**: `16:9 / 9:16 / 4:3 / 3:4 / 1:1` (default 16:9). This is an explicit **output spec** that carries through to the export: each clip is scaled to **fit** the frame with its own aspect preserved — never stretched, never cropped — with letterboxing/pillarboxing filling any difference.
+3. (Moment Assembly only) **Target duration (seconds)**: range 1–7200. It is an *optimisation target* rather than a hard constraint: the agent first picks the moments the intent needs, then compresses the lower-value ones to fit. Nothing is cut proportionally and no moment is silently removed; if the overrun cannot be absorbed, it is reported honestly (`on target` / `under target` / `over target — kept for content`, plus `optimised −Xs across N lower-value moment(s)`).
+4. **Editing intent**: describe the editorial direction. The UI hint is *Describe style, emotion, pacing and purpose.*
+5. Click `🎬 Generate Edit Timeline`.
+
+The result renders inline in the Selection section:
+
+- Summary line: mode · segment count · total duration · target-duration status · compression info · `🖼️ Output frame`;
+- `🧭 Ordering` strategy; if the ordering simply matches the order the material was listed, a `⚠ Order matches …` hint appears — read the reasoning below to judge whether that shape fits;
+- Narrative report: each segment's source in/out points, duration, ordering logic, and editorial reasoning;
+- `🗂️ Not used — backup material (N)` expander: the alternatives the agent weighed and rejected, strongest first, showing source range, exclusion reason, and possible alternative use (**none of these are in the export**).
+
+> Regenerating the timeline **clears the previous export** (so a stale export can never mismatch the new timeline).
+
+#### Step 5 · Project Export and NLE Review (④ Deliver)
+
+1. Enter a **Sequence name** (default `MAPO Edit`).
+2. Click `📦 Export Project`. Delivery compiles the structured timeline into **FCP7 XML (xmeml v5) + JSON**, preserving order and in/out points exactly, writes them to the output directory, and shows an export summary (this stage calls no LLM — it is fully deterministic).
+3. On success a `📂 Show <XML filename> in folder` button appears, which opens the file manager with the file selected (requires the app and the browser to run on the same machine).
+4. Drag the XML straight into **Premiere Pro (File ▸ Import)**; after import, make final adjustments in the timeline (e.g. extend or shorten individual clips).
+
+### Prompt Best Practices
+
+#### Search query
+
+- Describe **the content itself**: objects, scenes, people, actions, atmosphere.
+- Be as specific as possible; broad concepts (e.g. "football match") require more semantic reasoning than specific objects (e.g. "phone") and are slower and more token-hungry (measured in dissertation §5.3: phone-type queries ≈ 13–20 s / 11–17k tokens; football-scene queries ≈ 46–50 s / 38–40k tokens).
+- A `contains: …` reason means a moment inside the clip drove the recall — use it to judge whether the whole clip is worth adopting.
+
+#### Editing intent — the most important field
+
+- **Describe style, emotion, pacing, and purpose**, not technical operations.
+- ✅ Good: "Fast-paced tech product promo, showcasing various functions".
+- ❌ Avoid operational instructions such as "trim the 2nd clip by 3 seconds", "put them in time order", or "add more slow-motion" — Selection is an "assistant editor" that decides what to keep, how to order, and how to pace, and explains its reasoning; it has no fixed narrative template.
+- Different stylistic intents can produce substantially different edits from the same footage (verified in dissertation §5.2.4).
+
+#### Mode and parameter selection
+
+| Scenario | Recommended mode | Why |
+| --- | --- | --- |
+| vlog / travel / documentary / BTS / montage (short, self-contained clips) | 🎞️ Clip Assembly | keeps whole clips; naturally suits short material |
+| extracting highlights from longer clips, or matching a target runtime | 🎯 Moment Assembly | event-level precision, optional target-duration compression |
+| adapting to a platform frame | either | pick the Output aspect ratio explicitly (e.g. 9:16 for vertical video) |
+
+> The aspect ratio is an **output spec** — do not put it in the editing intent; writing "vertical" in the intent does not change the output frame. The frame is set by the UI option.
+
+### Debug & Maintenance
+
+- **🛠️ Debug log (N messages)**: collapsible panel at the bottom of the main area; it records the raw exchanges of every agent (the key Selection/Delivery outputs already render in their own sections; this is the full transcript for troubleshooting).
+- **🔄 Reset Pipeline**: at the bottom of the sidebar; clears all session state (Media Pool ticks, search results, timeline, export) and restarts.
+- **Incremental reuse**: re-running Ingest skips unchanged files; only modified sources (size or modification time changed) trigger re-analysis.
+- **Known limitations**:
+  - The fingerprint is `mtime + size`, not a content hash — an in-place replacement that preserves both would be treated as unchanged and reuse the old result; force re-analysis is the explicit override.
+  - `📂 Show in folder` works only in local runs; under remote deployment the button degrades to showing the file path.
+
+### FAQ
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `⚠ Folder not found` | Wrong footage-folder path; check the sidebar input |
+| Stages still locked after Ingest | Ingest did not actually succeed (failure or 0 clips); check the error and the Debug log |
+| `partial_success` warning | Some clips failed analysis (e.g. an undecodable file); the rest are fine |
+| More than 200 files rejected | Per-run cap; split the folder into batches or raise `_MAX_INGEST_FILES` |
+| Deliver button disabled | No structured timeline yet; generate a Selection timeline first |
+| `⚠ Order matches …` | The order matches the order the material was listed; read the report to judge whether it fits the intent |
+| `📂 Show in folder` does nothing | The app is not running on this machine (remote deployment); use the displayed absolute path |
+| No OpenAI key | The app runs, but Search/Selection/vision analysis are unavailable; Ingest can only do local probing |
+| Thumbnails / inline playback unavailable | The codec does not support inline preview; this is a normal graceful degradation |
+
+### Third-party Services & Dependencies
+
+| Dependency / service | Type | Purpose | How to connect |
+| --- | --- | --- | --- |
+| OpenAI API | Paid API (the project's only external model service) | vision tagging, embeddings, agent reasoning | `OPENAI_API_KEY` in `.env` |
+| FFmpeg / ffprobe | Local open-source tools | probing, scene detection, frame sampling, proxy generation | install system-wide and add to `PATH` |
+| LangGraph / LangChain | Open-source Python libraries | agent graph orchestration, tool routing | `pip` install; no account |
+| LangSmith | Optional observability platform | trace tracking | optional `LANGSMITH_API_KEY` + `LANGSMITH_TRACING=true` in `.env` |
+| SQLite | Local database | catalogue persistence (WAL, foreign keys, connection pool) | local file `METADATA_DB_PATH`; no account |
+| Streamlit | Open-source UI framework / optional hosting | UI framework; optional hosting on Streamlit Community Cloud | no account for local runs; platform account for hosting |
+| Adobe Premiere Pro | target NLE (provided by the user, not a system dependency) | imports the FCP7 XML project | user's own software |
+
+### Deliverables Checklist
+
+| # | Deliverable | Status | To do |
+| --- | --- | --- | --- |
+| 1 | Source code | ✅ full codebase in the repository; README/appendix point to GitHub: `github.com/Yichen727/Multi-Agent-Production-Orchestrator` | sync the repo, cut a release |
+| 2 | Local run + hosting deployment instructions | ✅ local: README Getting started + this manual | add hosting/deployment docs (Streamlit Community Cloud / server / Docker) |
+| 3 | Backend service access details | ✅ no hosted backend: service contract in `config.py` / `.env` template (OpenAI key, local SQLite, optional LangSmith) | actual keys are provided by the author; no credentials are shipped |
+| 4 | App usage guidance + prompt best practices | ✅ this document | — |
+| 5 | Build / architecture / codebase technical docs | ✅ README (structure) + dissertation Ch4 (architecture) | optional: standalone Architecture & Codebase doc |
+| 6 | Third-party services / APIs / tools details | ✅ third-party table in this manual | none (no paid services besides OpenAI) |
 
 ---
 
@@ -122,4 +278,3 @@ app/
   data/                              # catalogue, footage, outputs/exports
 tests/                               # pytest suite
 ```
-
