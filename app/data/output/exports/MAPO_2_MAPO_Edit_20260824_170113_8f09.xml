@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="5">
+  <sequence id="sequence-1">
+    <name>MAPO Edit</name>
+    <duration>292</duration>
+    <rate>
+      <timebase>25</timebase>
+      <ntsc>FALSE</ntsc>
+    </rate>
+    <timecode>
+      <rate>
+        <timebase>25</timebase>
+        <ntsc>FALSE</ntsc>
+      </rate>
+      <string>00:00:00:00</string>
+      <frame>0</frame>
+      <displayformat>NDF</displayformat>
+    </timecode>
+    <media>
+      <video>
+        <format>
+          <samplecharacteristics>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <width>1920</width>
+            <height>1080</height>
+            <pixelaspectratio>square</pixelaspectratio>
+            <anamorphic>FALSE</anamorphic>
+          </samplecharacteristics>
+        </format>
+        <track>
+          <clipitem id="clipitem-v1">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>137</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>0</start>
+            <end>137</end>
+            <in>1438</in>
+            <out>1575</out>
+            <comments>
+              <mastercomment1>smartphone product reveal</mastercomment1>
+            </comments>
+            <file id="file-1">
+              <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+              <pathurl>file://localhost/C:/Users/86153/Desktop/UCL/Multi-Agent%20Production%20Orchestrator/app/data/raw_footage/Atomized%20Studios/samsung_ifa2025_60sec_16x9_v05a-final_v1%20%281080p%29.mp4</pathurl>
+              <rate>
+                <timebase>25</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>1575</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <rate>
+                      <timebase>25</timebase>
+                      <ntsc>FALSE</ntsc>
+                    </rate>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+                <audio>
+                  <samplecharacteristics>
+                    <samplerate>48000</samplerate>
+                    <depth>16</depth>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+            <link>
+              <linkclipref>clipitem-v1</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-1</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-v2">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>155</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>137</start>
+            <end>292</end>
+            <in>1575</in>
+            <out>1730</out>
+            <comments>
+              <mastercomment1>Galaxy phone stage context</mastercomment1>
+            </comments>
+            <file id="file-1"/>
+            <link>
+              <linkclipref>clipitem-v2</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-2</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+          </clipitem>
+        </track>
+      </video>
+      <audio>
+        <track>
+          <clipitem id="clipitem-a1-1">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>137</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>0</start>
+            <end>137</end>
+            <in>1438</in>
+            <out>1575</out>
+            <file id="file-1"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v1</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-1</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>1</clipindex>
+            </link>
+          </clipitem>
+          <clipitem id="clipitem-a1-2">
+            <name>samsung_ifa2025_60sec_16x9_v05a-final_v1 (1080p).mp4</name>
+            <enabled>TRUE</enabled>
+            <duration>155</duration>
+            <rate>
+              <timebase>25</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>137</start>
+            <end>292</end>
+            <in>1575</in>
+            <out>1730</out>
+            <file id="file-1"/>
+            <sourcetrack>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+            </sourcetrack>
+            <link>
+              <linkclipref>clipitem-v2</linkclipref>
+              <mediatype>video</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+            <link>
+              <linkclipref>clipitem-a1-2</linkclipref>
+              <mediatype>audio</mediatype>
+              <trackindex>1</trackindex>
+              <clipindex>2</clipindex>
+            </link>
+          </clipitem>
+        </track>
+      </audio>
+    </media>
+  </sequence>
+</xmeml>
