@@ -119,7 +119,7 @@ The interface is split into two areas:
 
 Corresponds to the five steps of §4.5.2; the following reflects the actual UI.
 
-#### Step 1 · Project Setup and Footage Ingestion (① Ingest)
+#### Step 1 · Project Setup and Footage Ingestion 
 
 1. In the sidebar `⚙️ Project Settings`, enter a **Project ID** (default `1`) and an **Editor ID** (default `editor_01`). Both are used for project-level data isolation.
 2. In `📁 Footage`, set **Full path to the folder containing your video files** (default `./app/data/raw_footage`). If the folder exists, the UI shows `✓ Found N video files`; otherwise it warns `⚠ Folder not found`. Supported formats: `mp4, mov, avi, mxf, r3d, braw`.
@@ -131,7 +131,7 @@ Corresponds to the five steps of §4.5.2; the following reflects the actual UI.
 > - Per-run limit of **200 video files**; exceeding it **refuses the run** (the existing catalogue is never deleted and replaced with only the first 200 files), so split the footage folder into batches or raise the limit.
 > - **Incremental reuse**: unchanged files (same modification-time + size fingerprint) reuse their cached analysis, skipping FFmpeg/LLM calls; deleted source files drop out of the catalogue. A re-run typically takes about 5 seconds and consumes almost no tokens.
 
-#### Step 2 · Search (② Search)
+#### Step 2 · Search 
 
 1. Type what you are looking for in **Search query** (e.g. `e.g. Tech products`) and click `🔍 Search`.
 2. Results are grouped into three relevance tiers: `🟡 Suggested` (expanded by default) / `⚪ Neutral` / `🔴 Low` (collapsed by default).
@@ -147,7 +147,7 @@ Corresponds to the five steps of §4.5.2; the following reflects the actual UI.
 - Each row's `▶` opens a preview popover (inline playback + metadata).
 - **Optional shortcut**: skip Search and tick the entire Media Pool, letting Selection evaluate the full set against the editing intent. This means less manual work and one fewer retrieval stage, but Selection must consider more material, so reasoning time may increase.
 
-#### Step 4 · Edit Timeline Generation (③ Selection)
+#### Step 4 · Edit Timeline Generation 
 
 1. **Editing mode** (radio):
    - `🎞️ Clip Assembly` — Combine complete clips. The whole clip is the editing unit, original durations are kept, **no trimming**, no target duration.
@@ -166,7 +166,7 @@ The result renders inline in the Selection section:
 
 > Regenerating the timeline **clears the previous export** (so a stale export can never mismatch the new timeline).
 
-#### Step 5 · Project Export and NLE Review (④ Deliver)
+#### Step 5 · Project Export and NLE Review 
 
 1. Enter a **Sequence name** (default `MAPO Edit`).
 2. Click `📦 Export Project`. Delivery compiles the structured timeline into **FCP7 XML (xmeml v5) + JSON**, preserving order and in/out points exactly, writes them to the output directory, and shows an export summary (this stage calls no LLM — it is fully deterministic).
