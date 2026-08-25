@@ -17,26 +17,26 @@ Four agents run in a fixed order, driven from a [Streamlit](https://streamlit.io
 
 | Stage | What it does |
 |---|---|
-| **① Ingest** | Probes each file with ffprobe (resolution, orientation, fps, codec, audio, duration), detects scene cuts with FFmpeg, and sends sampled frames to GPT-5.5 Vision for tags (shot type, objects, keywords, description, people count, mood). It also splits every clip into ordered **events** — "what happens", with real start/end timecodes. Everything lands in a local catalogue. Re-running skips unchanged files. |
-| **② Search** | Type what you're looking for; you get back **whole clips**, ranked with a relevance % and a suggestion marker (🟡 suggested / ⚪ neutral / 🔴 low). A clip can surface because of a single moment inside it — the card then shows a "contains: …" reason. |
-| **Curation** | Tick the clips you want to use in the sidebar **Media Pool** (Select-all available). Only ticked clips reach Selection. |
-| **③ Selection** | An AI assistant editor: it takes your ticked clips as *candidates*, drops what doesn't serve your intent (and tells you why, as backup material), and lays the rest out as an explained timeline. |
-| **④ Deliver** | Compiles the timeline into an FCP7 XML (`xmeml` v5) + JSON, written to `app/data/output/exports`. Order and trims are preserved exactly — nothing is re-edited here. |
+| **① Ingest** | Analyses footage with ffprobe, FFmpeg, GPT-5.5 Vision, and embeddings, then builds a local searchable catalogue of clips and temporal events. |
+| **② Search** | Retrieves and ranks whole clips against a natural-language query, with relevance scores and retrieval reasons. |
+| **Curation** | Lets the editor select candidate clips in the Media Pool. Only selected clips reach Selection. |
+| **③ Selection** | Acts as an assistant editor, turning the curated candidate set into an explained edit timeline according to the editing intent. |
+| **④ Deliver** | Compiles the timeline into FCP7 XML (`xmeml` v5) + JSON for Premiere Pro import. |
 
 ### Two editing modes
 
-Selection has exactly two modes. They differ only in the **unit of editing**:
+Selection provides two editing modes:
 
 | Mode | Unit | Target Duration |
 |---|---|---|
-| 🎞️ **Clip Assembly** — vlog, documentary, travel, BTS, montage | the whole clip, at its original length | not applicable (no trimming) |
-| 🎯 **Moment Assembly** — build an edit from moments inside longer clips | a temporal event | optional |
+| 🎞️ **Clip Assembly** | Whole clip at original length | Not applicable |
+| 🎯 **Moment Assembly** | Temporal event within a clip | Optional |
 
-In Moment Assembly, a target duration is an *optimisation*: the agent first picks enough meaningful moments, then shortens the least important ones to fit. Nothing is cut proportionally, and no moment is silently removed — if the overrun can't be absorbed, it's reported back to you.
+Moment Assembly supports target-duration optimisation by trimming lower-value moments rather than proportionally shortening all material.
 
 ### Output aspect ratio
 
-You pick the output frame explicitly — **16:9 / 9:16 / 4:3 / 3:4 / 1:1** — and it carries through to the export. Source media is never modified: each clip is scaled to fit with its own aspect preserved, so footage is **never stretched and never cropped**. Where the ratios differ you get letterboxing/pillarboxing. (Selection may *prefer* footage that fits the frame; it never resizes anything.)
+The output frame is explicitly selected by the editor: **16:9 / 9:16 / 4:3 / 3:4 / 1:1**. Source media is never stretched or cropped; aspect-ratio differences are handled with letterboxing/pillarboxing.
 
 ---
 
@@ -81,24 +81,20 @@ PROCESSED_OUTPUT_DIR=./app/data/output
 ### Run
 
 ```bash
-python main.py                            # the only supported entry point 
+python main.py                 
 ```
 
 ### Then, in the browser
 
-**① Ingest** — set the footage folder and click *Run Ingest Analysis*. Later phases stay locked until ingest actually indexes something.
+**① Ingest** — set the footage folder and click *Run Ingest Analysis*.
 
-**② Search** — type a query, review the ranked clips, ➕ the ones you like into the Bin.
+**② Search** — enter a query and add relevant clips to the Media Pool.
 
-**Curate** — fine-tune the Media Pool in the sidebar.
+**③ Selection** — choose the editing mode, output aspect ratio, optional target duration (Moment Assembly only), and editing intent. Generate the edit timeline.
 
-**③ Selection** — choose **Editing Mode**, **Output aspect ratio**, an optional **Target Duration** (Moment Assembly only), and describe your **Editing Intent** (style, emotion, pacing, purpose — not technical operations). The agent returns an explained timeline.
+**④ Deliver** — export the timeline as FCP7 XML + JSON, then use **📂 Show in folder** to locate the XML for import into Premiere Pro.
 
-**④ Deliver** — enabled once a timeline exists. Exports the XML, then offers a **📂 Show in folder** button so you can drag it into Premiere (**File ▸ Import**).
-
-A running transcript of what the agents did is available in the collapsed **🛠️ Debug log** at the bottom. **Reset Pipeline** clears everything.
-
-> A control-by-control walkthrough, prompt best practices, and FAQ follow in the [📖 User Manual](#-user-manual) below.
+> For a detailed control-by-control walkthrough, see the [📖 MAPO Interface User Guide](#-user-manual).
 
 ---
 
@@ -205,10 +201,6 @@ The result renders inline in the Selection section:
 
 - **🛠️ Debug log (N messages)**: collapsible panel at the bottom of the main area; it records the raw exchanges of every agent (the key Selection/Delivery outputs already render in their own sections; this is the full transcript for troubleshooting).
 - **🔄 Reset Pipeline**: at the bottom of the sidebar; clears all session state (Media Pool ticks, search results, timeline, export) and restarts.
-- **Incremental reuse**: re-running Ingest skips unchanged files; only modified sources (size or modification time changed) trigger re-analysis.
-- **Known limitations**:
-  - The fingerprint is `mtime + size`, not a content hash — an in-place replacement that preserves both would be treated as unchanged and reuse the old result; force re-analysis is the explicit override.
-  - `📂 Show in folder` works only in local runs; under remote deployment the button degrades to showing the file path.
 
 
 ### FAQ
