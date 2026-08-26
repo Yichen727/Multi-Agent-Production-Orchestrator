@@ -100,6 +100,7 @@ The interface is split into two areas:
 > - Per-run limit of **200 video files**; exceeding it **refuses the run**.
 > - **Incremental reuse**: unchanged files reuse their cached analysis, skipping FFmpeg/LLM calls.
 
+
 #### Step 2 · Search
 1. Type what you are looking for in **Search query** and click `🔍 Search`.
    Describe the **content itself** — objects, scenes, actions, or atmosphere, rather than editing instructions.
@@ -109,11 +110,13 @@ The interface is split into two areas:
 4. Add/remove clips from the Media Pool: use the per-card `➕` / `➖`, or the per-tier `➕ Add all (N)` / `➖ Remove all (N)` for one-click bulk actions.
 5. `✖ Clear results` only clears the result cards.
 
+
 #### Step 3 · Candidate Curation
 
 - Tick the clips you want to use in the sidebar `🎞️ Media Pool`. `Select all` ticks/unticks the whole pool in one click; `Clear ✕` clears all selections; `↻ Refresh` reloads the pool.
 - Each row's `▶` opens a preview popover.
 - **Optional shortcut**: skip Search and tick the entire Media Pool, letting Selection evaluate the full set against the editing intent. This means less manual work and one fewer retrieval stage, but Selection must consider more material, so reasoning time may increase.
+
 
 #### Step 4 · Edit Timeline Generation
 
@@ -135,6 +138,7 @@ The result renders inline in the Selection section:
 
 > Regenerating the timeline **clears the previous export**.
 
+
 #### Step 5 · Project Export and NLE Review 
 
 1. Enter a **Sequence name** (default `MAPO Edit`).
@@ -142,11 +146,13 @@ The result renders inline in the Selection section:
 3. On success a `📂 Show <XML filename> in folder` button appears, which opens the file manager with the file selected (requires the app and the browser to run on the same machine).
 4. Drag the XML straight into **Premiere Pro (File ▸ Import)**; after import, make final adjustments in the timeline (e.g. extend or shorten individual clips).
 
+
 ### Debug & Maintenance
 
 - **🛠️ Debug log (N messages)**: collapsible panel at the bottom of the main area; it records the raw exchanges of every agent (the key Selection/Delivery outputs already render in their own sections; this is the full transcript for troubleshooting).
 - **🔄 Reset Pipeline**: at the bottom of the sidebar; clears all session state (Media Pool ticks, search results, timeline, export) and restarts.
 
+---
 
 ### FAQ
 
@@ -162,6 +168,7 @@ The result renders inline in the Selection section:
 | No OpenAI key | The app runs, but Search/Selection/vision analysis are unavailable; Ingest can only do local probing |
 | Thumbnails / inline playback unavailable | The codec does not support inline preview; this is a normal graceful degradation |
 
+---
 
 ### Third-party Services & Dependencies
 
@@ -175,6 +182,7 @@ The result renders inline in the Selection section:
 | Streamlit | Open-source UI framework / optional hosting | UI framework; optional hosting on Streamlit Community Cloud | no account for local runs; platform account for hosting |
 | Adobe Premiere Pro | target NLE (provided by the user, not a system dependency) | imports the FCP7 XML project | user's own software |
 
+---
 
 ## Project structure
 
