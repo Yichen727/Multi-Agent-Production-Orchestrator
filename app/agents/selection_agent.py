@@ -1,29 +1,4 @@
-"""Selection / Assistant-Editor Agent — edit-timeline orchestration.
-
-The editorial stage of the MAPO pipeline (Ingest → Search → Selection → Delivery). It
-does not produce a quality-ranked LIST; it produces an ordered EDIT TIMELINE from the
-clips the editor curated in the UI, which the Delivery Agent then compiles verbatim.
-
-There are exactly TWO user-facing editing modes, chosen by the editor in the UI. They
-differ only in the UNIT of editing:
-
-    CLIP ASSEMBLY   — combine COMPLETE clips into a coherent timeline. Each clip keeps
-                      its original duration; nothing is trimmed and a target duration
-                      does not apply. The agent's job is purely editorial: drop the
-                      candidates that do not serve the intent, decide the order, and
-                      explain it. (vlog, documentary, travel, BTS, atmosphere montage)
-    MOMENT ASSEMBLY — build the edit from meaningful MOMENTS inside longer clips. The
-                      agent inspects each clip's temporal events, picks the relevant
-                      ones, ranks their importance and arranges them. A target duration
-                      is OPTIONAL here and is applied as an optimisation over already-
-                      chosen moments — never as an allocation that splits time between
-                      them.
-
-Division of labour: the LLM does the EDITORIAL reasoning (what belongs, in what order,
-what matters most, what to drop and why); ``timeline_service`` does the deterministic
-arithmetic (boundaries, compression, validation). The agent is an assistant editor — it
-proposes and explains; the editor always makes the final call (Human-in-the-Loop).
-"""
+"""MAPO Selection / Assistant-Editor Agent."""
 
 import json
 from pathlib import Path
@@ -47,8 +22,6 @@ from app.services.timeline_service import (
     MODE_CLIP, MODE_MOMENT, MAX_BACKUP_ITEMS, build_clip_timeline, build_moment_timeline,
     compare_order, normalise_alternates,
 )
-# Output-aspect helpers only — Selection READS the delivery spec to prefer footage that
-# suits the frame; adapting the media to it is exclusively Delivery's job.
 from app.services.premiere_export_service import describe_fit, normalise_aspect_label
 from app.utils.logger import get_logger
 
@@ -59,13 +32,7 @@ logger = get_logger("selection_agent")
 
 
 def _pid_from_state(state) -> int:
-    """Current project id from the injected graph state (defaults to 1).
-
-    The MODEL never supplies this — it is injected by the ToolNode from
-    ``ProductionState`` (see ``InjectedState`` on the tools), so a tool call can never
-    target another project's catalogue (audit C-03). Identifier resolution is then
-    scoped to this id by ``catalogue_resolver``.
-    """
+    """Read the project id from injected state; never accept it from the LLM."""
     try:
         return int((state or {}).get("project_id"))
     except (TypeError, ValueError):
@@ -73,19 +40,13 @@ def _pid_from_state(state) -> int:
 
 
 def _mode_from_state(state) -> str:
-    """The EDITOR's chosen editing mode, injected from state (never model-supplied).
-
-    The mode is a UI decision, so the model cannot switch it by calling the other
-    planner: each planning tool checks this and refuses a mismatch. An empty/unknown
-    value means "not set by the UI" and leaves both planners open (direct/programmatic
-    invocation).
-    """
+    """Read the editor-selected mode from injected UI state."""
     raw = str((state or {}).get("editing_mode") or "").strip().lower().replace(" ", "_")
     return raw if raw in (MODE_CLIP, MODE_MOMENT) else ""
 
 
 def _target_from_state(state) -> float | None:
-    """The editor's optional Target Duration (seconds), injected from state."""
+    """Read the optional target duration from injected state."""
     try:
         value = float((state or {}).get("target_seconds"))
     except (TypeError, ValueError):
@@ -94,12 +55,7 @@ def _target_from_state(state) -> float | None:
 
 
 def _aspect_from_state(state) -> str:
-    """The editor's OUTPUT aspect ratio label, injected from state (``''`` if unset).
-
-    An explicit user input and an output SPECIFICATION — never inferred from the editing
-    prompt and never model-supplied, so the agent cannot change the delivery frame. The
-    planners stamp it onto the plan so it reaches Delivery unchanged.
-    """
+    """Read and normalise the editor-selected output aspect ratio."""
     try:
         return normalise_aspect_label((state or {}).get("aspect_ratio"))
     except ValueError:      # InvalidAspectRatio — validated upstream; ignore here
@@ -107,7 +63,7 @@ def _aspect_from_state(state) -> str:
 
 
 def _wrong_mode(state, wanted: str) -> str | None:
-    """Refusal message when a planner is called in the other editing mode, else ``None``."""
+    """Reject a planner call when it does not match the editor-selected mode."""
     mode = _mode_from_state(state)
     if not mode or mode == wanted:
         return None
@@ -119,11 +75,12 @@ def _wrong_mode(state, wanted: str) -> str | None:
 
 
 def _split(text: str | None, sep: str = ",") -> list[str]:
+    """Split a delimited string into non-empty tokens."""
     return [t.strip() for t in (text or "").split(sep) if t.strip()]
 
 
 def _floats(text: str | None) -> list[float] | None:
-    """Parse a comma-separated weight list; unparseable entries fall back to 1.0."""
+    """Parse comma-separated weights; invalid values default to 1.0."""
     tokens = _split(text)
     if not tokens:
         return None
@@ -137,22 +94,16 @@ def _floats(text: str | None) -> list[float] | None:
 
 
 def _enrich_excluded(project_id: int, raw) -> list[dict]:
-    """Resolve the agent's excluded refs into REAL clips and measured timecodes.
+    """Resolve rejected clip/event references into editor-readable metadata.
 
-    The agent identifies a dropped moment by its ``event_id`` (or a dropped clip by file
-    name), because that is what it actually has. Those are database identifiers and mean
-    nothing to an editor, so every entry is looked up here — project-scoped — and given
-    its source file name, its measured start/end timecodes and the event's own action
-    text. The model is never asked for a timecode, so none can be invented.
-
-    An entry that matches no catalogued event or clip keeps the raw ref and gets NO file
-    path or timecodes — it is shown as given rather than dressed up as resolved.
+    References come from the LLM, but file names and timecodes always come from
+    the project catalogue. Unresolved references remain unresolved rather than
+    being fabricated.
     """
     items = normalise_alternates(raw)
     if not items:
         return []
 
-    # One batched lookup for every ref in play, including grouped ones.
     ids: list[int] = []
     for item in items:
         for ref in [item["ref"], *item.get("also", [])]:
@@ -163,12 +114,11 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
     events = get_events_by_ids(project_id, ids) if ids else {}
 
     def _resolve(ref: str) -> dict | None:
-        """One ref → its real clip + measured timecodes, or ``None`` if nothing matched."""
         try:
             event = events.get(int(ref))
         except (TypeError, ValueError):
             event = None
-        if event:                                   # a rejected MOMENT
+        if event:                                  
             fp = event.get("file_path") or ""
             return {
                 "event_id": event.get("event_id"),
@@ -178,7 +128,7 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
                 "end_seconds": round(float(event.get("end_seconds") or 0.0), 3),
                 "label": (event.get("action") or "").strip()[:80],
             }
-        try:                                        # a rejected CLIP
+        try:                                        
             row = resolve_one(project_id, ref)
         except AmbiguousIdentifier:
             row = None
@@ -190,7 +140,6 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
             "file_path": fp,
             "name": Path(fp).name,
             "start_seconds": 0.0,
-            # No measured length → no end timecode, rather than a fabricated 0.
             "end_seconds": round(duration, 3) if duration > 0 else None,
             "label": "",
         }
@@ -201,8 +150,6 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
             label = item.get("label") or primary.pop("label", "")
             item.update(primary)
             item["label"] = label
-        # Grouped near-duplicates: resolved so the editor can find them, but they do NOT
-        # each take a slot in the shortlist.
         grouped = [g for g in (_resolve(r) for r in item.get("also", [])) if g]
         if grouped:
             item["also_details"] = grouped
@@ -210,7 +157,7 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
 
 
 def _excluded_headline(x: dict) -> str:
-    """``name (start–end)`` for one backup item — the way an editor refers to a clip."""
+    """Format one backup item as filename plus measured time range."""
     name = x.get("name") or x.get("ref") or "(unidentified)"
     start, end = x.get("start_seconds"), x.get("end_seconds")
     if start is None or end is None:
@@ -219,13 +166,7 @@ def _excluded_headline(x: dict) -> str:
 
 
 def _format_excluded(excluded: list[dict], omitted: int = 0) -> list[str]:
-    """Render backup material the way an EDITOR reads it, not the way the DB stores it.
-
-    Each item shows the source file, its measured start–end timecodes, a short action
-    label, why it is not in the edit, and how it could still be used — never a bare event
-    id. Grouped near-duplicates hang off their representative rather than taking their own
-    slot, and an over-long list is reported as trimmed rather than silently cut.
-    """
+    """Render resolved backup alternatives for the editor."""
     lines = ["", "🗂️ Not used — backup material", ""]
     for x in excluded:
         lines.append(f"• {_excluded_headline(x)}")
@@ -248,15 +189,7 @@ def _format_excluded(excluded: list[dict], omitted: int = 0) -> list[str]:
 
 
 def _order_lines(plan: dict) -> list[str]:
-    """Report the declared ordering strategy, and challenge an order that just echoes input.
-
-    Ordering is the core editorial act of this stage, so it is made explicit rather than
-    left implicit in the sequence of ids: the agent states the SHAPE it chose, and if the
-    resulting order turns out to be identical to the order the material was listed in, the
-    planner says so. That is not an error — chronological is right for plenty of edits —
-    but it is exactly the outcome that anchoring on the candidate list would also produce,
-    so the agent is asked to confirm it was a decision.
-    """
+    """Report the chosen ordering strategy and flag unchanged source ordering."""
     lines: list[str] = []
     strategy = plan.get("ordering_strategy")
     if strategy:
@@ -276,13 +209,10 @@ def _order_lines(plan: dict) -> list[str]:
 
 
 def _plan_block(lines: list[str], plan: dict) -> str:
-    """Append the fenced ```json plan the orchestrator reads back (never model prose)."""
+    """Append ordering, delivery-spec and validation information plus the JSON plan."""
     lines += _order_lines(plan)
     if plan.get("aspect_ratio"):
-        lines += ["", (f"🖼️ Output aspect ratio: {plan['aspect_ratio']} — Delivery scales "
-                       "each clip to FIT this frame with its own aspect preserved "
-                       "(letterbox/pillarbox as needed). No source media is cropped, "
-                       "resized or reframed.")]
+        lines += ["", f"🖼️ Output aspect ratio: {plan['aspect_ratio']}"]
     if not plan.get("valid", True):
         bad = plan.get("validation_errors", [])
         lines += ["", f"⛔ {len(bad)} segment(s) are INVALID and will block export:"]

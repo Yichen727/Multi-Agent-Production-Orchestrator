@@ -81,7 +81,20 @@ _SCAN_PREVIEW = 50
 
 @tool
 def scan_footage_directory(directory: str = None) -> str:
-    """Scan a directory for supported video files."""
+    """Scan a directory for supported video files (bounded, single traversal).
+
+    Walks the tree ONCE with ``os.walk`` and does NOT follow directory
+    symlinks/junctions, so symlink cycles cannot cause unbounded recursion. The
+    walk stops at a file/directory safety limit, and the returned summary is
+    truncated, so a huge footage folder cannot blow up CPU/RAM or the agent's
+    message history.
+
+    Args:
+        directory: Path to scan. Defaults to RAW_FOOTAGE_DIR.
+
+    Returns:
+        A bounded summary of the discovered video files.
+    """
     scan_dir = Path(directory or settings.RAW_FOOTAGE_DIR)
     if not scan_dir.exists():
         return f"Directory not found: {scan_dir}"
@@ -128,7 +141,14 @@ def scan_footage_directory(directory: str = None) -> str:
 
 @tool
 def verify_file_integrity(file_path: str) -> str:
-    """Verify a video file can be read by FFmpeg (basic integrity check)."""
+    """Verify a video file can be read by FFmpeg (basic integrity check).
+
+    Args:
+        file_path: Path to the video file.
+
+    Returns:
+        Verification result with duration if valid.
+    """
     path = Path(file_path)
     if not path.exists():
         return f"File not found: {file_path}"
@@ -142,7 +162,14 @@ def verify_file_integrity(file_path: str) -> str:
 
 @tool
 def create_project_structure(project_name: str) -> str:
-    """Create the standard MAPO project folder structure."""
+    """Create the standard MAPO project folder structure.
+
+    Args:
+        project_name: Name for the project directory.
+
+    Returns:
+        Confirmation of created directories.
+    """
     base = settings.PROCESSED_OUTPUT_DIR / project_name
     subdirs = ["proxies", "frames", "metadata", "reports", "exports"]
 
@@ -157,7 +184,14 @@ def create_project_structure(project_name: str) -> str:
 
 @tool
 def generate_proxy_for_file(file_path: str) -> str:
-    """Generate a low-resolution proxy for a video file."""
+    """Generate a low-resolution proxy for a video file.
+
+    Args:
+        file_path: Path to the original footage.
+
+    Returns:
+        Path to the generated proxy file.
+    """
     if not check_ffmpeg_installed():
         return "Error: FFmpeg is not installed. Please install FFmpeg first."
 
@@ -278,7 +312,15 @@ def _find_video_files(scan_dir: Path) -> tuple[list[Path], bool]:
 @tool
 def detect_new_footage(directory: str = None, project_id: int = 1,
                        state: Annotated[dict, InjectedState] = None) -> str:
-    """Find footage not yet present in the project catalogue."""
+    """Detect footage on disk that is NOT yet in the project's catalogue.
+
+    Read-only. Compares the video files in the directory against the catalogued
+    file paths and reports which are new — useful before deciding to (re)ingest.
+
+    Args:
+        directory: Footage directory to check. Defaults to the run's footage directory.
+        project_id: Project whose catalogue to compare against.
+    """
     scan_dir = _scan_dir(directory, state)
     project_id = _resolve_pid(state, project_id)
     if not scan_dir.exists():
@@ -340,21 +382,47 @@ def ingest_footage(directory: str = None, project_id: int = 1,
                    analyze_content: bool = True, generate_proxies: bool = False,
                    analyze_events: bool = True, force_reanalyze: bool = False,
                    state: Annotated[dict, InjectedState] = None) -> str:
-    """Ingest footage and rebuild the project catalogue.
+    """Run the ingest pipeline on a directory and (re)build the catalogue.
 
-    Unchanged files are reused by path, size, and modification time.
-    New or modified files undergo metadata, scene, vision, and event analysis.
+    INCREMENTAL BY DEFAULT: a file whose path is already catalogued and whose
+    content is unchanged (same size + modification time) is REUSED as-is — its
+    ffprobe metadata and GPT-5.5 Vision tags are kept, so no FFmpeg or LLM work runs
+    for it again. Only new or modified files go through full analysis. This keeps
+    repeated ingests fast and avoids re-spending Vision API calls.
+
+    For each file needing analysis it performs, in order:
+      1. VERIFY the media is readable (ffprobe).
+      2. TECHNICAL METADATA — true dimensions, display orientation
+         (portrait/landscape/square, rotation-aware), fps, codec, audio presence,
+         duration.
+      3. SHOT/SCENE DETECTION — FFmpeg scene-change cut count.
+      4. VISION TAGGING (if analyze_content) — GPT-5.5 watches sampled frames and
+         returns a description, shot type, objects, searchable keywords, and an
+         approximate people count.
+      5. TEMPORAL EVENT EXTRACTION (if analyze_events) — the clip is split into event
+         windows (scene cuts + long-scene sub-division) and GPT-5.5 describes WHAT
+         HAPPENS in each (action + change), stored as ordered ``clip_events`` with real
+         start/end timecodes and their own embeddings for moment-level search.
+      6. (optional) PROXY generation for each clip.
+    The merged results (reused + freshly analysed) REPLACE the project's catalogue,
+    so files deleted from disk drop out too.
+
+    Only measured / model-observed facts are stored. When a step cannot run (no
+    FFmpeg, no API key, unreadable file), the corresponding fields are left
+    unclassified rather than guessed.
 
     Args:
-        directory: Footage directory. Defaults to the configured directory.
-        project_id: Project to rebuild.
-        analyze_content: Enable GPT vision tagging.
-        generate_proxies: Generate low-resolution proxies.
-        analyze_events: Extract temporal events.
-        force_reanalyze: Ignore cached results.
+        directory: Footage directory to ingest. Defaults to the run's footage directory.
+        project_id: Project to (re)build the catalogue for.
+        analyze_content: Run GPT-5.5 Vision tagging on sampled frames (default True).
+        generate_proxies: Also generate a low-res proxy per clip (slow; default False).
+        analyze_events: Extract temporal 'what happens' events per clip (default True;
+            requires analyze_content / an API key — skipped otherwise).
+        force_reanalyze: Ignore the cache and re-analyse every file (default False).
 
     Returns:
-        Ingest summary for the UI.
+        A summary: clips indexed, how many were reused vs newly analysed, the
+        orientation breakdown, and how many were vision-tagged.
     """
     scan_dir = _scan_dir(directory, state)
     project_id = _resolve_pid(state, project_id)
@@ -625,7 +693,14 @@ def ingest_footage(directory: str = None, project_id: int = 1,
 
 @tool
 def get_shots_by_type(shot_type: str) -> str:
-    """Retrieve shots matching a shot type."""
+    """Retrieve all shots of a specific type from the database.
+
+    Shot types: wide_shot, close_up, establishing, medium_shot,
+    over_shoulder, pov, drone, gimbal, handheld
+
+    Args:
+        shot_type: Type of shot to search for.
+    """
     return db.run(
         _sql("""SELECT s.shot_id, s.file_path, s.shot_type,
                        s.duration_seconds, s.keywords
@@ -639,7 +714,11 @@ def get_shots_by_type(shot_type: str) -> str:
 
 @tool
 def classify_shot_attributes(shot_id: int) -> str:
-    """Get full metadata for a specific shot."""
+    """Get full metadata for a specific shot.
+
+    Args:
+        shot_id: Unique shot identifier.
+    """
     return db.run(
         _sql("SELECT * FROM shots WHERE shot_id = :sid"),
         parameters={"sid": shot_id},
@@ -652,7 +731,14 @@ def classify_shot_attributes(shot_id: int) -> str:
 
 @tool
 def export_metadata_json(project_id: int = 1) -> str:
-    """Export project metadata as JSON."""
+    """Export all project metadata as a JSON file (the "store in JSON" deliverable).
+
+    Args:
+        project_id: Project identifier.
+
+    Returns:
+        Path to the exported JSON file.
+    """
     shots = db.run(
         _sql("SELECT * FROM shots WHERE project_id = :pid"),
         parameters={"pid": project_id},

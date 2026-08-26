@@ -76,19 +76,30 @@ def search_catalogue(keywords: str = None, core_keywords: str = None,
                      shot_type: str = None, orientation: str = None, people: int = None,
                      min_duration: float = None, max_duration: float = None,
                      state: Annotated[dict, InjectedState] = None) -> str:
-    """Search the catalogue using hybrid semantic and structured retrieval.
+    """Unified hybrid search over the catalogue — the ONE search tool.
+
+    Combines structured SQL filters with semantic vector recall (falling back to
+    lexical matching when embeddings are unavailable). Fill only the arguments the
+    query implies; leave the rest as None.
 
     Args:
-        core_keywords: User's literal content terms, without synonyms.
-        keywords: Core terms plus controlled synonym expansion.
-        shot_type: Shot type filter.
-        orientation: Portrait, landscape, or square.
-        people: Minimum visible people count.
-        min_duration: Minimum duration in seconds.
-        max_duration: Maximum duration in seconds.
+        core_keywords: The things the USER LITERALLY ASKED FOR, translated to English —
+            the entities/subjects/actions themselves, comma-separated, NO synonyms
+            (user says "手机" or "phone" → "phone"). Matching these counts as strong
+            evidence, so putting a synonym here would overstate a match. Always fill
+            this whenever the request has any content component.
+        keywords: The FULL retrieval term set — ``core_keywords`` PLUS your synonym
+            expansion (e.g. "phone, mobile phone, smartphone, cellphone"). Comma-
+            separated. Expansion widens recall only; it can never certify a match.
+        shot_type: e.g. wide_shot, close_up, establishing, medium_shot, aerial.
+        orientation: 'portrait' | 'landscape' | 'square' (vertical/horizontal ok).
+        people: Minimum number of people visible (use for "clips with people").
+        min_duration: Minimum clip length in seconds.
+        max_duration: Maximum clip length in seconds.
 
     Returns:
-        Matching clips with metadata and relevance information.
+        A numbered list of matching clips with real metadata, a suggestion marker,
+        and a grounded relevance %. Retrieval only — never a "best" pick.
     """
     candidates = hybrid_search(
         _pid_from_state(state), keywords=keywords or core_keywords,
