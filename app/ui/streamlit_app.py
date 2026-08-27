@@ -1,16 +1,13 @@
 """MAPO — Streamlit UI.
 
-The UI is a thin presentation layer over the four-stage pipeline:
+Thin presentation layer for:
+    Ingest → Search → Selection → Deliver
 
-    Sidebar: Settings · Footage · Media Pool
-    Main:    ① Ingest → ② Search → ③ Selection → ④ Deliver
-
-The Media Pool is the single source of truth for selected clips.
-Selection produces a structured timeline, and Delivery deterministically
-compiles that plan into a Premiere Pro–compatible FCP7 XML project.
+The Media Pool is the source of truth for selected clips.
+Selection produces a structured timeline; Delivery deterministically
+compiles it into a Premiere Pro–compatible FCP7 XML project.
 
 Launch:
-    python main.py
     streamlit run app/ui/streamlit_app.py
 """
 
@@ -26,9 +23,7 @@ st.set_page_config(page_title="MAPO", page_icon="🎬", layout="wide")
 SUGGESTION_MARK = {"suggested": "🟡", "neutral": "⚪", "low": "🔴"}
 _TIERS = [("suggested", "🟡 Suggested"), ("neutral", "⚪ Neutral"), ("low", "🔴 Low")]
 
-# The ONLY two editing modes the Selection stage exposes: label → (mode id, caption).
-# They differ in the UNIT of editing — whole clips vs moments inside clips. Duration
-# control is a property of Moment Assembly alone, not a mode of its own.
+# Selection editing modes.
 EDITING_MODES = {
     "🎞️ Clip Assembly": ("clip_assembly",
                           "Combine complete clips."),
@@ -42,14 +37,11 @@ _DURATION_STATUS = {
     "over_target": "over target — kept for content",
 }
 
-# Output aspect ratio — an explicit OUTPUT SPEC the editor picks, never inferred from the
-# editing prompt. All five propagate identically (Selection → plan → Delivery). Delivery
-# scales clips to FIT the frame: aspect preserved, no cropping, no stretching —
-# letterbox/pillarbox where the source and target ratios differ.
+# Editor-selected output specification propagated through Selection → Delivery.
 ASPECT_CHOICES = ["16:9", "9:16", "4:3", "3:4", "1:1"]
 
 
-# ── Selection state (Bin checkbox is the single source of truth) ────────────────
+# ── Selection state (Media Pool checkbox is the single source of truth) ────────────────
 
 
 def _bin_key(path: str) -> str:
@@ -57,52 +49,30 @@ def _bin_key(path: str) -> str:
 
 
 def _set_bin(path: str, value: bool):
-    """on_click callback: set a Bin clip's selected state before the rerun.
-
-    Makes the Search ➕/➖ toggle persistent — it flips to ➖ and stays until the user
-    clicks ➖ or unticks the clip in the Bin.
-    """
+    """Persist a clip's selected state in session state."""
     st.session_state[_bin_key(path)] = value
 
 
 def _set_bin_many(paths: list[str], value: bool):
-    """on_click callback: tick/untick a WHOLE tier of search results at once.
-
-    Same mechanism as ``_set_bin``, applied to every path in one go — that is what makes
-    "add all 🟡 Suggested to the Media Pool" a single click instead of one ➕ per card.
-    """
+    """Set selection state for all clips in a search tier."""
     for path in paths:
         st.session_state[_bin_key(path)] = value
 
 
 def _clear_all_selections():
-    """on_click callback: untick every Bin clip.
-
-    Must run in a callback (not the script body): callbacks execute BEFORE the widgets
-    are instantiated on the rerun, so assigning to the checkbox keys is allowed — doing
-    it inline after the checkboxes render raises a StreamlitAPIException.
-    """
+    """Clear all Media Pool selections."""
     for k in [k for k in st.session_state if k.startswith("bin_")]:
         st.session_state[k] = False
 
 
 def _toggle_select_all():
-    """on_change callback for the 'Select all' checkbox in the Media Pool.
-
-    Sets every Bin clip to the checkbox's new value. It fires ONLY when the editor
-    toggles it (not on every rerun), so it never fights the editor's per-clip ticks —
-    after a Select-all / Deselect-all they can freely adjust individual clips.
-    """
+    """Apply the Select-all value to all clips."""
     value = bool(st.session_state.get("select_all_bin", False))
     for c in st.session_state.get("bin_shots", []):
         st.session_state[_bin_key(c["file_path"])] = value
 
 
-# ── Orchestrator (the single, explicit pipeline path — audit H-06) ─────────────
-#
-# The UI is a thin presentation layer: every stage goes through the pipeline
-# orchestrator's explicit stage functions (no LLM supervisor, no bypass). These are
-# lazy-imported so Streamlit reruns don't recompile the graphs each time.
+# ── Orchestrator ────────────────────────────────────────────────────
 
 
 def _orch():
@@ -118,11 +88,7 @@ def _pid(project_id):
 
 
 def _backup_headline(item: dict) -> str:
-    """``name (start–end)`` for one backup-material item — an editor's clip reference.
-
-    The timecodes come from the catalogue (the Selection tool resolved them); an item that
-    matched nothing simply shows its raw reference rather than an invented range.
-    """
+    """Format a backup item's name and measured time range."""
     name = item.get("name") or item.get("ref") or "(unidentified)"
     start, end = item.get("start_seconds"), item.get("end_seconds")
     if start is None or end is None:
@@ -131,12 +97,7 @@ def _backup_headline(item: dict) -> str:
 
 
 def _backup_span(item: dict) -> str:
-    """The MEASURED extent of one backup item, phrased for whichever unit it is.
-
-    A rejected moment reads as ``in → out · length``; a rejected whole clip reads as
-    ``full clip · length``; an item whose length was never measured says so rather than
-    display a 0.00s–0.00s range that looks like a real trim.
-    """
+    """Format the measured span of a backup item."""
     start, end = item.get("start_seconds"), item.get("end_seconds")
     if end is None:
         return "length unmeasured"
@@ -147,13 +108,7 @@ def _backup_span(item: dict) -> str:
 
 
 def _render_backup_item(index: int, item: dict) -> None:
-    """One backup-material entry as its own card, in a fixed scannable order.
-
-    Header (rank · unit icon · file name · measured timecodes) → the moment's own action
-    label → the two editorial lines the agent owns: why it is not in the edit, and what it
-    could still serve. Grouped near-duplicates hang off the card as one line instead of
-    each claiming a slot, so the shortlist stays a shortlist.
-    """
+    """Render one backup-material card."""
     with st.container(border=True):
         kind = "🎯" if item.get("event_id") else "🎞️"
         name = item.get("name") or item.get("ref") or "(unidentified)"
@@ -165,7 +120,7 @@ def _render_backup_item(index: int, item: dict) -> None:
         rows = [f"**Why not used** · {item.get('reason') or '*not stated*'}"]
         if item.get("suggested_use"):
             rows.append(f"**Could be used for** · {item['suggested_use']}")
-        st.markdown("  \n".join(rows))       # two spaces = one tight line break
+        st.markdown("  \n".join(rows))      
         group = item.get("also_details") or []
         if group:
             st.caption(f"⧉ Same call for {len(group)} near-duplicate(s): "
@@ -173,12 +128,8 @@ def _render_backup_item(index: int, item: dict) -> None:
 
 
 def _strip_backup_section(report: str) -> str:
-    """Drop any prose "not used / backup material" block from the agent's report.
-
-    Backup material is rendered ONCE, from the plan (resolved names + measured timecodes)
-    in its own expander. The agent is told not to repeat it in prose, but a model can
-    always drift, so the duplicate is removed at render time rather than shown twice.
-    Anything from a later ``Notes:``/heading line onwards is kept — only the list goes.
+    """Remove the backup-material section from agent prose.
+    Backup items are rendered separately from the structured plan.
     """
     def _is_heading(ln: str) -> bool:
         low = ln.strip().lstrip("#*_ ").lower()
@@ -199,37 +150,27 @@ def _strip_backup_section(report: str) -> str:
 
 
 def _reveal_in_file_manager(target: str) -> str | None:
-    """Open the OS file manager with ``target`` selected, ready to drag into an NLE.
-
-    Returns ``None`` on success, or a short reason it could not be opened. This works only
-    when the browser and the Streamlit server are the SAME machine — which is the supported
-    ``python main.py`` local setup. A remote server cannot open a window on the viewer's
-    machine, so the caller reports the path instead of pretending it worked.
+    """Open the OS file manager with the exported file selected.
+    Returns None on success or an error message when unavailable.
     """
     path = Path(target)
     if not path.exists():
         return "the file is no longer on disk"
     try:
         if sys.platform.startswith("win"):
-            # Explorer wants the flag and the path glued together; it also exits non-zero
-            # even on success, so fire-and-forget rather than check the return code.
+            # Explorer uses /select,<path>.
             subprocess.Popen(["explorer", f"/select,{path}"])
         elif sys.platform == "darwin":
             subprocess.Popen(["open", "-R", str(path)])
         else:
-            subprocess.Popen(["xdg-open", str(path.parent)])   # no "select" equivalent
+            subprocess.Popen(["xdg-open", str(path.parent)])  
     except OSError as e:
         return str(e)
     return None
 
 
 def _render_export_actions(result) -> None:
-    """One click to reveal the exported project file, so it can be dragged into Premiere.
-
-    Gated on the COMPILER's own structured ``DeliveryResult`` (status success + a real path
-    that still exists), never on the agent's prose: a refused or failed compile must not
-    offer to open a file that was never written.
-    """
+    """Show the exported project and provide a file-manager action."""
     xml_path = getattr(result, "xml_path", None) if result else None
     if not (xml_path and getattr(result, "status", None) == "success"):
         return
@@ -248,49 +189,31 @@ def _render_export_actions(result) -> None:
             st.caption(f"Opened {Path(xml_path).parent}")
 
 
-# ── Backend calls (thin wrappers over the orchestrator stages) ─────────────────
+# ── Backend calls  ────────────────────────────────────────────────────────────────────
 
 
 def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str,
                   editing_mode: str = "clip_assembly", target_seconds: float | None = None,
                   aspect_ratio: str = ""):
-    """③ Selection — returns (narration_text, structured_plan_or_None).
-
-    The editor picks the editing mode: CLIP ASSEMBLY (complete clips, original durations,
-    no target duration) or MOMENT ASSEMBLY (moments inside clips, optional target
-    duration), plus the OUTPUT ASPECT RATIO (a delivery spec that rides along the plan to
-    Delivery). Everything else — which candidates belong, the order, the pacing — is the
-    Selection Agent's editorial reasoning.
-    """
+    """Run Selection and return its narration plus structured plan."""
     return _orch().run_selection(intent, selected_paths, project_id, user_id,
                                  editing_mode=editing_mode, target_seconds=target_seconds,
                                  aspect_ratio=aspect_ratio)
 
 
 def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
-    """④ Delivery — compile the STRUCTURED plan (required; no Bin-order fallback, H-04).
-
-    Returns ``(agent_text, DeliveryResult | None)``; the structured result carries the
-    written artefact paths so the UI can reveal the file on disk.
-    """
+    """Compile a structured Selection plan into delivery outputs."""
     return _orch().run_delivery(plan, project_id, user_id, sequence_name=sequence_name)
 
 
 def load_bin(project_id):
-    """Load the full media pool (every catalogued clip, fixed file-name order)."""
+    """Load the catalogue into the Media Pool."""
     from app.services.retrieval_service import hybrid_search
     st.session_state.bin_shots = hybrid_search(_pid(project_id), top_k=1000)
 
 
 def do_search(query: str, project_id: str, user_id: str):
-    """② Search — rank/mark matching CLIPS via the orchestrator's Search stage.
-
-    Delegates to ``run_search``, which invokes the Search Agent (falling back to direct
-    hybrid retrieval when the LLM is unavailable); each candidate carries its own
-    🟡 suggested / ⚪ neutral / 🔴 low marker, which is what the result cards group by. The
-    unit is always the whole clip; a match driven by a moment inside a clip carries a
-    ``matched_event`` hint shown as the card's reason. Never touches selection.
-    """
+    """Run clip-level Search and store the ranked results."""
     st.session_state.search_results = _orch().run_search(query, project_id, user_id)
 
 
@@ -322,10 +245,7 @@ def _thumb(c):
 
 
 def _reason(c, tier: str) -> str:
-    """A short 'why' for a search card. When a MOMENT inside the clip drove the match
-    (event-aware recall), lead with that moment — it explains why this clip surfaced.
-    Otherwise fall back to the clip's own vision description, then keyword tags, so the
-    editor reads what the shot actually SHOWS rather than a bag of keywords."""
+    """Return a short explanation for why a clip matched the query."""
     if tier == "low":
         return "weak semantic match"
     ev = c.get("matched_event")
@@ -376,26 +296,23 @@ def _render_preview(c):
 
 
 def render_bin(project_id, locked):
-    """Render the Bin section in the sidebar: checkbox + ▶ preview per clip."""
+    """Render the Media Pool section in the sidebar: checkbox + ▶ preview per clip."""
     st.subheader("🎞️ Media Pool")
     st.caption("☑ add to edit · ▶ preview")
     if locked:
-        st.info("🔒 Run Ingest to populate the Bin.")
+        st.info("🔒 Run Ingest to populate the Media Pool.")
         return
 
     shots = st.session_state.bin_shots
     if not shots:
-        st.info("Bin is empty. Run Ingest to populate it.")
+        st.info("Media Pool is empty. Run Ingest to populate it.")
         return
 
-    # Select-all toggle: ticks/unticks every clip when changed, then the editor can still
-    # adjust individual clips (it only acts on toggle, never on rerun).
+    # Select-all changes all clip states without overriding later individual edits.
     st.checkbox("Select all", key="select_all_bin", on_change=_toggle_select_all,
                 help="Tick or untick every clip in the pool")
 
-    # FIXED file-name / ingestion order — ticking never moves a row. The pool always
-    # shows the WHOLE catalogue: filtering it by the last search would hide clips the
-    # editor may still want, and Search already has its own tiered result list.
+    # Keep the full catalogue in ingestion order; Search has its own result list.
     for c in shots:
         path = c["file_path"]
         name = Path(path).name
@@ -424,8 +341,7 @@ def render_search_results():
     for c in st.session_state.search_results:
         grouped.setdefault(c.get("suggestion", "low"), []).append(c)
 
-    # Each tier collapses into its own expander. Only 🟡 Suggested is open by default —
-    # it holds the highest-confidence matches; ⚪ Neutral and 🔴 Low start collapsed.
+    # Each tier collapses into its own expander
     _EXPANDED = {"suggested": True, "neutral": False, "low": False}
 
     for tier, header in _TIERS:
@@ -433,10 +349,7 @@ def render_search_results():
         if not items:
             continue
         with st.expander(f"{header} ({len(items)})", expanded=_EXPANDED.get(tier, False)):
-            # Bulk controls for the whole tier — one click instead of one ➕ per card,
-            # which matters when a query returns dozens of matches. They write the SAME
-            # bin_<path> keys as the per-card ➕/➖, so the sidebar Bin, the card icons and
-            # ③ Selection's count all stay in sync automatically.
+            # Bulk actions share the same Media Pool state as individual result buttons.
             paths_in_tier = [c["file_path"] for c in items]
             bulk_add, bulk_del, _ = st.columns([1.4, 1.4, 3.2])
             with bulk_add:
@@ -470,10 +383,10 @@ def render_search_results():
                             st.image(thumb, width=200)
                 with action:
                     if in_bin:
-                        st.button("➖", key=f"srch_tgl_{path}", help="Untick in Bin",
+                        st.button("➖", key=f"srch_tgl_{path}", help="Untick in Media Pool",
                                   on_click=_set_bin, args=(path, False))
                     else:
-                        st.button("➕", key=f"srch_tgl_{path}", help="Tick in Bin",
+                        st.button("➕", key=f"srch_tgl_{path}", help="Tick in Media Pool",
                                   on_click=_set_bin, args=(path, True))
         st.markdown("")
 
@@ -496,7 +409,7 @@ def main():
 
     locked = not st.session_state.ingest_done
 
-    # ── Sidebar: settings + the shared Bin (the workflow's data pool) ──────────
+    # ── Sidebar: settings + the shared Media Pool  ──────────
     with st.sidebar:
         st.header("⚙️ Project Settings")
         project_id = st.text_input("Project ID", value="1")
@@ -519,7 +432,7 @@ def main():
 
         st.divider()
 
-        # Bin — its own section, the shared media pool.
+        # Media Pool — its own section, the shared media pool.
         if st.session_state.ingest_done and not st.session_state.bin_shots:
             load_bin(project_id)
         render_bin(project_id, locked)
@@ -540,7 +453,7 @@ def main():
                            help="Ingest Agent — scan, vision-tag, embed, catalogue")
     st.divider()
 
-    # ② Search — decision cards (always clip-level; choosing a moment is Selection's job)
+    # ② Search
     st.subheader("② Search")
     st.caption("Find matching clips and add them to the Media Pool.")
 
@@ -563,7 +476,7 @@ def main():
     render_search_results()
     st.divider()
 
-    # ③ Selection — two editing modes, nothing else to configure
+    # ③ Selection
     st.subheader("③ Selection")
     st.caption("Choose an editing mode and describe your intent.")
     selected_paths = [c["file_path"] for c in st.session_state.bin_shots
@@ -591,8 +504,7 @@ def main():
             disabled=sel_disabled, key="aspect_ratio",
             )
     with o2:
-        # Target Duration applies to MOMENT ASSEMBLY only — Clip Assembly keeps every
-        # clip's original length, so there is nothing to optimise. Default is N/A.
+        # Target duration is only available in Moment Assembly.
         target_seconds = st.number_input(
             "Target duration (seconds)", min_value=1.0, max_value=7200.0, step=5.0,
             value=None, placeholder="N/A", format="%.0f",
@@ -613,7 +525,6 @@ def main():
                            help="Selection Agent — an assistant editor: it curates, orders "
                                 "and explains (no fixed narrative arc)")
 
-    # Selection output renders HERE, inside the Selection section.
     if st.session_state.get("selection_output"):
         plan = st.session_state.get("last_timeline_plan")
         if plan:
@@ -634,8 +545,7 @@ def main():
                            f"{plan.get('total_seconds')}s (no trimming)")
             if plan.get("aspect_ratio"):
                 st.caption(f"🖼️ Output frame: {plan['aspect_ratio']}")
-            # Ordering is the stage's core editorial act — surface the declared shape, and
-            # flag an order that merely reproduces how the material was listed.
+            # Surface the declared ordering strategy and flag unchanged input order.
             if plan.get("ordering_strategy"):
                 st.caption(f"🧭 Ordering: {plan['ordering_strategy']}")
             if (plan.get("order_check") or {}).get("unchanged"):
@@ -643,8 +553,7 @@ def main():
                            "check the agent's reasoning below for why that shape fits.")
         with st.container(border=True):
             st.markdown(_strip_backup_section(st.session_state.selection_output))
-        # Backup material, identified the way an editor reads it — source file + real
-        # timecodes, never a bare event id. This expander is the SINGLE place it appears.
+        # Render excluded alternatives separately from the agent's prose.
         dropped = (plan or {}).get("excluded") or []
         if dropped:
             with st.expander(f"🗂️ Not used — backup material ({len(dropped)})",
@@ -659,12 +568,9 @@ def main():
                                "capped at the strongest alternatives.")
     st.divider()
 
-    # ④ Deliver — compile the timeline into a Premiere-importable project
+    # ④ Deliver
     st.subheader("④ Deliver")
     st.caption("Export the generated timeline as a Premiere Pro–compatible project.")
-    # H-04: Delivery needs the STRUCTURED plan (ordered segments) from Selection — not
-    # merely some timeline text. Without a structured plan there is no defined edit order
-    # to compile and NO media-pool-order fallback, so Deliver stays disabled.
     _plan = st.session_state.get("last_timeline_plan")
     have_plan = bool(_plan and _plan.get("segments"))
     if locked:
@@ -684,7 +590,6 @@ def main():
                             disabled=locked or not have_plan,
                             help="Delivery Agent — compiles the ordered timeline segments")
 
-    # Delivery output renders HERE, inside the Deliver section.
     if st.session_state.get("delivery_output_text"):
         with st.container(border=True):
             st.markdown(st.session_state.delivery_output_text)
@@ -696,15 +601,10 @@ def main():
         with st.spinner("Ingest Agent is scanning, tagging and cataloguing footage..."):
             try:
                 from app.services.database_service import get_catalogued_paths
-                # run_ingest passes the footage directory on state (no global mutation,
-                # H-07) and returns a structured IngestResult.
                 response, res = _orch().run_ingest(footage_path, project_id, user_id)
                 st.session_state.messages.append(
                     {"role": "user", "content": f"[Ingest] {footage_path}"})
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                # C-08: unlock later phases ONLY on a real structured success — status
-                # success/partial_success AND clips indexed AND an independent catalogue
-                # check. A non-empty agent message (e.g. "Directory not found") never unlocks.
                 catalogued = len(get_catalogued_paths(_pid(project_id)))
                 if (res is not None and res.status in ("success", "partial_success")
                         and res.indexed_count > 0 and catalogued > 0):
@@ -730,7 +630,7 @@ def main():
                         intent_text.strip(), selected_paths, project_id, user_id,
                         editing_mode=mode_id, target_seconds=target_seconds,
                         aspect_ratio=aspect_ratio)
-                    # Render inline in the Selection section + keep a debug-log copy.
+                    # Render in Selection and retain a debug-log copy.
                     st.session_state.selection_output = response
                     st.session_state.messages.append({
                         "role": "user",
@@ -738,12 +638,8 @@ def main():
                                     f"{target_seconds or 'N/A'} · intent: {intent_text.strip()} "
                                     f"· {len(selected_paths)} candidate clip(s)")})
                     st.session_state.messages.append({"role": "assistant", "content": response})
-                    # The STRUCTURED plan is the ONLY thing Delivery consumes (audit
-                    # H-04): there is no Bin-order fallback. If Selection produced no
-                    # structured plan, Delivery stays disabled and asks for a re-run.
                     st.session_state.last_timeline = response
                     st.session_state.last_timeline_plan = plan
-                    # A fresh timeline invalidates any previous export.
                     st.session_state.delivery_output_text = ""
                 except Exception as e:
                     st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
@@ -753,9 +649,6 @@ def main():
     elif run_deliver:
         with st.spinner("Delivery Agent is compiling the Premiere project..."):
             try:
-                # H-04: Delivery is driven ONLY by the structured plan's ordered segments.
-                # The DeliveryResult is the compiler's own record of what it wrote — it is
-                # what gates the "show in folder" action, not the agent's narration.
                 response, res = run_delivery(
                     st.session_state.get("last_timeline_plan"),
                     project_id, user_id, (seq_name.strip() or "MAPO Edit"))
@@ -765,15 +658,11 @@ def main():
                     "role": "user", "content": f"[Deliver] compile '{seq_name.strip() or 'MAPO Edit'}'"})
                 st.session_state.messages.append({"role": "assistant", "content": response})
             except Exception as e:
-                # No artefact was written — drop any earlier one so the reveal button can't
-                # point at a stale export.
                 st.session_state.delivery_result = None
                 st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
         st.rerun()
 
     # ── Debug log (collapsed) ─────────────────────────────────────────────────
-    # The primary Selection/Delivery outputs render inside their own sections above;
-    # this is a demoted, collapsed raw log of every agent exchange for debugging.
     with st.expander(f"🛠️ Debug log ({len(st.session_state.messages)} messages)", expanded=False):
         if not st.session_state.messages:
             st.caption("No agent activity yet.")
