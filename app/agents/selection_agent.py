@@ -775,34 +775,37 @@ metadata — every real length and trim comes from the planning tool. When an at
 missing/'unclassified', say you inferred the placement from what IS known. If no
 candidates resolve, say so instead of fabricating.
 
-OUTPUT FORMAT — an ordered edit timeline, NOT a score ranking. For EVERY step explain
-(a) why this material is in the edit, (b) why it sits at THIS position and how it connects
-to the surrounding segments, and (c) what it does for the pacing/rhythm:
+OUTPUT FORMAT — an ordered edit timeline, NOT a score ranking.
 
-    🎬 Proposed Edit Timeline — <one-line read of the intent + the structure you chose>
-    Mode: <CLIP ASSEMBLY | MOMENT ASSEMBLY> · <target/length as the planner reported it>
-    Ordering: <your ordering_strategy — the shape you chose and why. If the planner
-               flagged that your order matches the source chronology, say explicitly why
-               chronological is the right shape here, or re-order and re-plan.>
-    Output frame: <the aspect ratio, and — only if it influenced your picks — one line on
-                   how, e.g. "9:16: favoured the portrait shots; the two landscape clips
-                   are essential to the story and will be letterboxed">
+Do NOT repeat plan metadata that is already shown by the UI, including:
+- editing mode
+- total or planned duration
+- target duration
+- output aspect ratio
+- ordering_strategy as a metadata field
 
+The UI renders these values directly from the structured plan.
 
-    1. IMG_0003.MOV  (0.0–4.0s · 4.0s)
-       Why selected: Crowd atmosphere is the energy the intent asks to open on.
-       Why here: Sets the tempo immediately; nothing needs to precede it.
-       Connects: — (first segment)
-       Pacing: High-energy cold open, establishes the rhythm.
-    2. IMG_0018.MOV  (12.0–15.0s · 3.0s)
-       Why selected: Gives the viewer a subject to follow after the wide opener.
-       Why here: Pulls focus inward from the crowd to the players.
-       Connects: Cuts from wide atmosphere to a human subject.
-       Pacing: Steadies briefly before the action ramps up.
+Your response should provide only the editorial explanation and timeline:
 
-    (…as many steps as the intent needs — no more, no fewer.)
+    🎬 Proposed Edit Timeline
 
-    Notes: <pacing, gaps, duration trade-offs, alternatives the editor should weigh>
+    <brief explanation of the chosen structure, especially why the ordering
+    fits the editing intent. Do not restate the intent verbatim.>
+
+    1. IMG_0003.MOV (0.0–4.0s · 4.0s)
+       Why selected: ...
+       Why here: ...
+       Connects: ...
+       Pacing: ...
+
+    2. IMG_0018.MOV (12.0–15.0s · 3.0s)
+       Why selected: ...
+       Why here: ...
+       Connects: ...
+       Pacing: ...
+
+    Notes: <only if there are meaningful pacing, gap, or editorial trade-offs>
 
 DO NOT write a "🗂️ Not used / backup material" section in this report. The shortlist you
 send in `excluded_json` is already presented to the editor separately, rendered from the
