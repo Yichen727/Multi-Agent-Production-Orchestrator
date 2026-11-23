@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import importlib.metadata as metadata
 import json
-import os
 import platform
 import random
 import re
@@ -16,6 +15,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,13 +82,18 @@ def command_output(args: list[str]) -> str | None:
 
 def source_files(root: Path):
     """Explicit source allowlist: never walk .env, runtime data, credentials or media."""
-    for name in ("main.py", "README.md", "PLAN.md", "CLAUDE.md", ".gitignore", "requirements.txt"):
+    for name in ("main.py", "README.md", "PLAN.md", "CLAUDE.md", ".gitignore", ".env.example",
+                 "pytest.ini", "requirements.txt", "requirements-dev.txt", "requirements-p0.lock.txt"):
         path = root / name
         if path.is_file():
             yield path
     for folder in ("app", "tests", "scripts"):
         for path in sorted((root / folder).rglob("*.py")):
             if "data" not in path.relative_to(root).parts and not path.is_symlink():
+                yield path
+    for folder, suffix in (("docs", ".md"), ("benchmarks", ".json")):
+        for path in sorted((root / folder).rglob("*" + suffix)):
+            if path.is_file() and not path.is_symlink():
                 yield path
 
 
@@ -146,12 +151,12 @@ def capture(database: Path, output: Path) -> Path:
     snapshot = destination / "catalogue.sqlite3"
     source = read_only_database(database)
     try:
-        with sqlite3.connect(snapshot) as target:
+        with closing(sqlite3.connect(snapshot)) as target:
             # SQLite's backup API includes committed WAL contents. Never copy a live .db alone.
             source.backup(target)
     finally:
         source.close()
-    with read_only_database(snapshot) as conn:
+    with closing(read_only_database(snapshot)) as conn:
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise RuntimeError("Snapshot integrity check failed")
         schema = catalogue_schema(conn)
@@ -205,7 +210,7 @@ def verify(destination: Path) -> dict:
         path = (destination / name).resolve()
         if not path.is_relative_to(destination.resolve()) or sha256(path) != record["sha256"]:
             raise ValueError(f"Baseline checksum failed: {name}")
-    with read_only_database(destination / "catalogue.sqlite3") as conn:
+    with closing(read_only_database(destination / "catalogue.sqlite3")) as conn:
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Baseline database integrity failed")
     return {"verified_files": len(manifest["files"]), "status": "ok"}

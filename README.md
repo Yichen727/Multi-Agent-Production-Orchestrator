@@ -215,3 +215,20 @@ app/
   data/                              # catalogue, footage, outputs/exports
 tests/                               # pytest suite
 ```
+
+## P0 engineering baseline
+
+The optimization baseline is documented in [docs/P0_BASELINE.md](docs/P0_BASELINE.md).
+It includes WAL-consistent local backups, pinned Windows/Python 3.12 dependencies,
+offline regressions, local latency/usage measurements, fixed evaluation inputs,
+and an opt-in budgeted query-parser trial. No live model evaluation runs by default.
+
+```bash
+python -m pytest -q
+python -m scripts.baseline capture
+python -m scripts.evaluate --budget-usd 0.05 --max-requests 2  # dry-run
+```
+
+Known P1/P5 defects are strict expected failures, listed in the baseline document.
+The upcoming database/model/form/UI rename is tracked in
+[docs/P0_NAMING_INVENTORY.md](docs/P0_NAMING_INVENTORY.md).

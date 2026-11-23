@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from app.config import settings
 from app.utils.logger import get_logger
+from app.services.metrics_service import measure_operation
 
 logger = get_logger("ffmpeg_service")
 
@@ -36,6 +37,7 @@ def _parse_frame_rate(value: str) -> float:
         return 0.0
 
 
+@measure_operation("ffprobe")
 def probe_video_metadata(input_path: str) -> dict:
     """Extract video, audio, and container metadata using ffprobe."""
     blank = {"width": 0, "height": 0, "duration_seconds": 0.0,
@@ -160,6 +162,7 @@ def _parse_cut_times(stderr: str) -> list[float]:
     return sorted(times)
 
 
+@measure_operation("scene_detection")
 def detect_scene_cuts(input_path: str, threshold: float = 0.4,
                       timeout: int | None = None,
                       duration_seconds: float | None = None) -> dict:
@@ -240,6 +243,7 @@ def choose_frame_count(duration_seconds: float, scene_count: int = None,
     return max(min_frames, min(count, max_frames))
 
 
+@measure_operation("frame_extraction")
 def _grab_frame_b64(input_path: str, ts: float, max_width: int = 768) -> str | None:
     """Extract one downscaled JPEG frame as base64."""
     vf = f"scale='min({max_width},iw)':-2"
@@ -436,6 +440,7 @@ def extract_sample_frames_b64(input_path: str, duration_seconds: float = 0.0,
     return frames
 
 
+@measure_operation("proxy_generation")
 def generate_proxy(input_path: str, output_dir: str = None, scale: str = "1280:720") -> str:
     """Generate a low-resolution H.264 proxy for editing."""
     output_dir = Path(output_dir or settings.PROXY_OUTPUT_DIR)

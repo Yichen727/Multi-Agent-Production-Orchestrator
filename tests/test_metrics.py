@@ -70,3 +70,26 @@ def test_measurement_io_failure_does_not_change_application_result(monkeypatch, 
         return "unchanged"
 
     assert task(1) == "unchanged"
+
+
+def test_real_langchain_callback_path_with_mock_http(monkeypatch):
+    import httpx
+    from langchain_openai import ChatOpenAI
+
+    monkeypatch.setattr(settings, "METRICS_ENABLED", True)
+    def respond(request):
+        return httpx.Response(200, json={
+            "id": "offline-completion", "object": "chat.completion", "created": 1,
+            "model": "gpt-5.5-2026-04-23",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        })
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        llm = ChatOpenAI(model="gpt-5.5", http_client=transport, max_retries=0,
+                         callbacks=[UsageCallback("gpt-5.5")])
+        assert llm.invoke("private text").content == "ok"
+    event = next(r for r in records() if r["event"] == "model_call")
+    assert event["input_tokens"] == 100
+    assert event["estimated_usd"] == pytest.approx(.0011)
+    assert "private text" not in str(records())

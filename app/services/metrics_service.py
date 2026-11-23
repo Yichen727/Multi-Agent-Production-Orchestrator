@@ -16,18 +16,11 @@ from datetime import datetime, timezone
 from langchain_core.callbacks import BaseCallbackHandler
 
 from app.config import settings
+from app.services.pricing import PRICE_VERSION, PRICES, estimate_cost
 
 logger = logging.getLogger(__name__)
 _context = contextvars.ContextVar("mapo_measurement", default={})
 _write_lock = threading.Lock()
-PRICE_VERSION = "2026-11-23-standard-text-v1"
-# USD / 1M tokens. Unknown models (including gpt-5.5-mini) have no invented price.
-PRICES = {
-    "gpt-5.5": (5.0, 0.50, 30.0),
-    "gpt-5.5-2026-04-23": (5.0, 0.50, 30.0),
-    "gpt-5.4-mini": (0.75, 0.075, 4.50),
-    "gpt-5.4-mini-2026-03-17": (0.75, 0.075, 4.50),
-}
 
 
 def _count(value):
@@ -45,18 +38,6 @@ def normalise_usage(raw: dict | None) -> dict:
         "cached_input_tokens": _count(details.get("cache_read", details.get("cached_tokens"))),
         "reasoning_tokens": _count(output_details.get("reasoning", output_details.get("reasoning_tokens"))),
     }
-
-
-def estimate_cost(model: str, usage: dict) -> float | None:
-    prices = PRICES.get(model)
-    inputs, outputs = usage.get("input_tokens"), usage.get("output_tokens")
-    if prices is None or inputs is None or outputs is None:
-        return None
-    cached = usage.get("cached_input_tokens") or 0
-    if cached > inputs:
-        return None
-    # Reasoning tokens are already included in output_tokens; do not bill twice.
-    return round(((inputs - cached) * prices[0] + cached * prices[1] + outputs * prices[2]) / 1e6, 10)
 
 
 def emit(event: str, **values) -> None:
@@ -98,6 +79,28 @@ def measure_stage(stage: str):
                 raise
             finally:
                 _context.reset(token)
+        return measured
+    return decorate
+
+
+def measure_operation(operation: str):
+    """Measure local/Vision work without recording paths, frames or result bodies."""
+    def decorate(fn):
+        @functools.wraps(fn)
+        def measured(*args, **kwargs):
+            if not settings.METRICS_ENABLED:
+                return fn(*args, **kwargs)
+            start = time.perf_counter()
+            try:
+                result = fn(*args, **kwargs)
+                emit("operation", operation=operation, status="completed",
+                     result_available=result is not None,
+                     elapsed_ms=round((time.perf_counter() - start) * 1000, 3))
+                return result
+            except Exception as exc:
+                emit("operation", operation=operation, status="error", error_type=type(exc).__name__,
+                     elapsed_ms=round((time.perf_counter() - start) * 1000, 3))
+                raise
         return measured
     return decorate
 

@@ -21,8 +21,9 @@ def pytest_configure(config):
     # Keep temp files in the workspace; the Windows user temp tree may belong to
     # another user. A fresh directory also avoids pytest deleting prior run data.
     if not config.option.basetemp:
-        config.option.basetemp = str(Path(__file__).resolve().parents[1] / ".local" /
-                                     "pytest" / uuid.uuid4().hex)
+        parent = Path(__file__).resolve().parents[1] / ".local" / "pytest"
+        parent.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(parent / uuid.uuid4().hex)
 
 
 @pytest.fixture(autouse=True)
@@ -34,8 +35,6 @@ def isolated_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(socket, "create_connection", blocked)
     from app.config import settings
     from app.services import database_service as database
-    from sqlalchemy import text
-
     engine = database._create_engine(":memory:")
     # Modules import _engine by value: point every consumer at the same isolated DB.
     import app.services.catalogue_resolver as resolver
