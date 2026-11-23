@@ -1,4 +1,4 @@
-"""Compile an ordered Atomized timeline into JSON and Premiere Pro FCP7 XML."""
+"""Compile an ordered MAPO timeline into JSON and Premiere Pro FCP7 XML."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from app.config import settings
-from app.branding import DEFAULT_SEQUENCE_NAME, EXPORT_PREFIX
 from app.utils.logger import get_logger
 
 logger = get_logger("premiere_export_service")
@@ -225,7 +224,7 @@ def _timebase_ntsc(fps: float) -> tuple[int, bool]:
 def build_timeline(
     clips: list[dict],
     *,
-    sequence_name: str = DEFAULT_SEQUENCE_NAME,
+    sequence_name: str = "MAPO Edit",
     fps: float | None = None,
     width: int | None = None,
     height: int | None = None,
@@ -305,10 +304,7 @@ def build_timeline(
         entries.append({
             "order": order,
             "role": clip.get("role") or "",
-            "clip_id": clip.get("clip_id"),
-            "source_revision": clip.get("source_revision"),
-            "event_id": clip.get("event_id"),
-            "event_set_id": clip.get("event_set_id"),
+            "shot_id": clip.get("shot_id"),
             "name": Path(file_path).name,
             "file_path": str(file_path),
             "absolute_path": str(abs_path),
@@ -334,7 +330,6 @@ def build_timeline(
         })
 
     return {
-        "schema_version": 1,
         "sequence": {
             "name": sequence_name,
             "fps": seq_fps,
@@ -650,7 +645,7 @@ def _reindent(block: str, prefix: str) -> str:
 def compile_project(
     clips: list[dict],
     *,
-    sequence_name: str = DEFAULT_SEQUENCE_NAME,
+    sequence_name: str = "MAPO Edit",
     project_id: int = 1,
     fps: float | None = None,
     width: int | None = None,
@@ -670,7 +665,6 @@ def compile_project(
 
     timeline = build_timeline(clips, sequence_name=sequence_name, fps=fps,
                               width=width, height=height, aspect_ratio=aspect_ratio)
-    timeline["project_id"] = project_id
     xml = to_fcp7_xml(timeline)
 
     result = {"timeline": timeline, "xml": xml}
@@ -680,7 +674,7 @@ def compile_project(
         output_dir.mkdir(parents=True, exist_ok=True)
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in sequence_name).strip("_") or "edit"
         version = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
-        stem = f"{EXPORT_PREFIX}_{project_id}_{safe}_{version}"
+        stem = f"MAPO_{project_id}_{safe}_{version}"
         xml_path = output_dir / f"{stem}.xml"
         json_path = output_dir / f"{stem}.json"
         _atomic_write(xml_path, xml)

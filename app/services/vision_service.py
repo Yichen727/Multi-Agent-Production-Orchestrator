@@ -8,7 +8,6 @@ from app.config import settings
 from app.models.schemas import VisionTags, EventTags
 from app.services.openai_service import get_llm
 from app.utils.logger import get_logger
-from app.services.metrics_service import measure_operation
 
 logger = get_logger("vision_service")
 
@@ -131,7 +130,6 @@ def _sampling_context(frames_b64: list[str], duration_seconds: float | None,
     )
 
 
-@measure_operation("clip_vision")
 def analyze_frames(frames_b64: list[str], duration_seconds: float | None = None,
                    scene_count: int | None = None,
                    sampled_timestamps: list[float] | None = None,
@@ -172,7 +170,6 @@ Rules:
 """
 
 
-@measure_operation("event_vision")
 def analyze_event(frames_b64: list[str], start_seconds: float | None = None,
                   end_seconds: float | None = None,
                   clip_duration: float | None = None) -> EventTags | None:

@@ -1,9 +1,9 @@
-"""Production Orchestrator — explicit four-stage Atomized pipeline."""
+"""Production Orchestrator — explicit four-stage MAPO pipeline."""
 
+import hashlib
 import json
 import re
 import uuid
-from app.branding import DEFAULT_SEQUENCE_NAME
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -12,19 +12,25 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 from app.models.state import ProductionState
 
+from app.agents.ingest_agent import (
+    ingest_assistant, ingest_tool_node, should_continue_ingest,
+    reset_last_ingest_result, get_last_ingest_result,
+)
+from app.agents.search_agent import (
+    search_assistant, search_tool_node, should_continue_search,
+)
 from app.agents.selection_agent import (
     selection_assistant, selection_tool_node, should_continue_selection,
 )
-from app.services.ingest_service import ingest_footage
-from app.services.delivery_service import compile_plan
-from app.services.search_service import search_clips
-from app.services.database_service import get_catalogued_clips
-from app.services.contracts import project_id_value, target_duration
-from app.services.plan_contract import validate_edit_plan
+from app.agents.delivery_agent import (
+    compile_plan, reset_last_delivery_result, get_last_delivery_result,
+)
+from app.services.retrieval_service import (hybrid_search, expand_query_terms,
+                                            hoist_orientation)
 from app.services.timeline_service import MODE_CLIP, MODE_MOMENT
 from app.services.premiere_export_service import normalise_aspect_label
+from app.config import settings
 from app.utils.logger import get_logger
-from app.services.metrics_service import measure_stage
 
 logger = get_logger("orchestrator")
 
@@ -38,7 +44,7 @@ in_memory_store = InMemoryStore()
 
 
 def _build_agent_graph(name, assistant_fn, tool_node, should_continue_fn):
-    """Build the Selection reasoning loop (assistant -> tools -> assistant)."""
+    """Helper: build a ReAct sub-agent graph (assistant → tools → assistant)."""
     graph = StateGraph(ProductionState)
     graph.add_node(f"{name}_assistant", assistant_fn)
     graph.add_node(f"{name}_tools", tool_node)
@@ -56,10 +62,13 @@ def _build_agent_graph(name, assistant_fn, tool_node, should_continue_fn):
     )
 
 
+ingest_agent = _build_agent_graph("ingest", ingest_assistant, ingest_tool_node, should_continue_ingest)
+search_agent = _build_agent_graph("search", search_assistant, search_tool_node, should_continue_search)
 selection_agent = _build_agent_graph("selection", selection_assistant, selection_tool_node, should_continue_selection)
 
 # Delivery is deterministic and does not require an agent graph.
-logger.info("Selection graph ready; ingestion, search, and delivery use direct services.")
+logger.info("3 sub-agent graphs compiled + deterministic delivery compiler "
+            "(fixed-pipeline orchestration, no supervisor).")
 
 
 # ── Shared state / config helpers ─────────────────────────────────────────────
@@ -71,8 +80,8 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
         "messages": [],
         "loaded_preferences": "",
         "footage_dir": "",
-        "ingested_files": [], "clip_metadata": [], "search_results": [],
-        "search_candidates": [], "selected_candidates": [], "selected_clips": [],
+        "ingested_files": [], "shot_metadata": [], "search_results": [],
+        "search_candidates": [], "selected_candidates": [], "selected_shots": [],
         "editing_mode": "", "target_seconds": None, "aspect_ratio": "",
         "recommendations": [], "edit_timeline": None, "delivery_output": None,
     }
@@ -83,7 +92,7 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
 
 def _config(stage: str, user_id, project_id, tag: str | None = None) -> dict:
     """Create a fresh checkpoint thread for one stage invocation."""
-    parts = [p for p in ("atomized", stage, str(user_id), str(project_id), tag,
+    parts = [p for p in ("mapo", stage, str(user_id), str(project_id), tag,
                          uuid.uuid4().hex[:12]) if p]
     return {"configurable": {
         "thread_id": "-".join(parts),
@@ -92,12 +101,20 @@ def _config(stage: str, user_id, project_id, tag: str | None = None) -> dict:
 
 
 def _pid(project_id) -> int:
-    return project_id_value(project_id)
+    try:
+        return int(project_id)
+    except (TypeError, ValueError):
+        return project_id
+
+
+def _qhash(query: str) -> str:
+    """Return a short digest used to identify a search invocation."""
+    return hashlib.md5((query or "").encode("utf-8")).hexdigest()[:8]
 
 
 # ── Structured output extraction ─────────────────────────────────────────────
 
-_PLAN_TOOLS = ("plan_clip_assembly", "plan_moment_assembly")
+_PLAN_TOOLS = (None, "plan_clip_assembly", "plan_moment_assembly")
 
 
 def _extract_plan(messages) -> dict | None:
@@ -115,36 +132,78 @@ def _extract_plan(messages) -> dict | None:
                 continue
             if isinstance(obj, dict) and "segments" in obj:
                 return obj
-        # A refused latest planning call must not resurrect an earlier plan.
-        return None
+    return None
+
+
+_SEARCH_TOOLS = (None, "search_catalogue", "list_all_shots")
+
+
+def _extract_candidates(messages) -> list[dict] | None:
+    """Extract the latest structured candidate list from a search tool output."""
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) not in _SEARCH_TOOLS:
+            continue
+        content = m.content if isinstance(m.content, str) else ""
+        for match in re.findall(r"```json\s*(\[.*?\])\s*```", content, re.DOTALL):
+            try:
+                obj = json.loads(match)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, list):
+                return obj
     return None
 
 
 # ── Pipeline stages ─────────────────────────────────────────────────────────────
 
 
-@measure_stage("ingest")
-def run_ingest(directory: str, project_id, user_id, **options) -> tuple[str, object]:
-    """Index footage directly; result belongs to this run."""
-    result = ingest_footage(directory, _pid(project_id), **options)
-    return result.message, result
+def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
+    """① Ingest — analyse footage and build the project catalogue."""
+    reset_last_ingest_result()
+    msg = (f"Run ingest analysis on the footage directory '{directory}' for project "
+           f"{project_id}. Call the ingest_footage tool now to build the catalogue.")
+    state = _base_state(project_id, {
+        "messages": [HumanMessage(content=msg)],
+        "footage_dir": str(directory),
+    })
+    result = ingest_agent.invoke(state, config=_config("ingest", user_id, project_id))
+    return result["messages"][-1].content, get_last_ingest_result()
 
 
-@measure_stage("search")
+def _search_direct(query: str, project_id) -> list[dict]:
+    """Run deterministic hybrid retrieval for a search query."""
+    residual, orientation = hoist_orientation(query, None)
+    core, related = (expand_query_terms(residual)
+                     if residual and residual.strip() else ("", ""))
+    keywords = ", ".join(t for t in (core, related) if t)
+    return hybrid_search(_pid(project_id), keywords=keywords or None,
+                         core_keywords=core or None, orientation=orientation)
+
+
 def run_search(query: str, project_id, user_id="editor") -> list[dict]:
-    """Parse once and retrieve directly; no result narration call."""
-    return search_clips(query, _pid(project_id))
+    """② Search — retrieve candidate clips using the search agent or fallback."""
+    if settings.OPENAI_API_KEY:
+        try:
+            config = _config("search", user_id, project_id, _qhash(query))
+            state = _base_state(project_id, {"messages": [HumanMessage(content=query)]})
+            result = search_agent.invoke(state, config=config)
+            candidates = _extract_candidates(result["messages"])
+            if candidates is not None:
+                return candidates
+            logger.warning("Search agent produced no structured result; using direct search.")
+        except Exception as e:  # keep the UI responsive on any agent/LLM failure
+            logger.warning(f"Search agent failed ({e}); using direct search.")
+    return _search_direct(query, project_id)
 
 
 def _normalise_editing_mode(mode) -> str:
     """Convert a UI editing mode to its canonical identifier."""
     raw = str(mode or "").strip().lower().replace(" ", "_")
-    if raw not in (MODE_CLIP, MODE_MOMENT):
-        raise ValueError("Unknown editing mode")
-    return raw
+    return MODE_MOMENT if raw == MODE_MOMENT else MODE_CLIP
 
 
-@measure_stage("selection")
 def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
                   editing_mode: str = MODE_CLIP,
                   target_seconds: float | None = None,
@@ -152,18 +211,14 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
     """③ Selection — create an ordered editorial timeline from curated clips."""
     mode = _normalise_editing_mode(editing_mode)
     aspect = normalise_aspect_label(aspect_ratio)   # raises on an unusable value
-    project_id = _pid(project_id)
-    target = target_duration(target_seconds) if mode == MODE_MOMENT else None
-    from app.services.media_identity import canonical_path
-    catalogue = {canonical_path(p): c for p, c in get_catalogued_clips(project_id).items()}
-    selected_clips = []
-    for path in selected_paths:
-        row = catalogue.get(canonical_path(path))
-        if not row or not row["online"]:
-            raise ValueError("Every curated candidate must be an online clip in this project")
-        selected_clips.append(row)
-    if not selected_clips:
-        raise ValueError("Select at least one curated candidate")
+    target = None
+    if mode == MODE_MOMENT:
+        try:
+            target = float(target_seconds) if target_seconds else None
+        except (TypeError, ValueError):
+            target = None
+        if target is not None and target <= 0:
+            target = None
 
     clip_list = "\n".join(f"- {p}" for p in selected_paths)
     aspect_line = (
@@ -221,27 +276,17 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
 
     state = _base_state(project_id, {
         "messages": [HumanMessage(content=message)],
-        "selected_candidates": [c["file_path"] for c in selected_clips],
-        "selected_clips": selected_clips,
+        "selected_candidates": list(selected_paths),
         "editing_mode": mode,
         "target_seconds": target,
         "aspect_ratio": aspect,
     })
     result = selection_agent.invoke(state, config=_config("select", user_id, project_id))
-    plan = _extract_plan(result["messages"])
-    if plan is not None:
-        plan = validate_edit_plan(plan, project_id)
-        if plan["mode"] != mode or plan.get("aspect_ratio") != aspect or plan.get("target_seconds") != target:
-            raise ValueError("Plan does not match the editor-selected specification")
-        allowed_ids = {c["clip_id"] for c in selected_clips}
-        if any(seg["clip_id"] not in allowed_ids for seg in plan["segments"]):
-            raise ValueError("Plan contains an unselected clip")
-    return result["messages"][-1].content, plan
+    return result["messages"][-1].content, _extract_plan(result["messages"])
 
 
-@measure_stage("delivery")
 def run_delivery(plan: dict, project_id, user_id,
-                 sequence_name: str = DEFAULT_SEQUENCE_NAME):
+                 sequence_name: str = "MAPO Edit"):
     """④ Delivery — compile the Selection plan into a Premiere project."""
     if not (plan and plan.get("segments")):
         raise ValueError(
@@ -249,8 +294,9 @@ def run_delivery(plan: dict, project_id, user_id,
             "Selection. Generate the edit timeline in ③ Selection first — there is no "
             "implicit media-pool-order fallback.")
 
-    result = compile_plan(plan, sequence_name=sequence_name, project_id=_pid(project_id))
-    return result.message, result
+    reset_last_delivery_result()
+    summary = compile_plan(plan, sequence_name=sequence_name, project_id=_pid(project_id))
+    return summary, get_last_delivery_result()
 
 
-logger.info("Atomized pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")
+logger.info("MAPO pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")

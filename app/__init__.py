@@ -1,1 +1,1 @@
-"""Atomized Post Production Helper."""
+"""MAPO - Multi-Agent Production Orchestrator."""

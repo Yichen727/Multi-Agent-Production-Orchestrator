@@ -10,9 +10,6 @@ __pycache__/
 venv/
 .pytest_cache/
 .mypy_cache/
-.local/
-.coverage
-htmlcov/
 
 # Media / raw footage
 *.mp4
@@ -21,7 +18,7 @@ htmlcov/
 *.mkv
 *.m4v
 
-# Atomized runtime data
+# MAPO runtime data
 app/data/raw_footage/*
 !app/data/raw_footage/.gitkeep
 
@@ -30,8 +27,6 @@ app/data/outputs/*
 !app/data/output/exports/
 app/data/output/exports/*
 !app/data/output/exports/.gitkeep
-app/data/output/metrics/
-app/data/backups/
 
 # Local catalogue / database
 *.db
