@@ -10,6 +10,9 @@ __pycache__/
 venv/
 .pytest_cache/
 .mypy_cache/
+.local/
+.coverage
+htmlcov/
 
 # Media / raw footage
 *.mp4
@@ -27,6 +30,7 @@ app/data/outputs/*
 !app/data/output/exports/
 app/data/output/exports/*
 !app/data/output/exports/.gitkeep
+app/data/output/metrics/
 
 # Local catalogue / database
 *.db
