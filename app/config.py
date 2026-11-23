@@ -41,5 +41,9 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     DEBUG_VERBOSE: bool = os.getenv("DEBUG_VERBOSE", "false").lower() == "true"
 
+    # Local P0 measurements (no prompt, response text, frames or credentials).
+    METRICS_ENABLED: bool = os.getenv("METRICS_ENABLED", "true").lower() == "true"
+    METRICS_OUTPUT_DIR: Path = Path(os.getenv("METRICS_OUTPUT_DIR", "./app/data/output/metrics"))
+
 
 settings = Settings()

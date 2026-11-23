@@ -3,6 +3,8 @@
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from app.config import settings
 from app.utils.logger import get_logger
+from app.services.metrics_service import UsageCallback, emit
+import time
 
 logger = get_logger("openai_service")
 
@@ -10,7 +12,7 @@ logger = get_logger("openai_service")
 def get_llm(model: str = None, temperature: float = 0) -> ChatOpenAI:
     """Create a configured ChatOpenAI instance."""
     model = model or settings.LLM_MODEL
-    llm = ChatOpenAI(model_name=model, temperature=temperature)
+    llm = ChatOpenAI(model_name=model, temperature=temperature, callbacks=[UsageCallback(model)])
     logger.info(f"LLM initialized: {model}")
     return llm
 
@@ -44,8 +46,16 @@ def embed_texts(texts: list[str]) -> list[list[float]] | None:
     if client is None:
         logger.warning("No OPENAI_API_KEY — skipping embeddings.")
         return None
+    start = time.perf_counter()
     try:
-        return client.embed_documents(texts)
+        vectors = client.embed_documents(texts)
+        emit("embedding_call", model=settings.EMBEDDING_MODEL, status="success", items=len(texts),
+             elapsed_ms=round((time.perf_counter() - start) * 1000, 3),
+             input_tokens=None, estimated_usd=None, usage_source="not_exposed_by_embed_documents")
+        return vectors
     except Exception as e: 
+        emit("embedding_call", model=settings.EMBEDDING_MODEL, status="error", items=len(texts),
+             elapsed_ms=round((time.perf_counter() - start) * 1000, 3),
+             error_type=type(e).__name__, input_tokens=None, estimated_usd=None)
         logger.error(f"Embedding failed: {e}")
         return None

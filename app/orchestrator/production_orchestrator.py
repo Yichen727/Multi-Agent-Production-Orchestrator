@@ -31,6 +31,7 @@ from app.services.timeline_service import MODE_CLIP, MODE_MOMENT
 from app.services.premiere_export_service import normalise_aspect_label
 from app.config import settings
 from app.utils.logger import get_logger
+from app.services.metrics_service import measure_stage
 
 logger = get_logger("orchestrator")
 
@@ -159,6 +160,7 @@ def _extract_candidates(messages) -> list[dict] | None:
 # ── Pipeline stages ─────────────────────────────────────────────────────────────
 
 
+@measure_stage("ingest")
 def run_ingest(directory: str, project_id, user_id) -> tuple[str, object]:
     """① Ingest — analyse footage and build the project catalogue."""
     reset_last_ingest_result()
@@ -182,6 +184,7 @@ def _search_direct(query: str, project_id) -> list[dict]:
                          core_keywords=core or None, orientation=orientation)
 
 
+@measure_stage("search")
 def run_search(query: str, project_id, user_id="editor") -> list[dict]:
     """② Search — retrieve candidate clips using the search agent or fallback."""
     if settings.OPENAI_API_KEY:
@@ -204,6 +207,7 @@ def _normalise_editing_mode(mode) -> str:
     return MODE_MOMENT if raw == MODE_MOMENT else MODE_CLIP
 
 
+@measure_stage("selection")
 def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
                   editing_mode: str = MODE_CLIP,
                   target_seconds: float | None = None,
@@ -285,6 +289,7 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
     return result["messages"][-1].content, _extract_plan(result["messages"])
 
 
+@measure_stage("delivery")
 def run_delivery(plan: dict, project_id, user_id,
                  sequence_name: str = "MAPO Edit"):
     """④ Delivery — compile the Selection plan into a Premiere project."""
