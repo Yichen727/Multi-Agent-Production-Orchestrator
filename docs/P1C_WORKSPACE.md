@@ -2,6 +2,9 @@
 
 实施日期：2026-11-23。
 
+产品名称现为 **Atomized Post Production Helper**，强调色为 **Atomized Pink（#FF0069）**。
+素材库和搜索页的 Preview 使用按钮旁的弹出窗口，只有打开窗口时才加载视频。
+
 ## 页面与命名
 
 主区域采用四个同级页面：Media Library、Find Footage、Edit Plan、Export；每次只执行当前页面的读取与渲染。侧栏只放项目、工作区设置、Footage、导入结果和候选计数。

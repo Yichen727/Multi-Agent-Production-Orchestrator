@@ -21,7 +21,7 @@ htmlcov/
 *.mkv
 *.m4v
 
-# MAPO runtime data
+# Atomized runtime data
 app/data/raw_footage/*
 !app/data/raw_footage/.gitkeep
 

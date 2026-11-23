@@ -23,7 +23,7 @@ class Settings:
     # LangSmith
     LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
-    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "MAPO-Production-Orchestrator")
+    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "Atomized Post Production Helper")
 
     # Paths
     RAW_FOOTAGE_DIR: Path = Path(os.getenv("RAW_FOOTAGE_DIR", "./app/data/raw_footage"))

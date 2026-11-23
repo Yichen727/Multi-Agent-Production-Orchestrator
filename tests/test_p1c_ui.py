@@ -239,3 +239,29 @@ def test_hidden_plan_is_not_revalidated_on_library_page(seed_catalogue, monkeypa
     page(ui, "Media Library")
     assert not ui.exception
     check.assert_not_called()
+
+
+def test_preview_stays_in_button_popover_and_loads_only_when_open(seed_catalogue, monkeypatch):
+    rows = seed_catalogue()
+    monkeypatch.setattr(orch, "run_search", Mock(return_value=rows))
+    ui = app()
+    assert not ui.get("video")
+    assert len(ui.get("popover")) == len(rows)
+    preview_key = f"preview:library:{rows[0]['clip_id']}"
+    ui.session_state[preview_key] = True
+    ui.run()
+    assert not ui.exception
+    assert len(ui.get("video")) == 1
+    assert len(ui.get("popover")[0].get("video")) == 1
+    assert not any(str(e.label).startswith("Preview") for e in ui.expander)
+    ui.session_state[preview_key] = False
+    ui.run()
+    assert not ui.get("video")
+    page(ui, "Find Footage")
+    button(ui, "Find footage").click().run()
+    assert not ui.get("video")
+    ui.session_state[f"preview:find:{rows[1]['clip_id']}"] = True
+    ui.run()
+    assert not ui.exception
+    assert len(ui.get("video")) == 1
+    assert len(ui.get("popover")[1].get("video")) == 1

@@ -1,6 +1,7 @@
 """Delivery — compile the edit timeline into a Premiere Pro project file."""
 
 import uuid
+from app.branding import DEFAULT_SEQUENCE_NAME
 from app.services.metrics_service import current_run_id
 from app.services.contracts import project_id_value
 from app.services.plan_contract import validate_edit_plan
@@ -60,7 +61,7 @@ def _frame_summary(seq: dict) -> str:
 
 # ── Compile ────────────────────────────────────────────────────────────────────
 
-def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> DeliveryResult:
+def compile_plan(plan, *, sequence_name: str = DEFAULT_SEQUENCE_NAME, project_id=1) -> DeliveryResult:
     """Compile a Selection plan into a Premiere Pro project."""
     try:
         project_id = project_id_value(project_id)

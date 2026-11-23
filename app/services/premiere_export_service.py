@@ -1,4 +1,4 @@
-"""Compile an ordered MAPO timeline into JSON and Premiere Pro FCP7 XML."""
+"""Compile an ordered Atomized timeline into JSON and Premiere Pro FCP7 XML."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from app.config import settings
+from app.branding import DEFAULT_SEQUENCE_NAME, EXPORT_PREFIX
 from app.utils.logger import get_logger
 
 logger = get_logger("premiere_export_service")
@@ -224,7 +225,7 @@ def _timebase_ntsc(fps: float) -> tuple[int, bool]:
 def build_timeline(
     clips: list[dict],
     *,
-    sequence_name: str = "MAPO Edit",
+    sequence_name: str = DEFAULT_SEQUENCE_NAME,
     fps: float | None = None,
     width: int | None = None,
     height: int | None = None,
@@ -649,7 +650,7 @@ def _reindent(block: str, prefix: str) -> str:
 def compile_project(
     clips: list[dict],
     *,
-    sequence_name: str = "MAPO Edit",
+    sequence_name: str = DEFAULT_SEQUENCE_NAME,
     project_id: int = 1,
     fps: float | None = None,
     width: int | None = None,
@@ -679,7 +680,7 @@ def compile_project(
         output_dir.mkdir(parents=True, exist_ok=True)
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in sequence_name).strip("_") or "edit"
         version = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
-        stem = f"MAPO_{project_id}_{safe}_{version}"
+        stem = f"{EXPORT_PREFIX}_{project_id}_{safe}_{version}"
         xml_path = output_dir / f"{stem}.xml"
         json_path = output_dir / f"{stem}.json"
         _atomic_write(xml_path, xml)

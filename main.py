@@ -1,4 +1,4 @@
-"""MAPO — Multi-Agent Production Orchestrator
+"""Atomized Post Production Helper
 
 Launch the Streamlit UI:
     python main.py

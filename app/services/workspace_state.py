@@ -12,7 +12,7 @@ _FIELDS = {
     "messages": [], "clip_metadata": [], "candidate_clip_ids": [], "search_results": [],
     "edit_report": "", "edit_plan": None, "export_report": "", "export_result": None, "exported_plan_id": None,
     "saved_edit_plans": [], "active_plan_id": None, "ingest_result": None,
-    "ui_values": {}, "preview_clip_id": None,
+    "ui_values": {},
 }
 _LEGACY_FIELDS = {
     "bin_clips": "clip_metadata", "selection_output": "edit_report",
@@ -53,6 +53,7 @@ def _migrate_legacy(state, clips):
 
 
 def reconcile_workspace(state, project_id, user_id, clips, *, verify_plan=True):
+    state.pop("preview_clip_id", None)  # Retired page-bottom preview state.
     key = (project_id_value(project_id), str(user_id))
     previous = state.get("workspace_key")
     # Migration applies only to the workspace the old state actually belonged to.
@@ -65,7 +66,7 @@ def reconcile_workspace(state, project_id, user_id, clips, *, verify_plan=True):
         for name, default in _FIELDS.items():
             state[name] = deepcopy(restored.get(name, default))
         for name in list(state):
-            if name.startswith(("candidate:", "library_", "find_", "plan_", "export_", "footage_", "import_")) and name not in _FIELDS:
+            if name.startswith(("candidate:", "preview:", "library_", "find_", "plan_", "export_", "footage_", "import_")) and name not in _FIELDS:
                 del state[name]
             elif name.startswith(SELECTION_PREFIX):
                 del state[name]

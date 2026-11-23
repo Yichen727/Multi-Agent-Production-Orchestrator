@@ -1,4 +1,4 @@
-"""MAPO editing workspace. Only the active page renders or performs its work."""
+"""Atomized editing workspace. Only the active page renders or performs its work."""
 
 import base64
 import json
@@ -7,11 +7,22 @@ from pathlib import Path
 
 import streamlit as st
 
+from app.branding import PRODUCT_NAME, ACCENT_COLOR, DEFAULT_SEQUENCE_NAME, EXPORT_PREFIX
 from app.services import database_service as catalogue
 from app.services.workspace_state import reconcile_workspace, set_candidates, save_edit_plan
 from app.services.plan_contract import validate_edit_plan
 
-st.set_page_config(page_title="MAPO", page_icon="🎬", layout="wide")
+st.set_page_config(page_title=PRODUCT_NAME, page_icon="🎬", layout="wide")
+
+st.html(f"""
+<style>
+  .atomized-wordmark {{ color: {ACCENT_COLOR}; font-size: 2rem; font-weight: 750; }}
+  [data-testid="stPopoverBody"] {{
+    min-width: min(520px, calc(100vw - 2rem));
+    max-width: min(720px, calc(100vw - 2rem));
+  }}
+</style>
+""")
 
 PAGES = ["Media Library", "Find Footage", "Edit Plan", "Export"]
 MODES = {"Full Clips": "clip_assembly", "Selected Moments": "moment_assembly"}
@@ -52,10 +63,6 @@ def _candidate_checkbox(clip, page):
     st.session_state[key] = clip["clip_id"] in st.session_state["candidate_clip_ids"]
     st.checkbox(Path(clip["file_path"]).name, key=key, on_change=_toggle_candidate,
                 args=(clip["clip_id"], key), help="Include in the candidate set for this edit")
-
-
-def _preview(clip_id):
-    st.session_state["preview_clip_id"] = clip_id
 
 
 def _analysis_label(clip):
@@ -105,22 +112,22 @@ def _render_clip(clip, page, thumbnails=False):
                 except OSError:
                     st.caption("Source file unavailable")
         with action:
-            st.button("Preview", key=f"preview:{page}:{clip['clip_id']}",
-                      on_click=_preview, args=(clip["clip_id"],))
+            preview = st.popover("Preview", key=f"preview:{page}:{clip['clip_id']}",
+                                 on_change="rerun", width="stretch")
+            if preview.open:
+                with preview:
+                    _render_preview(clip)
 
 
-def _render_preview():
-    cid = st.session_state.get("preview_clip_id")
-    clip = next((c for c in st.session_state["clip_metadata"] if c["clip_id"] == cid), None)
-    if not clip:
-        return
-    with st.expander(f"Preview · {Path(clip['file_path']).name}", expanded=True):
-        if Path(clip["file_path"]).is_file():
-            st.video(clip["file_path"])
-        else:
-            st.warning("Source file unavailable. Reconnect the media folder and update the library.")
-        st.caption(_meta(clip))
-        st.caption(clip.get("description") or "No visual description yet.")
+def _render_preview(clip):
+    """Render only inside the open popover anchored to this clip's button."""
+    st.markdown(f"**{Path(clip['file_path']).name}**")
+    if Path(clip["file_path"]).is_file():
+        st.video(clip["file_path"])
+    else:
+        st.warning("Source file unavailable. Reconnect the media folder and update the library.")
+    st.caption(_meta(clip))
+    st.caption(clip.get("description") or "No visual description yet.")
 
 
 def _backup_headline(item: dict) -> str:
@@ -196,7 +203,8 @@ def _sidebar():
     if st.session_state.get("project_picker") not in options:
         st.session_state["project_picker"] = options[0]
     with st.sidebar:
-        st.title("MAPO")
+        st.html('<div class="atomized-wordmark">Atomized</div>')
+        st.caption("Post Production Helper")
         pid = st.selectbox("Project", options, format_func=lambda p: labels.get(p, "Untitled project"),
                            key="project_picker")
         with st.expander("Workspace settings"):
@@ -344,7 +352,6 @@ def _library():
         st.info("No media matches these filters. Broaden the filters to see more clips.")
     for clip in shown:
         _render_clip(clip, "library", thumbnails)
-    _render_preview()
 
 
 def _find(pid, user):
@@ -390,7 +397,6 @@ def _find(pid, user):
     c.button("Create edit plan", key="find_to_plan", on_click=_go, args=("Edit Plan",))
     for clip in shown:
         _render_clip(clip, "find")
-    _render_preview()
 
 
 def _plan_summary(plan):
@@ -457,7 +463,7 @@ def _edit(pid, user):
             _render_backup_item(i, item)
         st.button("Export this plan", key="plan_to_export", on_click=_go, args=("Export",))
         st.download_button("Download plan JSON", json.dumps(plan, ensure_ascii=False, indent=2),
-                           file_name="MAPO_edit_plan.json", mime="application/json", key="plan_download")
+                           file_name=f"{EXPORT_PREFIX}_edit_plan.json", mime="application/json", key="plan_download")
 
 
 def _export(pid, user):
@@ -493,12 +499,12 @@ def _export(pid, user):
     except (ValueError, TypeError, KeyError, OSError) as exc:
         valid = False
         st.warning(f"This plan needs to be regenerated: {exc}")
-    _seed("export_name", "MAPO Edit")
+    _seed("export_name", DEFAULT_SEQUENCE_NAME)
     name = st.text_input("Sequence name", key="export_name", on_change=_remember, args=("export_name",))
     if st.button("Export Premiere project", key="export_compile", type="primary", disabled=not valid):
         try:
             with st.spinner("Preparing Premiere project…"):
-                report, result = _orch().run_delivery(record["plan"], pid, user, sequence_name=name.strip() or "MAPO Edit")
+                report, result = _orch().run_delivery(record["plan"], pid, user, sequence_name=name.strip() or DEFAULT_SEQUENCE_NAME)
             st.session_state.update(export_report=report, export_result=result, exported_plan_id=selected)
         except Exception as exc:
             st.session_state.update(export_result=None, export_report=str(exc), exported_plan_id=selected)
@@ -517,7 +523,7 @@ def _export(pid, user):
 
 def main():
     pid, user = _sidebar()
-    st.title("MAPO · Editing Workspace")
+    st.title(PRODUCT_NAME)
     page = st.radio("Workspace", PAGES, horizontal=True, key="workspace_page", label_visibility="collapsed")
     if page == "Media Library":
         _library()

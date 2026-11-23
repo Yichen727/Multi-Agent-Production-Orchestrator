@@ -1,8 +1,9 @@
-"""Production Orchestrator — explicit four-stage MAPO pipeline."""
+"""Production Orchestrator — explicit four-stage Atomized pipeline."""
 
 import json
 import re
 import uuid
+from app.branding import DEFAULT_SEQUENCE_NAME
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -82,7 +83,7 @@ def _base_state(project_id, extra: dict | None = None) -> dict:
 
 def _config(stage: str, user_id, project_id, tag: str | None = None) -> dict:
     """Create a fresh checkpoint thread for one stage invocation."""
-    parts = [p for p in ("mapo", stage, str(user_id), str(project_id), tag,
+    parts = [p for p in ("atomized", stage, str(user_id), str(project_id), tag,
                          uuid.uuid4().hex[:12]) if p]
     return {"configurable": {
         "thread_id": "-".join(parts),
@@ -240,7 +241,7 @@ def run_selection(intent: str, selected_paths: list[str], project_id, user_id,
 
 @measure_stage("delivery")
 def run_delivery(plan: dict, project_id, user_id,
-                 sequence_name: str = "MAPO Edit"):
+                 sequence_name: str = DEFAULT_SEQUENCE_NAME):
     """④ Delivery — compile the Selection plan into a Premiere project."""
     if not (plan and plan.get("segments")):
         raise ValueError(
@@ -252,4 +253,4 @@ def run_delivery(plan: dict, project_id, user_id,
     return result.message, result
 
 
-logger.info("MAPO pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")
+logger.info("Atomized pipeline orchestrator ready (Ingest -> Search -> Selection -> Delivery).")

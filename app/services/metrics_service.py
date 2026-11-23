@@ -19,7 +19,7 @@ from app.config import settings
 from app.services.pricing import PRICE_VERSION, PRICES, estimate_cost
 
 logger = logging.getLogger(__name__)
-_context = contextvars.ContextVar("mapo_measurement", default={})
+_context = contextvars.ContextVar("atomized_measurement", default={})
 _write_lock = threading.Lock()
 
 

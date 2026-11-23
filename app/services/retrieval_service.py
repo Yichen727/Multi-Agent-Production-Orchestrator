@@ -1,4 +1,4 @@
-"""Hybrid retrieval service for the MAPO production catalogue."""
+"""Hybrid retrieval service for the Atomized production catalogue."""
 
 import json
 import re

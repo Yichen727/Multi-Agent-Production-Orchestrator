@@ -1,6 +1,9 @@
-# 🎬 MAPO — Multi-Agent Production Orchestrator
+# Atomized Post Production Helper
 
-An AI-assisted film/video **post-production pipeline** built on [LangGraph](https://langchain-ai.github.io/langgraph/). MAPO ingests raw footage, builds a searchable catalogue, helps you find and curate the right clips, arranges them into an edit timeline, and exports a project file **Adobe Premiere Pro imports natively**.
+An AI-assisted film/video **post-production pipeline** built on [LangGraph](https://langchain-ai.github.io/langgraph/). Atomized Post Production Helper ingests raw footage, builds a searchable catalogue, helps you find and curate the right clips, arranges them into an edit timeline, and exports a project file **Adobe Premiere Pro imports natively**.
+
+The interface uses **Atomized Pink (`#FF0069`)** for its accents. Existing catalogue paths
+and historical exports remain readable after the product rename.
 
 Built for a small company editing team using one workstation. Author: **Yichen Zheng**.
 
@@ -102,7 +105,9 @@ filename/tags, orientation, analysis status, or **Candidates only**. Check a cli
 to the edit's candidate set; **Select this page / Clear this page** affect only the current
 filtered page. **Clear candidates** in the sidebar clears the entire candidate set.
 
-**Preview** opens one source preview. **Show thumbnails** loads frames for the current
+**Preview** opens the video in a popover anchored beside that clip's button, without
+scrolling to the bottom of the page. Closed previews do not load video.
+**Show thumbnails** loads frames for the current
 page only and defaults off to keep opening the library fast. **Create edit plan** opens
 the planning page with the same candidates.
 

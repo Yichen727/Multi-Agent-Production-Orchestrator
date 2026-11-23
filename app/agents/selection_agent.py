@@ -1,4 +1,4 @@
-"""MAPO Selection / Assistant-Editor Agent."""
+"""Atomized Selection / Assistant-Editor Agent."""
 
 import json
 import inspect
@@ -679,7 +679,7 @@ selection_tools = [
 llm_with_selection = llm.bind_tools(selection_tools)
 selection_tool_node = ToolNode(selection_tools)
 
-SELECTION_PROMPT = """You are the SELECTION AGENT in the MAPO system — an ASSISTANT
+SELECTION_PROMPT = """You are the SELECTION AGENT in Atomized Post Production Helper — an ASSISTANT
 EDITOR, not an autonomous one. You do NOT rank clips by score. You build an ordered EDIT
 TIMELINE and explain your editorial reasoning; the editor always makes the final call.
 

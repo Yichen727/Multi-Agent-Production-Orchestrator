@@ -1,4 +1,4 @@
-"""Shared LangGraph state for the MAPO pipeline."""
+"""Shared LangGraph state for the Atomized pipeline."""
 
 from typing import Annotated, Optional
 from typing_extensions import TypedDict

@@ -1,6 +1,10 @@
-# MAPO 开发约定
+# Atomized Post Production Helper 开发约定
 
 当前阶段：P1c。实施范围和后续顺序以 [PLAN.md](../PLAN.md) 为准。
+
+公开品牌统一从 app/branding.py 读取；强调色为 Atomized Pink（#FF0069），
+Streamlit 原生控件主题位于 .streamlit/config.toml。Preview 使用带状态的 popover，
+只在窗口打开时渲染视频；不能把全部预览预先加载或重新放到页面底部。
 
 ## 职责
 

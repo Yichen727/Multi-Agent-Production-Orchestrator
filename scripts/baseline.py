@@ -83,7 +83,8 @@ def command_output(args: list[str]) -> str | None:
 def source_files(root: Path):
     """Explicit source allowlist: never walk .env, runtime data, credentials or media."""
     for name in ("main.py", "README.md", "PLAN.md", "CLAUDE.md", ".gitignore", ".env.example",
-                 "pytest.ini", "requirements.txt", "requirements-dev.txt", "requirements-p0.lock.txt"):
+                 "pytest.ini", "requirements.txt", "requirements-dev.txt", "requirements-p0.lock.txt",
+                 ".streamlit/config.toml"):
         path = root / name
         if path.is_file():
             yield path
