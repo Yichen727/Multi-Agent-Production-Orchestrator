@@ -1,133 +1,90 @@
-"""Atomized editing workspace. Only the active page renders or performs its work."""
+"""MAPO — Streamlit UI.
+
+Thin presentation layer for:
+    Ingest → Search → Selection → Deliver
+
+The Media Pool is the source of truth for selected clips.
+Selection produces a structured timeline; Delivery deterministically
+compiles it into a Premiere Pro–compatible FCP7 XML project.
+
+Launch:
+    streamlit run app/ui/streamlit_app.py
+"""
 
 import base64
-import json
-import math
+import subprocess
+import sys
+import streamlit as st
 from pathlib import Path
 
-import streamlit as st
+# Must be first Streamlit command
+st.set_page_config(page_title="MAPO", page_icon="🎬", layout="wide")
 
-from app.branding import PRODUCT_NAME, ACCENT_COLOR, DEFAULT_SEQUENCE_NAME, EXPORT_PREFIX
-from app.services import database_service as catalogue
-from app.services.workspace_state import reconcile_workspace, set_candidates, save_edit_plan
-from app.services.plan_contract import validate_edit_plan
+SUGGESTION_MARK = {"suggested": "🟡", "neutral": "⚪", "low": "🔴"}
+_TIERS = [("suggested", "🟡 Suggested"), ("neutral", "⚪ Neutral"), ("low", "🔴 Low")]
 
-st.set_page_config(page_title=PRODUCT_NAME, page_icon="🎬", layout="wide")
+# Selection editing modes.
+EDITING_MODES = {
+    "🎞️ Clip Assembly": ("clip_assembly",
+                          "Combine complete clips."),
+    "🎯 Moment Assembly": ("moment_assembly",
+                           "Select moments from within clips."),
+}
 
-st.html(f"""
-<style>
-  .atomized-wordmark {{ color: {ACCENT_COLOR}; font-size: 2rem; font-weight: 750; }}
-  [data-testid="stPopoverBody"] {{
-    min-width: min(520px, calc(100vw - 2rem));
-    max-width: min(720px, calc(100vw - 2rem));
-  }}
-</style>
-""")
+_DURATION_STATUS = {
+    "on_target": "on target",
+    "under_target": "under target",
+    "over_target": "over target — kept for content",
+}
 
-PAGES = ["Media Library", "Find Footage", "Edit Plan", "Export"]
-MODES = {"Full Clips": "clip_assembly", "Selected Moments": "moment_assembly"}
-ASPECTS = ["16:9", "9:16", "4:3", "3:4", "1:1"]
+# Editor-selected output specification propagated through Selection → Delivery.
+ASPECT_CHOICES = ["16:9", "9:16", "4:3", "3:4", "1:1"]
+
+
+# ── Selection state (Media Pool checkbox is the single source of truth) ────────────────
+
+
+def _bin_key(path: str) -> str:
+    return f"bin_{path}"
+
+
+def _set_bin(path: str, value: bool):
+    """Persist a clip's selected state in session state."""
+    st.session_state[_bin_key(path)] = value
+
+
+def _set_bin_many(paths: list[str], value: bool):
+    """Set selection state for all clips in a search tier."""
+    for path in paths:
+        st.session_state[_bin_key(path)] = value
+
+
+def _clear_all_selections():
+    """Clear all Media Pool selections."""
+    for k in [k for k in st.session_state if k.startswith("bin_")]:
+        st.session_state[k] = False
+
+
+def _toggle_select_all():
+    """Apply the Select-all value to all clips."""
+    value = bool(st.session_state.get("select_all_bin", False))
+    for c in st.session_state.get("bin_shots", []):
+        st.session_state[_bin_key(c["file_path"])] = value
+
+
+# ── Orchestrator ────────────────────────────────────────────────────
 
 
 def _orch():
-    from app.orchestrator import production_orchestrator
-    return production_orchestrator
+    from app.orchestrator import production_orchestrator as orch
+    return orch
 
 
-def _go(page):
-    st.session_state["workspace_page"] = page
-
-
-def _remember(key):
-    st.session_state["ui_values"][key] = st.session_state[key]
-
-
-def _seed(key, default):
-    st.session_state.setdefault(key, st.session_state["ui_values"].get(key, default))
-
-
-def _choose(ids, selected):
-    set_candidates(st.session_state, ids, selected)
-    # Checkbox keys are views of the durable candidate IDs, never the source of truth.
-    for key in list(st.session_state):
-        if key.startswith("candidate:") and int(key.rsplit(":", 1)[1]) in ids:
-            st.session_state[key] = selected
-
-
-def _toggle_candidate(clip_id, key):
-    set_candidates(st.session_state, [clip_id], bool(st.session_state[key]))
-
-
-def _candidate_checkbox(clip, page):
-    key = f"candidate:{page}:{clip['clip_id']}"
-    st.session_state[key] = clip["clip_id"] in st.session_state["candidate_clip_ids"]
-    st.checkbox(Path(clip["file_path"]).name, key=key, on_change=_toggle_candidate,
-                args=(clip["clip_id"], key), help="Include in the candidate set for this edit")
-
-
-def _analysis_label(clip):
-    count = clip.get("event_count", 0)
-    if count:
-        return f"Moments analysed {clip.get('analysed_event_count', 0)}/{count}"
-    if clip.get("description") or clip.get("keywords"):
-        return "Clip analysed · no moments"
-    return "Metadata only"
-
-
-def _meta(clip):
-    orientation = clip.get("orientation") or "orientation unknown"
-    return f"{clip.get('duration_seconds') or 0:.1f}s · {orientation} · {_analysis_label(clip)}"
-
-
-@st.cache_data(show_spinner=False)
-def _thumbnail(path, mtime_ns, source_revision, duration_seconds):
+def _pid(project_id):
     try:
-        from app.services.ffmpeg_service import extract_sample_frames_b64
-        frames = extract_sample_frames_b64(path, duration_seconds=duration_seconds, count=1)
-        return base64.b64decode(frames[0]) if frames else None
-    except Exception:
-        return None
-
-
-def _render_clip(clip, page, thumbnails=False):
-    with st.container(border=True):
-        main, action = st.columns([5, 1])
-        with main:
-            _candidate_checkbox(clip, page)
-            st.caption(_meta(clip))
-            if page == "find":
-                event = clip.get("matched_event")
-                reason = ((event.get("action") if event else None)
-                          or clip.get("description") or clip.get("keywords"))
-                if reason:
-                    st.caption(reason)
-                if clip.get("relevance") is not None:
-                    st.caption(f"Retrieval relevance {clip['relevance']:.0%}")
-            if thumbnails:
-                try:
-                    stamp = Path(clip["file_path"]).stat().st_mtime_ns
-                    frame = _thumbnail(clip["file_path"], stamp, clip["source_revision"], clip.get("duration_seconds") or 0)
-                    if frame:
-                        st.image(frame, width=200)
-                except OSError:
-                    st.caption("Source file unavailable")
-        with action:
-            preview = st.popover("Preview", key=f"preview:{page}:{clip['clip_id']}",
-                                 on_change="rerun", width="stretch")
-            if preview.open:
-                with preview:
-                    _render_preview(clip)
-
-
-def _render_preview(clip):
-    """Render only inside the open popover anchored to this clip's button."""
-    st.markdown(f"**{Path(clip['file_path']).name}**")
-    if Path(clip["file_path"]).is_file():
-        st.video(clip["file_path"])
-    else:
-        st.warning("Source file unavailable. Reconnect the media folder and update the library.")
-    st.caption(_meta(clip))
-    st.caption(clip.get("description") or "No visual description yet.")
+        return int(project_id)
+    except (TypeError, ValueError):
+        return project_id
 
 
 def _backup_headline(item: dict) -> str:
@@ -192,347 +149,526 @@ def _strip_backup_section(report: str) -> str:
     return "\n".join(lines[:start] + lines[end:]).strip()
 
 
-
-
-def _sidebar():
-    projects = catalogue.list_projects()
-    labels = {p["project_id"]: p["project_name"] for p in projects}
-    options = list(labels) or [1]
-    if "pending_project_id" in st.session_state:
-        st.session_state["project_picker"] = st.session_state.pop("pending_project_id")
-    if st.session_state.get("project_picker") not in options:
-        st.session_state["project_picker"] = options[0]
-    with st.sidebar:
-        st.html('<div class="atomized-wordmark">Atomized</div>')
-        st.caption("Post Production Helper")
-        pid = st.selectbox("Project", options, format_func=lambda p: labels.get(p, "Untitled project"),
-                           key="project_picker")
-        with st.expander("Workspace settings"):
-            user = st.text_input("Editor ID", value="editor_01", key="workspace_editor_id",
-                                 help="Separates working selections within this browser session")
-            st.caption(f"Project ID: {pid}")
-            with st.form("create_project_form"):
-                name = st.text_input("New project name", key="new_project_name")
-                create = st.form_submit_button("Create project")
-            if create:
-                try:
-                    st.session_state["pending_project_id"] = catalogue.create_project(name)
-                    st.rerun()
-                except ValueError as exc:
-                    st.error(str(exc))
-        clips = catalogue.get_library_clips(pid)
-        reconcile_workspace(st.session_state, pid, user, clips,
-                            verify_plan=st.session_state.get("workspace_page") in ("Edit Plan", "Export"))
-        st.subheader("Footage")
-        _seed("footage_folder", "./app/data/raw_footage")
-        directory = st.text_input("Media folder", key="footage_folder",
-                                  on_change=_remember, args=("footage_folder",))
-        with st.expander("Import options"):
-            for key, default in (("import_visual", True), ("import_moments", True),
-                                 ("import_force", False), ("import_verify", False)):
-                _seed(key, default)
-            visual = st.checkbox("Analyse visual content", key="import_visual",
-                                 on_change=_remember, args=("import_visual",))
-            moments = st.checkbox("Analyse moments", key="import_moments", disabled=not visual,
-                                  on_change=_remember, args=("import_moments",))
-            force = st.checkbox("Reanalyse existing media", key="import_force",
-                                on_change=_remember, args=("import_force",),
-                                help="Runs completed analysis again; ordinary updates reuse it")
-            verify = st.checkbox("Verify file contents", key="import_verify",
-                                 on_change=_remember, args=("import_verify",),
-                                 help="Also detects replacements that kept the same size and timestamp")
-        if st.button("Import / Update", key="import_update", type="primary",
-                     use_container_width=True, disabled=not directory.strip()):
-            _import_media(directory, pid, user, visual, moments, force, verify)
-        result = st.session_state.get("ingest_result")
-        if result:
-            show = st.error if result["status"] == "failure" else (
-                st.warning if result["status"] == "partial_success" else st.success)
-            show(f"Reused {result['reused']} · New {result['new']} · Changed {result['changed']} "
-                 f"· Failed {result['failed']}")
-            with st.expander("Import details"):
-                st.write(f"Updated analysis: {result.get('analysed', 0)}")
-                for detail in result["details"]:
-                    st.text(detail)
-        st.divider()
-        st.metric("Current candidates", len(st.session_state["candidate_clip_ids"]))
-        online = st.session_state["clip_metadata"]
-        st.caption(f"{len(online)} online clips · {sum(bool(c.get('event_count')) for c in online)} with moments")
-        if len(clips) > len(online):
-            st.caption(f"{len(clips) - len(online)} offline clips")
-        st.button("Clear candidates", key="clear_candidates", on_click=_choose,
-                  args=(list(st.session_state["candidate_clip_ids"]), False),
-                  disabled=not st.session_state["candidate_clip_ids"])
-    return pid, user
-
-
-def _import_media(directory, pid, user, visual, moments, force, verify):
-    before = {c["clip_id"]: c for c in catalogue.get_library_clips(pid)}
-    totals = {"status": "success", "reused": 0, "new": 0, "changed": 0, "failed": 0,
-              "analysed": 0, "details": []}
-    offset, indexed = 0, 0
+def _reveal_in_file_manager(target: str) -> str | None:
+    """Open the OS file manager with the exported file selected.
+    Returns None on success or an error message when unavailable.
+    """
+    path = Path(target)
+    if not path.exists():
+        return "the file is no longer on disk"
     try:
-        with st.status("Updating media library…", expanded=True) as progress:
-            while True:
-                st.write(f"Processing batch {offset // 200 + 1}")
-                _, result = _orch().run_ingest(directory, pid, user, batch_offset=offset,
-                    analyze_content=visual, analyze_events=moments, force_reanalyze=force,
-                    verify_content=verify)
-                totals["reused"] += result.reused_count
-                totals["failed"] += result.unreadable_count
-                indexed += result.indexed_count
-                totals["details"].extend([result.message, *result.warnings, *result.errors])
-                if result.status != "success":
-                    totals["status"] = result.status
-                if result.status == "failure" or result.next_offset is None:
-                    break
-                offset = result.next_offset
-            progress.update(label="Import finished", state="error" if totals["status"] == "failure" else "complete",
-                            expanded=False)
-    except Exception as exc:
-        totals["status"] = "failure"
-        totals["details"].append(str(exc))
-    after = catalogue.get_library_clips(pid)
-    totals["new"] = sum(c["clip_id"] not in before for c in after)
-    totals["changed"] = sum(c["clip_id"] in before and c["source_revision"] != before[c["clip_id"]]["source_revision"]
-                            for c in after)
-    totals["analysed"] = max(0, indexed - totals["reused"] - totals["new"] - totals["changed"])
-    reconcile_workspace(st.session_state, pid, user, after)
-    st.session_state["ingest_result"] = totals
-    st.rerun()
-
-
-def _library():
-    st.header("Media Library")
-    st.caption("Browse project media and choose candidates for your edit.")
-    clips = st.session_state["clip_metadata"]
-    if not clips:
-        st.info("Import your media using Footage in the sidebar. Existing project media appears here automatically.")
-        return
-    for key, default in (("library_filter", ""), ("library_orientation", "Any orientation"),
-                         ("library_analysis", "Any analysis"), ("library_selected", False),
-                         ("library_thumbnails", False), ("library_size", 20)):
-        _seed(key, default)
-    query = st.text_input("Filter media", key="library_filter", on_change=_remember, args=("library_filter",))
-    a, b, c = st.columns(3)
-    orientation = a.selectbox("Orientation", ["Any orientation", "Landscape", "Portrait", "Square"],
-                             key="library_orientation", on_change=_remember, args=("library_orientation",))
-    analysis = b.selectbox("Analysis", ["Any analysis", "Metadata only", "Has moments", "No moments"],
-                          key="library_analysis", on_change=_remember, args=("library_analysis",))
-    selected_only = c.checkbox("Candidates only", key="library_selected",
-                              on_change=_remember, args=("library_selected",))
-    selected = set(st.session_state["candidate_clip_ids"])
-    filtered = [clip for clip in clips if (
-        (not query or query.casefold() in (clip["file_path"] + " " + (clip.get("keywords") or "")).casefold())
-        and (orientation == "Any orientation" or clip.get("orientation") == orientation.lower())
-        and (not selected_only or clip["clip_id"] in selected)
-        and (analysis != "Metadata only" or not (clip.get("description") or clip.get("keywords")))
-        and (analysis != "Has moments" or clip.get("event_count"))
-        and (analysis != "No moments" or not clip.get("event_count")))]
-    size = st.selectbox("Clips per page", [20, 50], key="library_size",
-                        on_change=_remember, args=("library_size",))
-    pages = max(1, math.ceil(len(filtered) / size))
-    _seed("library_page", 1)
-    st.session_state["library_page"] = min(st.session_state["library_page"], pages)
-    page = st.number_input("Page", min_value=1, max_value=pages, step=1, key="library_page",
-                           on_change=_remember, args=("library_page",))
-    shown = filtered[(page - 1) * size:page * size]
-    st.caption(f"{len(filtered)} matching clips · page {page}/{pages}")
-    left, middle, right = st.columns(3)
-    left.button("Select this page", key="library_select_page", on_click=_choose,
-                args=([c["clip_id"] for c in shown], True), disabled=not shown)
-    middle.button("Clear this page", key="library_clear_page", on_click=_choose,
-                  args=([c["clip_id"] for c in shown], False), disabled=not shown)
-    right.button("Create edit plan", key="library_to_plan", on_click=_go, args=("Edit Plan",),
-                 disabled=not selected)
-    thumbnails = st.checkbox("Show thumbnails", key="library_thumbnails",
-                             on_change=_remember, args=("library_thumbnails",),
-                             help="Loads thumbnails for this page only")
-    if not shown:
-        st.info("No media matches these filters. Broaden the filters to see more clips.")
-    for clip in shown:
-        _render_clip(clip, "library", thumbnails)
-
-
-def _find(pid, user):
-    st.header("Find Footage")
-    st.caption("Search for subjects, actions or atmosphere. Add matches to the same candidate set.")
-    if not st.session_state["clip_metadata"]:
-        st.info("Import media in the sidebar, or switch to a project with an existing library.")
-        return
-    _seed("find_query", "")
-    with st.form("find_form"):
-        query = st.text_input("What are you looking for?", key="find_query",
-                              placeholder="e.g. People celebrating outdoors")
-        submit = st.form_submit_button("Find footage", type="primary")
-    if submit:
-        _remember("find_query")
-        try:
-            with st.spinner("Finding footage…"):
-                found = _orch().run_search(query, pid, user)
-                by_id = {c["clip_id"]: c for c in st.session_state["clip_metadata"]}
-                st.session_state["search_results"] = [{**by_id.get(c["clip_id"], {}), **c} for c in found]
-            st.session_state["ui_values"]["find_has_run"] = True
-            st.session_state["find_page"] = 1
-        except Exception as exc:
-            st.error(f"Search could not finish: {exc}")
-    rows = st.session_state["search_results"]
-    if not rows:
-        if st.session_state["ui_values"].get("find_has_run"):
-            st.info("No matching footage. Try broader content terms.")
-        return
-    st.caption(f"{len(rows)} results")
-    # Retrieval stays untouched; the UI renders one window of its result list.
-    _seed("find_page", 1)
-    pages = max(1, math.ceil(len(rows) / 20))
-    st.session_state["find_page"] = min(st.session_state["find_page"], pages)
-    page = st.number_input("Results page", min_value=1, max_value=pages, step=1, key="find_page",
-                           on_change=_remember, args=("find_page",))
-    shown = rows[(page - 1) * 20:page * 20]
-    a, b, c = st.columns(3)
-    a.button("Add this page", key="find_add_page", on_click=_choose,
-             args=([c["clip_id"] for c in shown], True))
-    b.button("Remove this page", key="find_remove_page", on_click=_choose,
-             args=([c["clip_id"] for c in shown], False))
-    c.button("Create edit plan", key="find_to_plan", on_click=_go, args=("Edit Plan",))
-    for clip in shown:
-        _render_clip(clip, "find")
-
-
-def _plan_summary(plan):
-    mode = "Full Clips" if plan.get("mode") == "clip_assembly" else "Selected Moments"
-    st.caption(f"{mode} · {len(plan['segments'])} segments · {plan.get('total_seconds', 0):g}s "
-               + (f"· {plan['aspect_ratio']}" if plan.get("aspect_ratio") else ""))
-    if plan.get("target_seconds"):
-        st.caption(f"Target {plan['target_seconds']:g}s · {plan.get('duration_status', '').replace('_', ' ')}")
-    if plan.get("ordering_strategy"):
-        st.write(plan["ordering_strategy"])
-    st.dataframe([{"Order": s["order"], "Clip": s.get("name") or Path(s["file_path"]).name,
-                   "In (s)": s["in_point"], "Out (s)": s["out_point"],
-                   "Duration (s)": s["duration"], "Role": s.get("label", "")}
-                  for s in plan["segments"]], hide_index=True, use_container_width=True)
-
-
-def _edit(pid, user):
-    st.header("Edit Plan")
-    candidates = [c for c in st.session_state["clip_metadata"]
-                  if c["clip_id"] in st.session_state["candidate_clip_ids"]]
-    st.caption(f"{len(candidates)} candidate clips")
-    if not candidates:
-        st.info("Choose candidates in Media Library or Find Footage to create an edit plan.")
-        st.button("Choose media", key="plan_to_library", on_click=_go, args=("Media Library",))
-    for key, default in (("plan_mode", "Full Clips"), ("plan_aspect", "16:9"),
-                         ("plan_target", None), ("plan_intent", ""), ("plan_name", "Edit plan")):
-        _seed(key, default)
-    mode = st.radio("Editing mode", list(MODES), horizontal=True, key="plan_mode",
-                    captions=["Keep complete video clips.", "Choose moments within clips."],
-                    on_change=_remember, args=("plan_mode",))
-    a, b = st.columns(2)
-    aspect = a.selectbox("Output aspect ratio", ASPECTS, key="plan_aspect",
-                         on_change=_remember, args=("plan_aspect",))
-    target = b.number_input("Target duration (seconds)", min_value=1.0, max_value=7200.0,
-                            value=None, key="plan_target", disabled=mode == "Full Clips",
-                            placeholder="Optional", on_change=_remember, args=("plan_target",))
-    if mode == "Full Clips":
-        st.caption("Full Clips preserves the complete source lengths; target duration does not apply.")
-    elif candidates and not any(c.get("analysed_event_count") for c in candidates):
-        st.warning("These candidates have no analysed moments. Enable Analyse moments in Import options and update the media.")
-    intent = st.text_area("Editing intent", key="plan_intent", on_change=_remember, args=("plan_intent",),
-                          placeholder="Describe the purpose, style, pace and feeling of the edit.")
-    name = st.text_input("Plan name", key="plan_name", on_change=_remember, args=("plan_name",))
-    if st.button("Generate edit plan", key="plan_generate", type="primary", disabled=not candidates):
-        if not intent.strip():
-            st.warning("Describe the editing intent first.")
+        if sys.platform.startswith("win"):
+            # Explorer uses /select,<path>.
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
         else:
-            try:
-                with st.spinner("Building your edit plan…"):
-                    report, plan = _orch().run_selection(intent.strip(), [c["file_path"] for c in candidates],
-                        pid, user, editing_mode=MODES[mode], target_seconds=target if mode == "Selected Moments" else None,
-                        aspect_ratio=aspect)
-                    if not plan:
-                        raise ValueError("No usable timeline was generated. Refine the intent and try again.")
-                    save_edit_plan(st.session_state, plan, report, name)
-                st.success("Plan saved in this workspace.")
-            except Exception as exc:
-                st.error(f"The edit plan could not be generated: {exc}")
-    plan = st.session_state["edit_plan"]
-    if plan:
-        _plan_summary(plan)
-        st.markdown(_strip_backup_section(st.session_state["edit_report"]))
-        for i, item in enumerate(plan.get("excluded") or [], 1):
-            _render_backup_item(i, item)
-        st.button("Export this plan", key="plan_to_export", on_click=_go, args=("Export",))
-        st.download_button("Download plan JSON", json.dumps(plan, ensure_ascii=False, indent=2),
-                           file_name=f"{EXPORT_PREFIX}_edit_plan.json", mime="application/json", key="plan_download")
+            subprocess.Popen(["xdg-open", str(path.parent)])  
+    except OSError as e:
+        return str(e)
+    return None
 
 
-def _export(pid, user):
-    st.header("Export")
-    st.caption("Choose a saved plan and export it for Adobe Premiere Pro.")
-    with st.expander("Open a saved plan JSON"):
-        upload = st.file_uploader("Plan JSON", type=["json"], key="export_upload")
-        if st.button("Open plan", key="export_open", disabled=upload is None):
-            try:
-                plan = validate_edit_plan(upload.getvalue(), pid)
-                opened = save_edit_plan(st.session_state, plan, "", Path(upload.name).stem)
-                st.session_state["export_plan"] = opened["id"]
-                st.success("Verified plan opened.")
-            except Exception as exc:
-                st.error(f"This plan cannot be used: {exc}")
-    records = st.session_state["saved_edit_plans"]
-    if not records:
-        st.info("Create an edit plan first, or open a previously downloaded plan JSON.")
-        st.button("Create edit plan", key="export_to_plan", on_click=_go, args=("Edit Plan",))
+def _render_export_actions(result) -> None:
+    """Show the exported project and provide a file-manager action."""
+    xml_path = getattr(result, "xml_path", None) if result else None
+    if not (xml_path and getattr(result, "status", None) == "success"):
         return
-    by_id = {r["id"]: r for r in records}
-    current = st.session_state.get("active_plan_id")
-    if st.session_state.get("export_plan") not in by_id:
-        st.session_state["export_plan"] = current if current in by_id else records[-1]["id"]
-    selected = st.selectbox("Saved plan", list(by_id), key="export_plan",
-                            format_func=lambda rid: f"{by_id[rid]['name']} · version {list(by_id).index(rid) + 1}")
-    st.session_state["active_plan_id"] = selected
-    record = by_id[selected]
-    _plan_summary(record["plan"])
-    valid = True
+    if not Path(xml_path).exists():
+        st.caption(f"⚠ The exported file is no longer at its recorded path: {xml_path}")
+        return
+    name = Path(xml_path).name
+    if st.button(f"📂 Show {name} in folder", key="reveal_export",
+                 use_container_width=True,
+                 help="Opens the export folder with the file selected — drag it straight "
+                      "into Premiere Pro (works when the app runs on this machine)"):
+        problem = _reveal_in_file_manager(xml_path)
+        if problem:
+            st.warning(f"Could not open the folder ({problem}). The file is at: {xml_path}")
+        else:
+            st.caption(f"Opened {Path(xml_path).parent}")
+
+
+# ── Backend calls  ────────────────────────────────────────────────────────────────────
+
+
+def run_selection(intent: str, selected_paths: list[str], project_id: str, user_id: str,
+                  editing_mode: str = "clip_assembly", target_seconds: float | None = None,
+                  aspect_ratio: str = ""):
+    """Run Selection and return its narration plus structured plan."""
+    return _orch().run_selection(intent, selected_paths, project_id, user_id,
+                                 editing_mode=editing_mode, target_seconds=target_seconds,
+                                 aspect_ratio=aspect_ratio)
+
+
+def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str = "MAPO Edit"):
+    """Compile a structured Selection plan into delivery outputs."""
+    return _orch().run_delivery(plan, project_id, user_id, sequence_name=sequence_name)
+
+
+def load_bin(project_id):
+    """Load the catalogue into the Media Pool."""
+    from app.services.retrieval_service import hybrid_search
+    st.session_state.bin_shots = hybrid_search(_pid(project_id), top_k=1000)
+
+
+def do_search(query: str, project_id: str, user_id: str):
+    """Run clip-level Search and store the ranked results."""
+    st.session_state.search_results = _orch().run_search(query, project_id, user_id)
+
+
+# ── Preview / thumbnail helpers ─────────────────────────────────────────────
+
+
+def _safe_mtime(path: str) -> float:
     try:
-        validate_edit_plan(record["plan"], pid)
-    except (ValueError, TypeError, KeyError, OSError) as exc:
-        valid = False
-        st.warning(f"This plan needs to be regenerated: {exc}")
-    _seed("export_name", DEFAULT_SEQUENCE_NAME)
-    name = st.text_input("Sequence name", key="export_name", on_change=_remember, args=("export_name",))
-    if st.button("Export Premiere project", key="export_compile", type="primary", disabled=not valid):
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _thumbnail_bytes(path: str, mtime: float, duration: float):
+    """Extract one representative JPEG frame (cached per file). None if unavailable."""
+    try:
+        if not Path(path).exists():
+            return None
+        from app.services.ffmpeg_service import extract_sample_frames_b64
+        frames = extract_sample_frames_b64(path, duration or 0.0, count=1)
+        return base64.b64decode(frames[0]) if frames else None
+    except Exception:
+        return None
+
+
+def _thumb(c):
+    return _thumbnail_bytes(c["file_path"], _safe_mtime(c["file_path"]), c.get("duration_seconds") or 0.0)
+
+
+def _reason(c, tier: str) -> str:
+    """Return a short explanation for why a clip matched the query."""
+    if tier == "low":
+        return "weak semantic match"
+    ev = c.get("matched_event")
+    if ev and (ev.get("action") or "").strip():
+        span = f"{ev.get('start_seconds', 0):.0f}–{ev.get('end_seconds', 0):.0f}s"
+        return f"contains: {ev['action'].strip()} (~{span})"
+    desc = (c.get("description") or "").strip()
+    if desc:
+        return desc
+    kws = [k.strip() for k in (c.get("keywords") or "").split(",") if k.strip()]
+    if kws:
+        return " / ".join(kws[:3])
+    return "semantic match"
+
+
+def _meta_line(c: dict) -> str:
+    bits = []
+    if c.get("shot_type") and c["shot_type"] != "unclassified":
+        bits.append(f"`{c['shot_type']}`")
+    if c.get("duration_seconds"):
+        bits.append(f"{c['duration_seconds']:.1f}s")
+    if c.get("orientation"):
+        bits.append(c["orientation"])
+    if c.get("mood"):
+        bits.append(f"mood: {c['mood']}")
+    if c.get("group_size") and c["group_size"] not in ("unknown", "none"):
+        bits.append(f"{c['group_size']} ({c.get('people_count')})")
+    if c.get("keywords"):
+        bits.append(str(c["keywords"])[:80])
+    return " · ".join(bits)
+
+
+def _render_preview(c):
+    """Popover body: a frame, an inline player if possible, and full metadata."""
+    path = c["file_path"]
+    st.markdown(f"**{Path(path).name}**")
+    if Path(path).exists():
         try:
-            with st.spinner("Preparing Premiere project…"):
-                report, result = _orch().run_delivery(record["plan"], pid, user, sequence_name=name.strip() or DEFAULT_SEQUENCE_NAME)
-            st.session_state.update(export_report=report, export_result=result, exported_plan_id=selected)
-        except Exception as exc:
-            st.session_state.update(export_result=None, export_report=str(exc), exported_plan_id=selected)
-    result = st.session_state["export_result"]
-    if result and st.session_state.get("exported_plan_id") == selected and result.status == "success":
-        st.success(f"Exported {result.clip_count} segments · {result.width} × {result.height}")
-        for path, label, mime in ((result.xml_path, "Download Premiere XML", "application/xml"),
-                                  (result.json_path, "Download timeline JSON", "application/json")):
-            if path and Path(path).is_file():
-                st.download_button(label, Path(path).read_bytes(), file_name=Path(path).name, mime=mime,
-                                   key="download:" + label)
-        st.caption("Import the XML in Premiere Pro using File → Import.")
-    elif st.session_state.get("export_report") and st.session_state.get("exported_plan_id") == selected:
-        st.error(st.session_state["export_report"])
+            st.video(path)
+        except Exception:
+            st.caption("(inline playback unavailable for this codec)")
+    else:
+        st.caption("⚠ File not found on disk — preview unavailable.")
+    st.caption(_meta_line(c))
+
+
+# ── Section renderers ────────────────────────────────────────────────────────
+
+
+def render_bin(project_id, locked):
+    """Render the Media Pool section in the sidebar: checkbox + ▶ preview per clip."""
+    st.subheader("🎞️ Media Pool")
+    st.caption("☑ add to edit · ▶ preview")
+    if locked:
+        st.info("🔒 Run Ingest to populate the Media Pool.")
+        return
+
+    shots = st.session_state.bin_shots
+    if not shots:
+        st.info("Media Pool is empty. Run Ingest to populate it.")
+        return
+
+    # Select-all changes all clip states without overriding later individual edits.
+    st.checkbox("Select all", key="select_all_bin", on_change=_toggle_select_all,
+                help="Tick or untick every clip in the pool")
+
+    # Keep the full catalogue in ingestion order; Search has its own result list.
+    for c in shots:
+        path = c["file_path"]
+        name = Path(path).name
+        col_name, col_play = st.columns([0.8, 0.2])
+        with col_name:
+            st.checkbox(name, key=_bin_key(path))
+        with col_play:
+            with st.popover("▶"):
+                _render_preview(c)
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("↻ Refresh", use_container_width=True):
+            load_bin(project_id)
+            st.rerun()
+    with b2:
+        st.button("Clear ✕", use_container_width=True, help="Clear all selections",
+                  on_click=_clear_all_selections)
+
+
+def render_search_results():
+    if not st.session_state.get("search_results"):
+        return
+
+    grouped = {"suggested": [], "neutral": [], "low": []}
+    for c in st.session_state.search_results:
+        grouped.setdefault(c.get("suggestion", "low"), []).append(c)
+
+    # Each tier collapses into its own expander
+    _EXPANDED = {"suggested": True, "neutral": False, "low": False}
+
+    for tier, header in _TIERS:
+        items = grouped.get(tier) or []
+        if not items:
+            continue
+        with st.expander(f"{header} ({len(items)})", expanded=_EXPANDED.get(tier, False)):
+            # Bulk actions share the same Media Pool state as individual result buttons.
+            paths_in_tier = [c["file_path"] for c in items]
+            bulk_add, bulk_del, _ = st.columns([1.4, 1.4, 3.2])
+            with bulk_add:
+                st.button(f"➕ Add all ({len(items)})", key=f"srch_add_{tier}",
+                          use_container_width=True,
+                          help="Tick every clip in this tier in the Media Pool",
+                          on_click=_set_bin_many, args=(paths_in_tier, True))
+            with bulk_del:
+                st.button(f"➖ Remove all ({len(items)})", key=f"srch_del_{tier}",
+                          use_container_width=True,
+                          help="Untick every clip in this tier in the Media Pool",
+                          on_click=_set_bin_many, args=(paths_in_tier, False))
+
+            for c in items:
+                path = c["file_path"]
+                name = Path(path).name
+                in_bin = bool(st.session_state.get(_bin_key(path)))
+                rel = c.get("relevance")
+                rel_str = f"{rel*100:.0f}%" if rel is not None else "—"
+                dur = c.get("duration_seconds") or 0.0
+                mark = SUGGESTION_MARK.get(tier, "⚪")
+
+                card, action = st.columns([5, 1])
+                with card:
+                    st.markdown(f"{mark} **{name}** · {rel_str} · {dur:.1f}s")
+                    st.caption(f"💡 {_reason(c, tier)}")
+                    # Thumbnail evidence only for strong/medium matches.
+                    if tier in ("suggested", "neutral"):
+                        thumb = _thumb(c)
+                        if thumb:
+                            st.image(thumb, width=200)
+                with action:
+                    if in_bin:
+                        st.button("➖", key=f"srch_tgl_{path}", help="Untick in Media Pool",
+                                  on_click=_set_bin, args=(path, False))
+                    else:
+                        st.button("➕", key=f"srch_tgl_{path}", help="Tick in Media Pool",
+                                  on_click=_set_bin, args=(path, True))
+        st.markdown("")
+
+
+# ── App ────────────────────────────────────────────────────────────────────
 
 
 def main():
-    pid, user = _sidebar()
-    st.title(PRODUCT_NAME)
-    page = st.radio("Workspace", PAGES, horizontal=True, key="workspace_page", label_visibility="collapsed")
-    if page == "Media Library":
-        _library()
-    elif page == "Find Footage":
-        _find(pid, user)
-    elif page == "Edit Plan":
-        _edit(pid, user)
+    st.title("🎬 MAPO — Multi-Agent Production Orchestrator")
+    st.caption("MSc Computer Graphics, Vision & Imaging — UCL | Yichen Zheng")
+
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("ingest_done", False)
+    st.session_state.setdefault("bin_shots", [])
+    st.session_state.setdefault("search_results", [])
+    st.session_state.setdefault("selection_output", "")
+    st.session_state.setdefault("delivery_output_text", "")
+    st.session_state.setdefault("delivery_result", None)
+    st.session_state.setdefault("last_timeline_plan", None)
+
+    locked = not st.session_state.ingest_done
+
+    # ── Sidebar: settings + the shared Media Pool  ──────────
+    with st.sidebar:
+        st.header("⚙️ Project Settings")
+        project_id = st.text_input("Project ID", value="1")
+        user_id = st.text_input("Editor ID", value="editor_01")
+
+        st.divider()
+
+        st.subheader("📁 Footage")
+        footage_path = st.text_input(
+            "Full path to the folder containing your video files", value="./app/data/raw_footage")
+        if footage_path:
+            fdir = Path(footage_path)
+            if fdir.exists():
+                vids = []
+                for ext in ["mp4", "mov", "avi", "mxf", "r3d", "braw"]:
+                    vids.extend(fdir.rglob(f"*.{ext}"))
+                st.success(f"✓ Found {len(vids)} video files")
+            else:
+                st.warning("⚠ Folder not found — check the path")
+
+        st.divider()
+
+        # Media Pool — its own section, the shared media pool.
+        if st.session_state.ingest_done and not st.session_state.bin_shots:
+            load_bin(project_id)
+        render_bin(project_id, locked)
+
+        st.divider()
+        if st.button("🔄 Reset Pipeline", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+    # ── Main area (full width): the workflow ──────────────────────────────────
+    # ① Ingest
+    st.subheader("① Ingest")
+    st.caption("Scan and catalogue the footage.")
+    if st.session_state.ingest_done:
+        st.success("✅ Ingest completed. All clips are in the Media Pool.")
+    run_ingest = st.button("🎬 Run Ingest Analysis", use_container_width=True,
+                           help="Ingest Agent — scan, vision-tag, embed, catalogue")
+    st.divider()
+
+    # ② Search
+    st.subheader("② Search")
+    st.caption("Find matching clips and add them to the Media Pool.")
+
+    if locked:
+        st.info("🔒 Locked — run Ingest first.")
+
+    search_text = st.text_input("Search query", placeholder="e.g. Tech products",
+                                disabled=locked, key="search_query")
+    s1, s2 = st.columns(2)
+    with s1:
+        if st.button("🔍 Search", use_container_width=True, disabled=locked):
+            if search_text.strip():
+                do_search(search_text, project_id, user_id)
+            else:
+                st.warning("Enter a search query first.")
+    with s2:
+        if st.button("✖ Clear results", use_container_width=True, disabled=locked,
+                     help="Drop the last search's result cards (Media Pool ticks stay)"):
+            st.session_state.search_results = []
+    render_search_results()
+    st.divider()
+
+    # ③ Selection
+    st.subheader("③ Selection")
+    st.caption("Choose an editing mode and describe your intent.")
+    selected_paths = [c["file_path"] for c in st.session_state.bin_shots
+                      if st.session_state.get(_bin_key(c["file_path"]))]
+    have_sel = bool(selected_paths)
+    if locked:
+        st.info("🔒 Locked — run Ingest first.")
+    elif not have_sel:
+        st.info("Tick at least one clip in the Media Pool (left sidebar).")
     else:
-        _export(pid, user)
+        st.caption(f"{len(selected_paths)} clip(s) selected.")
+
+    sel_disabled = locked or not have_sel
+    mode_label = st.radio(
+        "Editing mode",
+        options=list(EDITING_MODES),
+        captions=[EDITING_MODES[k][1] for k in EDITING_MODES],
+        horizontal=True, disabled=sel_disabled, key="editing_mode_label")
+    is_moment = EDITING_MODES[mode_label][0] == "moment_assembly"
+
+    o1, o2 = st.columns([2, 2])
+    with o1:
+        aspect_ratio = st.selectbox(
+            "Output aspect ratio", options=ASPECT_CHOICES, index=0,
+            disabled=sel_disabled, key="aspect_ratio",
+            )
+    with o2:
+        # Target duration is only available in Moment Assembly.
+        target_seconds = st.number_input(
+            "Target duration (seconds)", min_value=1.0, max_value=7200.0, step=5.0,
+            value=None, placeholder="N/A", format="%.0f",
+            disabled=sel_disabled or not is_moment, key="target_seconds",
+            help=("Optional. The agent selects the moments the intent needs first, then "
+                  "compresses the lower-value ones to fit — content is never dropped just "
+                  "to hit the number." if is_moment
+                  else "Not available in Clip Assembly Mode."))
+    if not is_moment:
+        target_seconds = None
+
+    intent_text = st.text_input(
+        "Editing intent", key="intent", disabled=sel_disabled,
+        placeholder="e.g. Fast-paced tech product promo, showcasing various functions",
+        help="Describe style, emotion, pacing and purpose.")
+    run_select = st.button("🎬 Generate Edit Timeline", use_container_width=True,
+                           disabled=sel_disabled,
+                           help="Selection Agent — an assistant editor: it curates, orders "
+                                "and explains (no fixed narrative arc)")
+
+    if st.session_state.get("selection_output"):
+        plan = st.session_state.get("last_timeline_plan")
+        if plan:
+            n_steps = len(plan.get("segments", []))
+            if plan.get("mode") == "moment_assembly":
+                head = (f"🎯 MOMENT ASSEMBLY · {n_steps} moment(s) · "
+                        f"{plan.get('total_seconds')}s")
+                if plan.get("target_seconds"):
+                    head += (f" · target {plan.get('target_seconds')}s "
+                             f"({_DURATION_STATUS.get(plan.get('duration_status'), '')})")
+                comp = plan.get("compression") or {}
+                if comp.get("applied"):
+                    head += (f" · optimised −{comp.get('absorbed_seconds')}s across "
+                             f"{comp.get('trimmed_count')} lower-value moment(s)")
+                st.caption(head)
+            else:
+                st.caption(f"🎞️ CLIP ASSEMBLY · {n_steps} complete clip(s) · "
+                           f"{plan.get('total_seconds')}s (no trimming)")
+            if plan.get("aspect_ratio"):
+                st.caption(f"🖼️ Output frame: {plan['aspect_ratio']}")
+            # Surface the declared ordering strategy and flag unchanged input order.
+            if plan.get("ordering_strategy"):
+                st.caption(f"🧭 Ordering: {plan['ordering_strategy']}")
+            if (plan.get("order_check") or {}).get("unchanged"):
+                st.caption(f"⚠ Order matches {plan['order_check']['reference']} — "
+                           "check the agent's reasoning below for why that shape fits.")
+        with st.container(border=True):
+            st.markdown(_strip_backup_section(st.session_state.selection_output))
+        # Render excluded alternatives separately from the agent's prose.
+        dropped = (plan or {}).get("excluded") or []
+        if dropped:
+            with st.expander(f"🗂️ Not used — backup material ({len(dropped)})",
+                             expanded=False):
+                st.caption("The alternatives the agent weighed and rejected, strongest "
+                           "first — not every unused clip. None of these is in the export.")
+                for i, x in enumerate(dropped, 1):
+                    _render_backup_item(i, x)
+                omitted = (plan or {}).get("excluded_omitted", 0)
+                if omitted:
+                    st.caption(f"＋{omitted} further item(s) were trimmed — the shortlist is "
+                               "capped at the strongest alternatives.")
+    st.divider()
+
+    # ④ Deliver
+    st.subheader("④ Deliver")
+    st.caption("Export the generated timeline as a Premiere Pro–compatible project.")
+    _plan = st.session_state.get("last_timeline_plan")
+    have_plan = bool(_plan and _plan.get("segments"))
+    if locked:
+        st.info("🔒 Locked — run Ingest first.")
+    elif not have_plan:
+        st.info("Generate a structured edit timeline first.")
+    else:
+        st.caption(f"Timeline ready · {len(_plan['segments'])} segment(s) · "
+                   f"built by {_plan.get('mode', 'clip_assembly').replace('_', ' ')} · "
+                   f"{_plan.get('total_seconds')}s"
+                   + (f" · output frame {_plan['aspect_ratio']}"
+                      if _plan.get("aspect_ratio") else "")
+                   )
+    seq_name = st.text_input("Sequence name", value="MAPO Edit",
+                             disabled=locked or not have_plan, key="seq_name")
+    run_deliver = st.button("📦 Export Project", use_container_width=True,
+                            disabled=locked or not have_plan,
+                            help="Delivery Agent — compiles the ordered timeline segments")
+
+    if st.session_state.get("delivery_output_text"):
+        with st.container(border=True):
+            st.markdown(st.session_state.delivery_output_text)
+        _render_export_actions(st.session_state.get("delivery_result"))
+    st.divider()
+
+    # ── Resolve actions (each button runs exactly one explicit pipeline stage) ──
+    if run_ingest:
+        with st.spinner("Ingest Agent is scanning, tagging and cataloguing footage..."):
+            try:
+                from app.services.database_service import get_catalogued_paths
+                response, res = _orch().run_ingest(footage_path, project_id, user_id)
+                st.session_state.messages.append(
+                    {"role": "user", "content": f"[Ingest] {footage_path}"})
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                catalogued = len(get_catalogued_paths(_pid(project_id)))
+                if (res is not None and res.status in ("success", "partial_success")
+                        and res.indexed_count > 0 and catalogued > 0):
+                    st.session_state.ingest_done = True
+                    load_bin(project_id)
+                    if res.status == "partial_success":
+                        warn = res.message + ("\n" + "; ".join(res.warnings) if res.warnings else "")
+                        st.warning(warn)
+                else:
+                    reason = (res.message if res is not None else
+                              "the agent never completed an ingest (no structured result)")
+                    st.error("Ingest did not succeed — Search/Selection/Delivery stay "
+                             f"locked: {reason}")
+            except Exception as e:
+                st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
+        st.rerun()
+    elif run_select:
+        if intent_text.strip():
+            mode_id = EDITING_MODES[mode_label][0]
+            with st.spinner("Selection Agent is orchestrating the edit..."):
+                try:
+                    response, plan = run_selection(
+                        intent_text.strip(), selected_paths, project_id, user_id,
+                        editing_mode=mode_id, target_seconds=target_seconds,
+                        aspect_ratio=aspect_ratio)
+                    # Render in Selection and retain a debug-log copy.
+                    st.session_state.selection_output = response
+                    st.session_state.messages.append({
+                        "role": "user",
+                        "content": (f"[Selection] {mode_label} · {aspect_ratio} · target "
+                                    f"{target_seconds or 'N/A'} · intent: {intent_text.strip()} "
+                                    f"· {len(selected_paths)} candidate clip(s)")})
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    st.session_state.last_timeline = response
+                    st.session_state.last_timeline_plan = plan
+                    st.session_state.delivery_output_text = ""
+                except Exception as e:
+                    st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
+            st.rerun()
+        else:
+            st.warning("Enter your editing intent first.")
+    elif run_deliver:
+        with st.spinner("Delivery Agent is compiling the Premiere project..."):
+            try:
+                response, res = run_delivery(
+                    st.session_state.get("last_timeline_plan"),
+                    project_id, user_id, (seq_name.strip() or "MAPO Edit"))
+                st.session_state.delivery_output_text = response
+                st.session_state.delivery_result = res
+                st.session_state.messages.append({
+                    "role": "user", "content": f"[Deliver] compile '{seq_name.strip() or 'MAPO Edit'}'"})
+                st.session_state.messages.append({"role": "assistant", "content": response})
+            except Exception as e:
+                st.session_state.delivery_result = None
+                st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
+        st.rerun()
+
+    # ── Debug log (collapsed) ─────────────────────────────────────────────────
+    with st.expander(f"🛠️ Debug log ({len(st.session_state.messages)} messages)", expanded=False):
+        if not st.session_state.messages:
+            st.caption("No agent activity yet.")
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
 
 if __name__ == "__main__":

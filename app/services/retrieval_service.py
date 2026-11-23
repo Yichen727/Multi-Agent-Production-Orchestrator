@@ -1,4 +1,4 @@
-"""Hybrid retrieval service for the Atomized production catalogue."""
+"""Hybrid retrieval service for the MAPO production catalogue."""
 
 import json
 import re
@@ -9,7 +9,6 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from sqlalchemy import text as _sql
 
 from app.services.database_service import _engine
-from app.services.contracts import project_id_value
 from app.services.openai_service import embed_texts, llm_fast
 from app.utils.logger import get_logger
 
@@ -18,7 +17,7 @@ logger = get_logger("retrieval_service")
 
 # Metadata returned for each candidate. Embeddings are used internally only.
 _SELECT_COLUMNS = (
-    "clip_id, project_id, source_revision, file_path, shot_type, duration_seconds, "
+    "shot_id, file_path, shot_type, duration_seconds, "
     "orientation, width, height, fps, keywords, description, "
     "people_count, mood, embedding"
 )
@@ -220,7 +219,7 @@ def _fetch_filtered(project_id, shot_type, orientation, people,
         params["maxdur"] = float(max_duration)
 
     where = " AND ".join(clauses)
-    query = f"SELECT {_SELECT_COLUMNS} FROM clips WHERE {where} AND online=1 ORDER BY file_path"
+    query = f"SELECT {_SELECT_COLUMNS} FROM shots WHERE {where} ORDER BY file_path"
 
     with _engine.begin() as conn:
         rows = conn.execute(_sql(query), params)
@@ -338,10 +337,8 @@ def _fetch_project_events(project_id, wanted_paths: set) -> list[dict]:
         return []
     with _engine.begin() as conn:
         rows = conn.execute(
-            _sql("SELECT e.file_path, e.start_seconds, e.end_seconds, e.action, e.state_change, "
-                 "e.keywords, e.subjects, e.embedding FROM clip_events e JOIN clips c "
-                 "ON c.clip_id=e.clip_id AND c.active_event_set_id=e.event_set_id "
-                 "WHERE e.project_id = :pid AND c.online=1"),
+            _sql("SELECT file_path, start_seconds, end_seconds, action, state_change, "
+                 "keywords, subjects, embedding FROM clip_events WHERE project_id = :pid"),
             {"pid": project_id},
         )
         return [dict(r._mapping) for r in rows if r._mapping["file_path"] in wanted_paths]
@@ -430,7 +427,6 @@ def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None
     Returns catalogue metadata with relevance, group size, suggestion label,
     and an optional matched event.
     """
-    project_id = project_id_value(project_id)
     keywords, orientation = hoist_orientation(keywords, orientation)
     orient = _normalise_orientation(orientation)
 
@@ -497,7 +493,7 @@ def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None
 
 # Event retrieval returns precise temporal moments for Selection.
 _EVENT_SELECT = (
-    "e.event_id, e.clip_id, e.event_set_id, s.source_revision, e.file_path, e.event_order, "
+    "e.event_id, e.shot_id, e.file_path, e.event_order, "
     "e.start_seconds, e.end_seconds, e.duration_seconds, "
     "e.action, e.state_change, e.subjects, e.keywords, e.embedding, "
     "s.shot_type AS shot_type, s.orientation AS orientation, "
@@ -533,8 +529,8 @@ def search_events(project_id, *, keywords: str = None, core_keywords: str = None
         params["stype"] = f"%{shot_type.strip().lower()}%"
     where = " AND ".join(clauses)
     query_sql = (f"SELECT {_EVENT_SELECT} FROM clip_events e "
-                 f"JOIN clips s ON s.clip_id = e.clip_id AND s.active_event_set_id=e.event_set_id "
-                 f"WHERE {where} AND s.online=1 ORDER BY e.file_path, e.event_order")
+                 f"JOIN shots s ON s.shot_id = e.shot_id "
+                 f"WHERE {where} ORDER BY e.file_path, e.event_order")
 
     with _engine.begin() as conn:
         rows = [dict(r._mapping) for r in conn.execute(_sql(query_sql), params)]

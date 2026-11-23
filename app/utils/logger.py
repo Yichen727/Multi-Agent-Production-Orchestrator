@@ -1,4 +1,4 @@
-"""Logging configuration for Atomized Post Production Helper."""
+"""Logging configuration for MAPO."""
 
 import logging
 import sys

@@ -206,7 +206,6 @@ def _finish(mode: str, segments: list[dict], *, target_seconds: float | None = N
     alternates = normalise_alternates(excluded)
     kept_alternates = alternates[:MAX_BACKUP_ITEMS]
     plan = {
-        "schema_version": 1,
         "mode": mode,
         "ordering_strategy": (ordering_strategy or "").strip(),
         "order_check": order_check or {"checked": False, "unchanged": False,
@@ -239,8 +238,7 @@ def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
         in_p, out_p = (0.0, src) if src > 0 else (None, None)
         segments.append({
             "order": i + 1,
-            "clip_id": c.get("clip_id"),
-            "source_revision": c.get("source_revision"),
+            "shot_id": c.get("shot_id"),
             "file_path": c.get("file_path"),
             "name": Path(c.get("file_path") or "").name,
             "label": (labels[i] if labels and i < len(labels) else ""),
@@ -308,9 +306,7 @@ def build_moment_timeline(events: list[dict], *, target_seconds: float | None = 
 
         segments.append({
             "order": i + 1,
-                        "clip_id": e.get("clip_id"),
-            "source_revision": e.get("source_revision"),
-            "event_set_id": e.get("event_set_id"),
+            "shot_id": e.get("shot_id"),
             "event_id": e.get("event_id"),
             "file_path": e.get("file_path"),
             "name": Path(e.get("file_path") or "").name,

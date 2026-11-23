@@ -1,4 +1,4 @@
-"""Shared LangGraph state for the Atomized pipeline."""
+"""Shared LangGraph state for the MAPO pipeline."""
 
 from typing import Annotated, Optional
 from typing_extensions import TypedDict
@@ -17,13 +17,13 @@ class ProductionState(TypedDict):
     footage_dir: str
 
     ingested_files: list[str]
-    clip_metadata: list[dict]
+    shot_metadata: list[dict]
 
     search_results: list[SearchCandidate]
     search_candidates: list[SearchCandidate]
 
     selected_candidates: list[str]
-    selected_clips: list[dict]
+    selected_shots: list[dict]
 
     editing_mode: str
     target_seconds: Optional[float]

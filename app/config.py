@@ -23,7 +23,7 @@ class Settings:
     # LangSmith
     LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
-    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "Atomized Post Production Helper")
+    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "MAPO-Production-Orchestrator")
 
     # Paths
     RAW_FOOTAGE_DIR: Path = Path(os.getenv("RAW_FOOTAGE_DIR", "./app/data/raw_footage"))
@@ -40,10 +40,6 @@ class Settings:
     # Debug
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     DEBUG_VERBOSE: bool = os.getenv("DEBUG_VERBOSE", "false").lower() == "true"
-
-    # Local P0 measurements (no prompt, response text, frames or credentials).
-    METRICS_ENABLED: bool = os.getenv("METRICS_ENABLED", "true").lower() == "true"
-    METRICS_OUTPUT_DIR: Path = Path(os.getenv("METRICS_OUTPUT_DIR", "./app/data/output/metrics"))
 
 
 settings = Settings()
