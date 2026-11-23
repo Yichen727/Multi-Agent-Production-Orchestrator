@@ -8,18 +8,18 @@ Built for a small company editing team using one workstation. Author: **Yichen Z
 
 ## The pipeline
 
-Four stages run in a fixed order, driven from a [Streamlit](https://streamlit.io/) UI. Selection is the reasoning agent; ingestion, search, and export use direct services. You stay in control at two points: which clips participate, and when to export.
+Four pipeline capabilities are available through a [Streamlit](https://streamlit.io/) workspace. Existing media and saved plans can be opened directly. Selection is the reasoning agent; ingestion, search, and export use direct services. You stay in control at two points: which clips participate, and when to export.
 
 ```
 ①  Ingest   →  ②  Search   →  [ Curation ]  →  ③  Selection   →  ④  Deliver
-  catalogue     find clips   tick Media Pool    edit timeline     Premiere XML
+  catalogue     find clips   choose candidates    edit timeline     Premiere XML
 ```
 
 | Stage | What it does |
 |---|---|
 | **① Ingest** | Analyses footage with ffprobe, FFmpeg, GPT-5.5 Vision, and embeddings, then builds a local searchable catalogue of clips and temporal events. |
 | **② Search** | Retrieves and ranks whole clips against a natural-language query, with relevance scores and retrieval reasons. |
-| **Curation** | Lets the editor select candidate clips in the Media Pool. Only selected clips reach Selection. |
+| **Curation** | Lets the editor select candidate clips in Media Library. Only selected clips reach Selection. |
 | **③ Selection** | Acts as an assistant editor, turning the curated candidate set into an explained edit timeline according to the editing intent. |
 | **④ Deliver** | Compiles the timeline into FCP7 XML (`xmeml` v5) + JSON for Premiere Pro import. |
 
@@ -73,114 +73,84 @@ python main.py
 
 ## User Manual
 
-### UI Overview
+The sidebar contains the project picker, workspace settings and **Footage → Import / Update**.
+The main area has four equal pages: **Media Library**, **Find Footage**, **Edit Plan**, **Export**.
+Only the active page renders. Opening a page never runs a search, analysis, planning or export.
 
-The interface is split into two areas:
+### Project and footage
 
-- **Sidebar (left)**: project configuration, footage folder, and the Media Pool.
-- **Main workspace (full width)**: the four production stages arranged top-to-bottom.
+Choose a project by name. **Workspace settings** contains Editor ID, the diagnostic
+Project ID and a **New project name → Create project** form. Creating a project is explicit.
+Each browser session has its own workspace; project/editor switches restore that session's
+own candidates, input drafts, saved plans and media folder. Editor ID is a workspace label,
+not an authentication mechanism.
 
-**Stage-locking mechanism**: downstream operations stay disabled (🔒 Locked) until the required preceding stage completes:
+Set **Media folder** under Footage and click **Import / Update**. The import reports
+**Reused / New / Changed / Failed** counts and analysis updates. Existing online media is
+available immediately after startup; an unsuccessful import does not erase the library.
 
-- Search / Selection / Deliver unlock when the current project has online catalogued clips, including after a restart;
-- Selection requires at least 1 clip ticked in the Media Pool;
-- Deliver additionally requires Selection to produce a **structured timeline**.
+Imports reuse unchanged clips and events, preserving IDs and completed analysis. The UI
+explicitly processes large folders in pages of at most 200 files. Import options contain
+visual/moment analysis, explicit reanalysis and content verification. The UI does not
+rescan the media directory on every rerun. Import is synchronous in P1c; background
+progress, cancellation and recovery are planned for P2.
 
-### Step-by-step Walkthrough
+### Media Library
 
-#### Step 1 · Project Setup and Footage Ingestion 
+Browse paginated clip cards with duration, orientation and analysis coverage. Filter by
+filename/tags, orientation, analysis status, or **Candidates only**. Check a clip to add it
+to the edit's candidate set; **Select this page / Clear this page** affect only the current
+filtered page. **Clear candidates** in the sidebar clears the entire candidate set.
 
-1. In the sidebar `⚙️ Project Settings`, enter a **Project ID** (default `1`) and an **Editor ID** (default `editor_01`).
-2. In `📁 Footage`, set **Full path to the folder containing your video files** (default `./app/data/raw_footage`). If the folder exists, the UI shows `✓ Found N video files`; otherwise it warns `⚠ Folder not found`. Supported formats: `mp4, mov, avi, mxf, r3d, braw`.
-3. Click `🎬 Run Ingest Analysis` in the main area. Ingestion performs: ffprobe probing → FFmpeg scene detection → GPT-5.5 Vision tagging → temporal event splitting → embedding → SQLite catalogue write.
-4. On success the Media Pool is populated and downstream stages unlock.
+**Preview** opens one source preview. **Show thumbnails** loads frames for the current
+page only and defaults off to keep opening the library fast. **Create edit plan** opens
+the planning page with the same candidates.
 
-> **Ingestion notes:**
->
-> - The default import accepts **up to 200 video files** and refuses oversized scans before writing. The service API also supports explicit pages via `batch_offset=0` and `result.next_offset`; paged imports append/update and cannot synchronize missing files.
-> - **Incremental reuse**: unchanged files reuse their cached analysis, skipping FFmpeg/LLM calls.
+### Find Footage
 
+Describe subjects, actions or atmosphere and submit **Find footage**. An empty query lists
+the available catalogue. Search runs only on submission; paging, previews and checkbox
+changes reuse the result list. Results preserve retrieval order and relevance, with event
+evidence where available.
 
-#### Step 2 · Search
-1. Type what you are looking for in **Search query** and click `🔍 Search`.
-   Describe the **content itself** — objects, scenes, actions, or atmosphere, rather than editing instructions.
-   Example: `Find all clips showing mobile phones.`
-2. Results are grouped into three relevance tiers: `🟡 Suggested` / `⚪ Neutral` / `🔴 Low`.
-3. Each result card shows: **clip name · relevance % · duration**, plus a `💡` retrieval reason.
-4. Add/remove clips from the Media Pool: use the per-card `➕` / `➖`, or the per-tier `➕ Add all (N)` / `➖ Remove all (N)` for one-click bulk actions.
-5. `✖ Clear results` only clears the result cards.
+Result checkboxes and **Add this page / Remove this page** use the same stable clip IDs
+as Media Library. Switching pages or changing filters does not lose candidates.
 
+### Edit Plan
 
-#### Step 3 · Candidate Curation
+Choose **Full Clips** to keep complete source lengths, or **Selected Moments** to choose
+events within clips with an optional target duration. If candidates have no analysed
+moments, update them using **Analyse moments** before requesting moment editing.
 
-- Tick the clips you want to use in the sidebar `🎞️ Media Pool`. `Select all` ticks/unticks the whole pool in one click; `Clear ✕` clears all selections; `↻ Refresh` reloads the pool.
-- Each row's `▶` opens a preview popover.
-- **Optional shortcut**: skip Search and tick the entire Media Pool, letting Selection evaluate the full set against the editing intent. This means less manual work and one fewer retrieval stage, but Selection must consider more material, so reasoning time may increase.
+Set the output aspect ratio, describe the editing intent, give the plan a name and click
+**Generate edit plan**. Each successful generation saves a separate version in this
+browser workspace. The page shows the timeline, duration and editorial explanation.
+**Export this plan** opens Export without compiling automatically.
 
+Plans survive page and project/editor switches within the session. Use **Download plan
+JSON** to persist a plan beyond the session. Reopen that JSON on Export; source references
+are verified before it can be used. Local order/trim editing is planned for P3.
 
-#### Step 4 · Edit Timeline Generation
+### Export
 
-1. **Editing mode**:
-   - `🎞️ Clip Assembly` — Combine complete clips. The whole clip is the editing unit, original durations are kept, **no trimming**, no target duration. Recommended for **vlogs, travel videos, documentaries, BTS, and montages with short, self-contained clips**.
-   - `🎯 Moment Assembly` — Select moments from within clips. Temporal events inside clips are the editing unit, with an **optional target duration**. Recommended for **extracting highlights from longer clips or creating an edit to match a target runtime**.
-2. **Output aspect ratio**: `16:9 / 9:16 / 4:3 / 3:4 / 1:1` (default 16:9). This is an explicit **output spec** that carries through to the export: each clip is scaled to **fit** the frame with its own aspect ratio preserved.
-3. (Moment Assembly only) **Target duration (seconds)**: range 1–7200. It is an *optimisation target* rather than a hard constraint.
-4. **Editing intent**: Describe the **editorial direction** in terms of **style, emotion, pacing, and purpose**, rather than technical operations.
-   Example: `Fast-paced tech product promo, showcasing various functions.`
-5. Click `🎬 Generate Edit Timeline`.
+Choose a version under **Saved plan**, name the sequence and click **Export Premiere
+project**. Export preserves the chosen plan's order, trims, source versions and output
+aspect ratio. Download the Premiere XML and timeline JSON, then import the XML in
+Premiere using **File → Import**.
 
-The result renders inline in the Selection section:
+Opening/revisiting Export does not compile again. Plans with changed sources, unavailable
+media or stale events show a regeneration message and cannot be exported. Historical
+JSON is accepted only when identity and source provenance can be verified; the original
+file is never overwritten.
 
-- Summary line: mode · segment count · total duration · target-duration status · compression info;
-- `🧭 Ordering` strategy;
-- Narrative report: each segment's source in/out points, duration, ordering logic, and editorial reasoning;
-- `🗂️ Not used — backup material (N)` expander: the alternatives (**none of these are in the export**).
+### Data and verification
 
-> Regenerating the timeline **clears the previous export**.
+The catalogue stays in `METADATA_DB_PATH`; exports are written under
+`PROCESSED_OUTPUT_DIR/exports`. Keep SQLite and its WAL on the workstation.
+P1c does not change model choices or video analysis algorithms.
 
-
-#### Step 5 · Project Export and NLE Review 
-
-1. Enter a **Sequence name** (default `MAPO Edit`).
-2. Click `📦 Export Project`. Delivery compiles the structured timeline into **FCP7 XML (xmeml v5) + JSON**, preserving order and in/out points exactly, writes them to the output directory, and shows an export summary.
-3. On success a `📂 Show <XML filename> in folder` button appears, which opens the file manager with the file selected (requires the app and the browser to run on the same machine).
-4. Drag the XML straight into **Premiere Pro (File ▸ Import)**; after import, make final adjustments in the timeline (e.g. extend or shorten individual clips).
-
-
-### Debug & Maintenance
-
-- **🛠️ Debug log (N messages)**: collapsible panel at the bottom of the main area; it records the raw exchanges of every agent (the key Selection/Delivery outputs already render in their own sections; this is the full transcript for troubleshooting).
-- **🔄 Reset Pipeline**: at the bottom of the sidebar; clears all session state (Media Pool ticks, search results, timeline, export) and restarts.
-
----
-
-### FAQ
-
-| Symptom | Cause / fix |
-| --- | --- |
-| `⚠ Folder not found` | Wrong footage-folder path; check the sidebar input |
-| Stages still locked after Ingest | Ingest did not actually succeed (failure or 0 clips); check the error and the Debug log |
-| `partial_success` warning | Some clips failed analysis (e.g. an undecodable file); the rest are fine |
-| More than 200 files rejected | Per-run cap; split the folder into batches or raise `_MAX_INGEST_FILES` |
-| Deliver button disabled | No structured timeline yet; generate a Selection timeline first |
-| `⚠ Order matches …` | The order matches the order the material was listed; read the report to judge whether it fits the intent |
-| `📂 Show in folder` does nothing | The app is not running on this machine (remote deployment); use the displayed absolute path |
-| No OpenAI key | The app runs, but Search/Selection/vision analysis are unavailable; Ingest can only do local probing |
-| Thumbnails / inline playback unavailable | The codec does not support inline preview; this is a normal graceful degradation |
-
----
-
-### Third-party Services & Dependencies
-
-| Dependency / service | Type | Purpose | How to connect |
-| --- | --- | --- | --- |
-| OpenAI API | Paid API (the project's only external model service) | vision tagging, embeddings, agent reasoning | `OPENAI_API_KEY` in `.env` |
-| FFmpeg / ffprobe | Local open-source tools | probing, scene detection, frame sampling, proxy generation | install system-wide and add to `PATH` |
-| LangGraph / LangChain | Open-source Python libraries | agent graph orchestration, tool routing | `pip` install; no account |
-| LangSmith | Optional observability platform | trace tracking | optional `LANGSMITH_API_KEY` + `LANGSMITH_TRACING=true` in `.env` |
-| SQLite | Local database | catalogue persistence (WAL, foreign keys, connection pool) | local file `METADATA_DB_PATH`; no account |
-| Streamlit | Open-source UI framework / optional hosting | UI framework; optional hosting on Streamlit Community Cloud | no account for local runs; platform account for hosting |
-| Adobe Premiere Pro | target NLE (provided by the user, not a system dependency) | imports the FCP7 XML project | user's own software |
+Run offline tests with `python -B -m pytest -q`. Real model quality and Premiere import
+validation are separate acceptance tasks; see [PLAN.md](PLAN.md).
 
 ---
 
@@ -271,7 +241,16 @@ export; reading does not invent provenance or overwrite the originals.
 Each import/export returns its own typed result and `run_id`. Existing catalogues
 load immediately; switching project/editor clears stale candidates and outputs.
 Selection tools enforce the curated candidates and the editor's mode, aspect ratio,
-and optional duration. P1c will reorganize the pages and remaining visible labels.
+and optional duration. P1c provides four pages with shared stable-ID candidates and project/editor workspaces.
 
 See [P1b delivery record](docs/P1B_CONTRACTS.md) and
 [development conventions](docs/DEVELOPMENT.md).
+
+
+
+## P1c workspace
+
+See [P1c delivery record](docs/P1C_WORKSPACE.md) for the page flow, state migration and
+acceptance coverage. The former path-based checkbox state is migrated once; production
+candidate state uses `candidate_clip_ids`. Saved plan versions are session-local, with
+explicit JSON download/open for persistence.

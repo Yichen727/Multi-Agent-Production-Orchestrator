@@ -11,28 +11,6 @@ from app.models.schemas import VisionTags, EventTags
 from app.services import database_service as db
 
 
-@pytest.fixture
-def media_analysis(tmp_path, monkeypatch):
-    folder = tmp_path / "footage"
-    folder.mkdir()
-    media = folder / "same.mov"
-    media.write_bytes(b"initial video")
-    probe = Mock(return_value={"ok": True, "duration_seconds": 10, "width": 1920, "height": 1080,
-        "orientation": "landscape", "fps": 25, "codec": "h264", "has_audio": False})
-    clip_tags = Mock(return_value=VisionTags(scene_description="A player runs", keywords=["running"]))
-    event_tags = Mock(return_value=EventTags(action="A player runs", keywords=["running"]))
-    monkeypatch.setattr(ingest, "check_ffprobe_installed", lambda: True)
-    monkeypatch.setattr(ingest, "probe_video_metadata", probe)
-    monkeypatch.setattr(ingest, "detect_scene_cuts", Mock(return_value={
-        "ran": True, "complete": True, "cut_times": [], "scene_count": 1}))
-    monkeypatch.setattr(ingest, "extract_scene_representative_frames_b64", lambda *a, **k: (["mock-frame"], [5]))
-    monkeypatch.setattr(ingest, "extract_frames_in_window_b64", Mock(return_value=["frame1", "frame2"]))
-    monkeypatch.setattr(ingest, "build_event_windows", lambda *a, **k: [(0, 5), (5, 10)])
-    monkeypatch.setattr(ingest, "analyze_frames", clip_tags)
-    monkeypatch.setattr(ingest, "analyze_event", event_tags)
-    monkeypatch.setattr(ingest, "embed_texts", Mock(side_effect=lambda texts: [[.1, .2] for _ in texts]))
-    return folder, media, probe, clip_tags, event_tags
-
 
 def run(folder, **kwargs):
     return ingest.ingest_footage(directory=str(folder), project_id=1, **kwargs)

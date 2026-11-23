@@ -229,6 +229,38 @@ def get_project_info(project_id):
         return dict(row) if row else None
 
 
+def list_projects():
+    """List project labels without reading media vectors."""
+    with _engine.connect() as conn:
+        return [dict(r) for r in conn.execute(sql_text(
+            "SELECT project_id,project_name,clip_count FROM projects ORDER BY project_id")).mappings()]
+
+
+def create_project(name):
+    """Create an explicitly requested named project."""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Project name is required")
+    with _write() as conn:
+        pid = _insert(conn, "projects", {"project_name": name, "clip_count": 0})
+    return pid
+
+
+def get_library_clips(project_id):
+    """Read UI metadata and analysis coverage without loading embedding vectors."""
+    pid = project_id_value(project_id)
+    columns = ["clip_id", "project_id", "canonical_path", "source_revision",
+               "source_mtime_ns", "online", "active_event_set_id",
+               *[c for c in MEDIA_COLUMNS if c != "embedding"]]
+    query = ("SELECT " + ",".join("c." + c for c in columns) + """,
+        (SELECT COUNT(*) FROM clip_events e WHERE e.event_set_id=c.active_event_set_id) AS event_count,
+        (SELECT COUNT(*) FROM clip_events e WHERE e.event_set_id=c.active_event_set_id
+            AND (COALESCE(e.action,'')<>'' OR COALESCE(e.keywords,'')<>'')) AS analysed_event_count
+        FROM clips c WHERE c.project_id=:pid ORDER BY c.clip_id""")
+    with _engine.connect() as conn:
+        return [dict(r) for r in conn.execute(sql_text(query), {"pid": pid}).mappings()]
+
+
 def get_catalogued_clips(project_id):
     project_id = project_id_value(project_id)
     with _engine.connect() as conn:

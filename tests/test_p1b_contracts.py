@@ -218,17 +218,17 @@ def test_existing_catalogue_and_project_switch_restore_correct_workspace(seed_ca
     other = seed_catalogue(2, ("other.mov",))
     session = {}
     reconcile_workspace(session, 1, "alice", rows)
-    assert session["ingest_done"] and session["bin_clips"] == rows
-    session.update(selection_output="old explanation", delivery_result="old output",
-                   search_results=rows, last_timeline_plan=build_clip_timeline(rows))
-    session[SELECTION_PREFIX + rows[0]["file_path"]] = True
+    assert bool(session["clip_metadata"]) and session["clip_metadata"] == rows
+    session.update(edit_report="old explanation", export_result="old output",
+                   search_results=rows, edit_plan=build_clip_timeline(rows))
+    session["candidate_clip_ids"] = [rows[0]["clip_id"]]
     reconcile_workspace(session, 2, "alice", other)
-    assert session["bin_clips"] == other and session["ingest_done"]
-    assert session["last_timeline_plan"] is None and session["delivery_result"] is None
+    assert session["clip_metadata"] == other and bool(session["clip_metadata"])
+    assert session["edit_plan"] is None and session["export_result"] is None
     assert session["search_results"] == []
-    assert SELECTION_PREFIX + rows[0]["file_path"] not in session
+    assert rows[0]["clip_id"] not in session["candidate_clip_ids"]
     reconcile_workspace(session, 3, "alice", [])
-    assert not session["ingest_done"]
+    assert not bool(session["clip_metadata"])
 
 
 def test_workspace_refresh_preserves_valid_plan_but_discards_changed_sources(seed_catalogue):
@@ -236,15 +236,15 @@ def test_workspace_refresh_preserves_valid_plan_but_discards_changed_sources(see
     session = {}
     reconcile_workspace(session, 1, "alice", rows)
     plan = build_clip_timeline(rows[:1])
-    session["last_timeline_plan"] = plan
+    session["edit_plan"] = plan
     extra = seed_catalogue(1, ("append.mov",))
     all_rows = list(db.get_catalogued_clips(1).values())
     reconcile_workspace(session, 1, "alice", all_rows)
-    assert session["last_timeline_plan"] == plan
+    assert session["edit_plan"] == validate_edit_plan(plan, 1)
     Path(rows[0]["file_path"]).write_bytes(b"changed source after planning")
     reconcile_workspace(session, 1, "alice", all_rows)
-    assert session["last_timeline_plan"] is None
-    assert session["delivery_result"] is None
+    assert session["edit_plan"] is None
+    assert session["export_result"] is None
 
 
 def test_concurrent_service_results_have_unique_run_ids_and_no_registry(tmp_path):
@@ -267,14 +267,12 @@ def test_streamlit_restores_existing_project_and_switches_without_ingestion(seed
     monkeypatch.setattr(ffmpeg_service, "extract_sample_frames_b64", lambda *a, **k: [])
     app = AppTest.from_file("app/ui/streamlit_app.py", default_timeout=20).run()
     assert not app.exception
-    assert app.session_state["ingest_done"]
-    assert app.session_state["bin_clips"] == rows
-    app.sidebar.text_input[0].set_value("2").run()
+    assert app.session_state["clip_metadata"]
+    assert [c["clip_id"] for c in app.session_state["clip_metadata"]] == [c["clip_id"] for c in rows]
+    app.selectbox(key="project_picker").set_value(2).run()
     assert not app.exception
-    assert app.session_state["bin_clips"] == other
-    app.sidebar.text_input[0].set_value("invalid").run()
-    assert not app.exception
-    assert any("positive integer" in message.value for message in app.error)
+    assert [c["clip_id"] for c in app.session_state["clip_metadata"]] == [c["clip_id"] for c in other]
+    assert app.selectbox(key="project_picker").format_func(2) == "Project 2"
 
 
 def test_latest_refused_planning_call_does_not_resurrect_an_earlier_plan():
@@ -306,11 +304,11 @@ def test_editor_switch_clears_prior_outputs_and_selections(seed_catalogue):
     rows = seed_catalogue()
     session = {}
     reconcile_workspace(session, 1, "alice", rows)
-    session["last_timeline_plan"] = build_clip_timeline(rows)
-    session[SELECTION_PREFIX + rows[0]["file_path"]] = True
+    session["edit_plan"] = build_clip_timeline(rows)
+    session["candidate_clip_ids"] = [rows[0]["clip_id"]]
     reconcile_workspace(session, 1, "bob", rows)
-    assert session["ingest_done"] and session["last_timeline_plan"] is None
-    assert SELECTION_PREFIX + rows[0]["file_path"] not in session
+    assert bool(session["clip_metadata"]) and session["edit_plan"] is None
+    assert rows[0]["clip_id"] not in session["candidate_clip_ids"]
 
 
 @pytest.mark.parametrize("override", [
@@ -321,5 +319,3 @@ def test_injected_invalid_specification_is_refused(seed_catalogue, override):
     rows = seed_catalogue()
     report = selection.plan_clip_assembly.func(str(rows[0]["clip_id"]), state=state(rows, **override))
     assert "```json" not in report
-
-
