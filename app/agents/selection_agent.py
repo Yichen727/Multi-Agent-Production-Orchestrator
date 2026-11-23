@@ -1,6 +1,8 @@
 """MAPO Selection / Assistant-Editor Agent."""
 
 import json
+import inspect
+from functools import wraps
 from pathlib import Path
 from typing import Annotated
 
@@ -10,6 +12,9 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode, InjectedState
 
 from app.models.state import ProductionState
+from app.services.contracts import project_id_value, target_duration
+from app.services.media_identity import canonical_path
+from app.services.metrics_service import current_run_id
 from app.services.openai_service import llm
 from app.services.database_service import (
     get_catalogued_events, get_events_by_ids, get_project_info,
@@ -33,10 +38,7 @@ logger = get_logger("selection_agent")
 
 def _pid_from_state(state) -> int:
     """Read the project id from injected state; never accept it from the LLM."""
-    try:
-        return int((state or {}).get("project_id"))
-    except (TypeError, ValueError):
-        return 1
+    return project_id_value((state or {}).get("project_id"))
 
 
 def _mode_from_state(state) -> str:
@@ -47,26 +49,21 @@ def _mode_from_state(state) -> str:
 
 def _target_from_state(state) -> float | None:
     """Read the optional target duration from injected state."""
-    try:
-        value = float((state or {}).get("target_seconds"))
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+    return target_duration((state or {}).get("target_seconds"))
 
 
 def _aspect_from_state(state) -> str:
     """Read and normalise the editor-selected output aspect ratio."""
-    try:
-        return normalise_aspect_label((state or {}).get("aspect_ratio"))
-    except ValueError:      # InvalidAspectRatio — validated upstream; ignore here
-        return ""
+    return normalise_aspect_label((state or {}).get("aspect_ratio"))
 
 
 def _wrong_mode(state, wanted: str) -> str | None:
     """Reject a planner call when it does not match the editor-selected mode."""
     mode = _mode_from_state(state)
-    if not mode or mode == wanted:
+    if mode == wanted:
         return None
+    if not mode:
+        return "Cannot plan: missing or invalid editor-selected editing mode."
     other = "Clip Assembly" if mode == MODE_CLIP else "Moment Assembly"
     tool_name = ("plan_clip_assembly" if mode == MODE_CLIP else "plan_moment_assembly")
     return (f"The editor selected {other} mode in the UI, so this planner does not apply. "
@@ -93,13 +90,14 @@ def _floats(text: str | None) -> list[float] | None:
     return out
 
 
-def _enrich_excluded(project_id: int, raw) -> list[dict]:
+def _enrich_excluded(state, raw) -> list[dict]:
     """Resolve rejected clip/event references into editor-readable metadata.
 
     References come from the LLM, but file names and timecodes always come from
     the project catalogue. Unresolved references remain unresolved rather than
     being fabricated.
     """
+    project_id = _pid_from_state(state)
     items = normalise_alternates(raw)
     if not items:
         return []
@@ -111,14 +109,18 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
                 ids.append(int(ref))
             except (TypeError, ValueError):
                 continue
-    events = get_events_by_ids(project_id, ids) if ids else {}
+    events = (get_events_by_ids(project_id, ids)
+              if ids and _mode_from_state(state) == MODE_MOMENT else {})
 
     def _resolve(ref: str) -> dict | None:
         try:
             event = events.get(int(ref))
         except (TypeError, ValueError):
             event = None
-        if event:                                  
+        if event:
+            allowed, problems = _candidate_rows(state, [str(event["clip_id"])])
+            if not allowed or problems:
+                return None
             fp = event.get("file_path") or ""
             return {
                 "event_id": event.get("event_id"),
@@ -129,7 +131,8 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
                 "label": (event.get("action") or "").strip()[:80],
             }
         try:                                        
-            row = resolve_one(project_id, ref)
+            rows, problems = _candidate_rows(state, [ref])
+            row = rows[0] if rows and not problems else None
         except AmbiguousIdentifier:
             row = None
         if not row:
@@ -144,8 +147,15 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
             "label": "",
         }
 
+    verified = []
     for item in items:
+        # Ignore model-supplied filenames and timecodes; resolve authority below.
+        for key in ("file_path", "event_id", "start_seconds", "end_seconds", "label", "also_details", "name"):
+            item.pop(key, None)
         primary = _resolve(item["ref"])
+        if not primary:
+            continue
+        verified.append(item)
         if primary:
             label = item.get("label") or primary.pop("label", "")
             item.update(primary)
@@ -153,7 +163,7 @@ def _enrich_excluded(project_id: int, raw) -> list[dict]:
         grouped = [g for g in (_resolve(r) for r in item.get("also", [])) if g]
         if grouped:
             item["also_details"] = grouped
-    return items
+    return verified
 
 
 def _excluded_headline(x: dict) -> str:
@@ -220,14 +230,53 @@ def _plan_block(lines: list[str], plan: dict) -> str:
     excluded = plan.get("excluded") or []
     if excluded:
         lines += _format_excluded(excluded, plan.get("excluded_omitted", 0))
-    lines += ["", "```json", json.dumps(plan), "```"]
+    lines += ["", "```json", json.dumps(plan, allow_nan=False), "```"]
     return "\n".join(lines)
+
+
+def _candidate_rows(state, tokens):
+    """Resolve only curated sources, keeping caller order and duplicate uses."""
+    rows, problems = resolve_ordered(_pid_from_state(state), tokens)
+    allowed = {canonical_path(p) for p in (state or {}).get("selected_candidates", [])}
+    snapshot = {c["clip_id"]: c for c in (state or {}).get("selected_clips", [])}
+    accepted = []
+    for row in rows:
+        old = snapshot.get(row["clip_id"])
+        if row["canonical_path"] not in allowed:
+            problems.append((row.get("_identifier", ""), "clip is outside the curated candidates"))
+        elif not row.get("online", 1):
+            problems.append((row.get("_identifier", ""), "clip is offline; update the catalogue"))
+        elif snapshot and (not old or old["source_revision"] != row["source_revision"]
+                           or (_mode_from_state(state) == MODE_MOMENT
+                               and old.get("active_event_set_id") != row.get("active_event_set_id"))):
+            problems.append((row.get("_identifier", ""), "candidate source changed during this run"))
+        else:
+            accepted.append(row)
+    return accepted, problems
+
+
+def _guard(fn):
+    """Invalid injected specifications fail before tools can access a project."""
+    signature = inspect.signature(fn)
+
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        state = signature.bind_partial(*args, **kwargs).arguments.get("state")
+        try:
+            _pid_from_state(state)
+            _aspect_from_state(state)
+            _target_from_state(state)
+            return fn(*args, **kwargs)
+        except (ValueError, TypeError, KeyError) as exc:
+            return f"Cannot use this request: {exc}"
+    return guarded
 
 
 # ── Tools: candidate enrichment, timeline planning, delivery ────────────────────
 
 
 @tool
+@_guard
 def get_candidate_details(identifiers: str,
                           state: Annotated[dict, InjectedState] = None) -> str:
     """Fetch full metadata for the editor-curated candidates.
@@ -244,12 +293,12 @@ def get_candidate_details(identifiers: str,
     actually uses.
 
     Args:
-        identifiers: Comma-separated shot IDs and/or file names/paths
+        identifiers: Comma-separated clip IDs and/or file names/paths
             (e.g. "3, IMG_5231.MOV, /footage/goal.mov").
     """
     project_id = _pid_from_state(state)
     tokens = _split(identifiers)
-    rows, problems = resolve_ordered(project_id, tokens)
+    rows, problems = _candidate_rows(state, tokens)
     if not rows:
         detail = "No matching catalogued clips for those identifiers in this project."
         if problems:
@@ -271,6 +320,7 @@ def get_candidate_details(identifiers: str,
 
 
 @tool
+@_guard
 def get_clip_events(identifiers: str,
                     state: Annotated[dict, InjectedState] = None) -> str:
     """List the temporal MOMENTS (what happens, with real timecodes) inside curated clips.
@@ -281,7 +331,7 @@ def get_clip_events(identifiers: str,
     Resolution is scoped to the current project.
 
     Args:
-        identifiers: Comma-separated shot IDs and/or file names/paths for the clips whose
+        identifiers: Comma-separated clip IDs and/or file names/paths for the clips whose
             moments you want to inspect.
 
     Returns:
@@ -291,7 +341,7 @@ def get_clip_events(identifiers: str,
     """
     project_id = _pid_from_state(state)
     tokens = _split(identifiers)
-    rows, problems = resolve_ordered(project_id, tokens)
+    rows, problems = _candidate_rows(state, tokens)
     if not rows:
         return "No matching catalogued clips for those identifiers in this project."
     events_by_file = get_catalogued_events(project_id)
@@ -305,7 +355,7 @@ def get_clip_events(identifiers: str,
             lines.append(f"{name}: no temporal moments extracted (clip not event-analysed) "
                          "— it can only be used whole.")
             continue
-        lines.append(f"{name} (shot_id {r.get('shot_id')}) — {len(evs)} moment(s):")
+        lines.append(f"{name} (clip_id {r.get('clip_id')}) — {len(evs)} moment(s):")
         for e in evs:
             start = float(e.get("start_seconds") or 0.0)
             end = float(e.get("end_seconds") or 0.0)
@@ -329,6 +379,7 @@ def get_clip_events(identifiers: str,
 
 
 @tool
+@_guard
 def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
                        labels: str = None, excluded_json: str = None,
                        state: Annotated[dict, InjectedState] = None) -> str:
@@ -344,7 +395,7 @@ def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
     left out via ``excluded_json``.
 
     Args:
-        ordered_identifiers: Comma-separated shot IDs and/or file names IN TIMELINE ORDER
+        ordered_identifiers: Comma-separated clip IDs and/or file names IN TIMELINE ORDER
             (first = timeline step 1). This exact order is preserved — never re-sorted,
             so the order you give IS the edit. The Bin order is NOT a default: re-order
             freely to serve the intent.
@@ -356,7 +407,7 @@ def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
         labels: Optional PIPE-separated step labels aligned 1:1 with the clips
             (e.g. "cold open|the arrival|wide breather|closing beat").
         excluded_json: The curated candidates you deliberately left OUT, as a JSON list of
-            ``{"ref": "<file name or shot id>", "reason": "why it is not in the edit",
+            ``{"ref": "<file name or clip id>", "reason": "why it is not in the edit",
             "suggested_use": "how it could still be used", "also": ["<other clips>"]}``.
             Report the clips you genuinely weighed and rejected — strongest alternatives
             first, MAXIMUM 5 (the tool trims beyond that), grouping near-duplicates into
@@ -374,7 +425,7 @@ def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
 
     project_id = _pid_from_state(state)
     tokens = _split(ordered_identifiers)
-    clips, problems = resolve_ordered(project_id, tokens)
+    clips, problems = _candidate_rows(state, tokens)
     if problems:
         # H-01: never silently drop or first-match an ambiguous/unknown identifier — the
         # timeline order IS the edit, so refuse and let the editor disambiguate by id.
@@ -392,7 +443,7 @@ def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
                        if str(p) in keep]
     plan = build_clip_timeline(
         clips, labels=_split(labels, "|") or None,
-        excluded=_enrich_excluded(project_id, excluded_json),
+        excluded=_enrich_excluded(state, excluded_json),
         aspect_ratio=_aspect_from_state(state),
         ordering_strategy=ordering_strategy or "",
         order_check=compare_order(emitted, candidate_order,
@@ -405,10 +456,12 @@ def plan_clip_assembly(ordered_identifiers: str, ordering_strategy: str = None,
                   else "full clip (length not measured)")
         lines.append(f"  {s['order']}. {s['name']} — {length}"
                      + (f" · {s['label']}" if s.get("label") else ""))
+    plan.update(project_id=project_id, run_id=current_run_id())
     return _plan_block(lines, plan)
 
 
 @tool
+@_guard
 def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
                          importance: str = None,
                          target_seconds: float = None, labels: str = None,
@@ -507,6 +560,9 @@ def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
                 "(nothing was fabricated or dropped): "
                 + ", ".join(str(m) for m in missing))
 
+    _, problems = _candidate_rows(state, [str(found[i]["clip_id"]) for i in ids])
+    if problems:
+        return "Cannot plan events outside the curated candidates: " + "; ".join(reason for _, reason in problems)
     ordered_events = [found[i] for i in ids]   # preserve the caller's exact order
 
     protected_ids = set()
@@ -533,11 +589,8 @@ def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
         except (TypeError, ValueError):
             focus.append(None)
 
-    # The editor's Target Duration is authoritative: fall back to the injected state so a
-    # target the editor set in the UI still applies if the model omits the argument.
-    target = target_seconds if (target_seconds and target_seconds > 0) else None
-    if target is None:
-        target = _target_from_state(state)
+    # The injected editor specification is authoritative, including an unset target.
+    target = _target_from_state(state)
 
     # Anchoring check: the source chronology is exactly how `get_clip_events` listed these
     # moments (grouped by file, chronological within each file), so sorting the emitted
@@ -548,7 +601,7 @@ def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
     plan = build_moment_timeline(
         ordered_events, target_seconds=target, importance=_floats(importance),
         labels=_split(labels, "|") or None, focus=focus, protect=protect,
-        excluded=_enrich_excluded(project_id, excluded_json),
+        excluded=_enrich_excluded(state, excluded_json),
         aspect_ratio=_aspect_from_state(state),
         ordering_strategy=ordering_strategy or "",
         order_check=compare_order(
@@ -587,10 +640,12 @@ def plan_moment_assembly(ordered_event_ids: str, ordering_strategy: str = None,
     elif plan["duration_status"] == "under_target":
         lines += ["", (f"ℹ️ {plan['duration_delta']:.1f}s under the target — footage is never "
                        "stretched. Add more meaningful moments if the edit needs the length.")]
+    plan.update(project_id=project_id, run_id=current_run_id())
     return _plan_block(lines, plan)
 
 
 @tool
+@_guard
 def generate_delivery_summary(
         state: Annotated[dict, InjectedState] = None) -> str:
     """Generate a text summary of the current project for delivery handoff.
@@ -606,7 +661,7 @@ def generate_delivery_summary(
     return f"""Delivery Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Project: {project['project_name']} (id {project['project_id']})
-Total Shots: {project['clip_count']}
+Total Clips: {project['clip_count']}
 Status: Ready for review
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
@@ -770,7 +825,7 @@ trims outside a moment's own event boundaries. Your part:
   - Narrative completeness and content richness outrank hitting the target exactly.
 
 ANTI-HALLUCINATION: only ever place clips and moments that a tool actually returned in
-this conversation. NEVER invent file names, shot IDs, event IDs, timecodes, durations or
+this conversation. NEVER invent file names, clip IDs, event IDs, timecodes, durations or
 metadata — every real length and trim comes from the planning tool. When an attribute is
 missing/'unclassified', say you inferred the placement from what IS known. If no
 candidates resolve, say so instead of fabricating.

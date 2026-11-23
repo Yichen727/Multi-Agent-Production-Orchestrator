@@ -2,13 +2,13 @@
 
 An AI-assisted film/video **post-production pipeline** built on [LangGraph](https://langchain-ai.github.io/langgraph/). MAPO ingests raw footage, builds a searchable catalogue, helps you find and curate the right clips, arranges them into an edit timeline, and exports a project file **Adobe Premiere Pro imports natively**.
 
-> MSc project — UCL, Computer Graphics, Vision & Imaging (CGVI). Author: **Yichen Zheng**.
+Built for a small company editing team using one workstation. Author: **Yichen Zheng**.
 
 ---
 
 ## The pipeline
 
-Four agents run in a fixed order, driven from a [Streamlit](https://streamlit.io/) UI. You stay in control at two points: which clips participate, and when to export.
+Four stages run in a fixed order, driven from a [Streamlit](https://streamlit.io/) UI. Selection is the reasoning agent; ingestion, search, and export use direct services. You stay in control at two points: which clips participate, and when to export.
 
 ```
 ①  Ingest   →  ②  Search   →  [ Curation ]  →  ③  Selection   →  ④  Deliver
@@ -82,7 +82,7 @@ The interface is split into two areas:
 
 **Stage-locking mechanism**: downstream operations stay disabled (🔒 Locked) until the required preceding stage completes:
 
-- Search / Selection / Deliver are all locked until **Ingest succeeds**;
+- Search / Selection / Deliver unlock when the current project has online catalogued clips, including after a restart;
 - Selection requires at least 1 clip ticked in the Media Pool;
 - Deliver additionally requires Selection to produce a **structured timeline**.
 
@@ -97,7 +97,7 @@ The interface is split into two areas:
 
 > **Ingestion notes:**
 >
-> - Per-run limit of **200 video files**; exceeding it **refuses the run**.
+> - The default import accepts **up to 200 video files** and refuses oversized scans before writing. The service API also supports explicit pages via `batch_offset=0` and `result.next_offset`; paged imports append/update and cannot synchronize missing files.
 > - **Incremental reuse**: unchanged files reuse their cached analysis, skipping FFmpeg/LLM calls.
 
 
@@ -193,11 +193,13 @@ app/
   orchestrator/
     production_orchestrator.py       # the spine — 4 explicit stage functions
   agents/
-    ingest_agent.py                  # ① probe / scene-detect / vision-tag / catalogue
-    search_agent.py                  # ② retrieval only
     selection_agent.py               # ③ intent-driven edit timeline
-    delivery_agent.py                # ④ Premiere FCP7 XML compiler
   services/
+    ingest_service.py                # ① incremental, typed result, no agent loop
+    search_service.py                # ② one SearchQuery parse + hybrid retrieval
+    delivery_service.py              # ④ validated deterministic export
+    plan_contract.py                 # versioned reads + legacy ID/path checks
+    workspace_state.py               # project/editor session reconciliation
     openai_service.py                # llm + embeddings
     retrieval_service.py             # hybrid search + query understanding
     catalogue_resolver.py            # project-scoped identifier resolution
@@ -251,3 +253,25 @@ python -m scripts.migrate_catalogue app/data/mapo_catalogue.db
 The command creates a consistent backup and migrates once; repeated execution
 does not recreate IDs. This workspace's catalogue has already been migrated.
 Public model/state naming and UI navigation remain scheduled for P1b/P1c.
+
+## P1b contracts and services
+
+P1b uses `ClipMetadata`, `clip_id`, `clip_metadata`, and `selected_clips` throughout
+production code. `shot_type` remains the photographic shot classification.
+New timeline plans and export JSON carry `schema_version: 1`, `project_id`,
+`clip_id`, `source_revision`, and event references where relevant.
+
+`read_edit_plan(value, project_id)` accepts historical unversioned `shot_id` plans
+and exported JSON at one compatibility boundary. It verifies IDs against original
+paths within the project. `validate_edit_plan` additionally checks current source
+revisions, disk fingerprints and real event/trim bounds before export. Historical
+files without source versions can be inspected, but require regeneration before
+export; reading does not invent provenance or overwrite the originals.
+
+Each import/export returns its own typed result and `run_id`. Existing catalogues
+load immediately; switching project/editor clears stale candidates and outputs.
+Selection tools enforce the curated candidates and the editor's mode, aspect ratio,
+and optional duration. P1c will reorganize the pages and remaining visible labels.
+
+See [P1b delivery record](docs/P1B_CONTRACTS.md) and
+[development conventions](docs/DEVELOPMENT.md).

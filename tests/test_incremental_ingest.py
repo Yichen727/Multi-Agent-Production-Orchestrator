@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 from sqlalchemy import text
 
-from app.agents import ingest_agent as ingest
+from app.services import ingest_service as ingest
 from app.models.schemas import VisionTags, EventTags
 from app.services import database_service as db
 
@@ -35,8 +35,7 @@ def media_analysis(tmp_path, monkeypatch):
 
 
 def run(folder, **kwargs):
-    ingest.ingest_footage.func(directory=str(folder), state={"project_id": "1"}, **kwargs)
-    return ingest.get_last_ingest_result()
+    return ingest.ingest_footage(directory=str(folder), project_id=1, **kwargs)
 
 
 def identities():
@@ -105,11 +104,11 @@ def test_missing_embeddings_do_not_trigger_visual_reanalysis(media_analysis):
 def test_source_change_retains_clip_id_but_invalidates_old_plan(media_analysis):
     folder, media, probe, clip_tags, event_tags = media_analysis
     run(folder)
-    old = db.get_catalogued_shots(1)[str(media)]
+    old = db.get_catalogued_clips(1)[str(media)]
     event = db.get_catalogued_events(1)[str(media)][0]
     media.write_bytes(b"replacement video with different contents")
     assert run(folder).status == "success"
-    new = db.get_catalogued_shots(1)[str(media)]
+    new = db.get_catalogued_clips(1)[str(media)]
     assert new["clip_id"] == old["clip_id"]
     assert new["source_revision"] == old["source_revision"] + 1
     assert event["event_id"] not in db.get_events_by_ids(1, [event["event_id"]])
@@ -121,13 +120,13 @@ def test_source_change_retains_clip_id_but_invalidates_old_plan(media_analysis):
 def test_strict_verification_catches_same_size_same_mtime_replacement(media_analysis):
     folder, media, probe, clip_tags, event_tags = media_analysis
     run(folder)
-    old = db.get_catalogued_shots(1)[str(media)]
+    old = db.get_catalogued_clips(1)[str(media)]
     before = media.stat()
     media.write_bytes(b"x" * before.st_size)
     os.utime(media, ns=(before.st_atime_ns, before.st_mtime_ns))
     clip_tags.return_value = VisionTags(scene_description="A different observed scene", keywords=["changed"])
     run(folder, verify_content=True)
-    new = db.get_catalogued_shots(1)[str(media)]
+    new = db.get_catalogued_clips(1)[str(media)]
     assert new["clip_id"] == old["clip_id"]
     assert new["source_revision"] == 2
     assert new["description"] == "A different observed scene"
@@ -154,7 +153,7 @@ def test_append_and_scope_sync_keep_other_folders_and_missing_history(media_anal
     (folder / "remaining.mov").write_bytes(b"remaining video")
     media.unlink()
     run(folder, synchronize=True)
-    rows = db.get_catalogued_shots(1)
+    rows = db.get_catalogued_clips(1)
     assert rows[str(media)]["online"] == 0
     assert rows[str(other / "b.mov")]["online"] == 1
     assert set(original["clips"]).issubset(identities()["clips"])
@@ -164,7 +163,7 @@ def test_per_file_publication_rolls_back_metadata_events_and_steps(media_analysi
     folder, media, *_ = media_analysis
     run(folder)
     original = identities()
-    row = db.get_catalogued_shots(1)[str(media)]
+    row = db.get_catalogued_clips(1)[str(media)]
     def fail(*args, **kwargs):
         raise RuntimeError("injected step write failure")
     monkeypatch.setattr(db, "_step", fail)
@@ -172,7 +171,7 @@ def test_per_file_publication_rolls_back_metadata_events_and_steps(media_analysi
         db.publish_clip(1, {**row, "description": "must roll back"}, events=[
             {"file_path": str(media), "event_order": 1, "start_seconds": 1, "end_seconds": 3}])
     assert identities() == original
-    assert db.get_catalogued_shots(1)[str(media)]["description"] == row["description"]
+    assert db.get_catalogued_clips(1)[str(media)]["description"] == row["description"]
 
 
 def test_probe_failure_preserves_previous_observed_results(media_analysis):
@@ -182,8 +181,8 @@ def test_probe_failure_preserves_previous_observed_results(media_analysis):
     probe.return_value = {"ok": False}
     assert run(folder, force_reanalyze=True).status == "failure"
     assert identities() == original
-    assert db.get_catalogued_shots(1)[str(media)]["description"] == "A player runs"
-    assert db.get_catalogued_shots(1)[str(media)]["online"] == 1
+    assert db.get_catalogued_clips(1)[str(media)]["description"] == "A player runs"
+    assert db.get_catalogued_clips(1)[str(media)]["online"] == 1
 
 
 def test_concurrent_same_project_imports_share_finished_analysis(media_analysis):
@@ -206,32 +205,31 @@ def test_scan_error_does_not_mark_unobserved_clips_offline(media_analysis, monke
     monkeypatch.setattr(ingest.os, "walk", interrupted)
     assert run(folder, synchronize=True).status == "failure"
     assert identities() == original
-    assert db.get_catalogued_shots(1)[str(media)]["online"] == 1
+    assert db.get_catalogued_clips(1)[str(media)]["online"] == 1
 
 
 def test_delivery_checks_source_revision_and_disk_changes(media_analysis, monkeypatch):
-    from app.agents import delivery_agent as delivery
+    from app.services import delivery_service as delivery
     from app.services.timeline_service import build_clip_timeline
 
     folder, media, *_ = media_analysis
     run(folder)
-    row = db.get_catalogued_shots(1)[str(media)]
+    row = db.get_catalogued_clips(1)[str(media)]
     plan = build_clip_timeline([row])
     monkeypatch.setattr(delivery, "count_audio_streams", lambda path: 0)
-    delivery.compile_plan(plan, project_id=1)
-    result = delivery.get_last_delivery_result()
+    result = delivery.compile_plan(plan, project_id=1)
     assert result.status == "success"
     assert Path(result.xml_path).is_file()
     media.write_bytes(b"changed after the plan was built")
-    delivery.compile_plan(plan, project_id=1)
-    assert delivery.get_last_delivery_result().status == "failure"
-    assert "changed on disk" in delivery.get_last_delivery_result().message
+    result = delivery.compile_plan(plan, project_id=1)
+    assert result.status == "failure"
+    assert "changed on disk" in result.message
 
 
 def test_unversioned_plan_is_refused_instead_of_assuming_current_source(media_analysis):
     folder, media, *_ = media_analysis
     run(folder)
-    row = db.get_catalogued_shots(1)[str(media)]
+    row = db.get_catalogued_clips(1)[str(media)]
     with pytest.raises(ValueError, match="no source revision"):
         db.validate_segment_source({"file_path": str(media)}, row)
 
@@ -244,3 +242,76 @@ def test_force_event_failure_keeps_existing_ids_and_observed_actions(media_analy
     assert run(folder, force_reanalyze=True).status == "partial_success"
     assert identities() == original
     assert all(e["action"] == "A player runs" for e in db.get_catalogued_events(1)[str(media)])
+
+
+def test_ingest_explicit_pages_preserve_200_boundary_and_append_semantics(media_analysis):
+    folder, media, probe, *_ = media_analysis
+    for index in range(200):
+        (folder / f"page-{index:03d}.mov").write_bytes(b"video")
+    refused = run(folder, analyze_content=False)
+    assert refused.status == "failure" and refused.truncated
+    assert db.get_catalogued_clips(1) == {}
+    first = run(folder, analyze_content=False, batch_offset=0)
+    assert first.status == "success" and first.indexed_count == 200
+    assert first.next_offset == 200
+    second = run(folder, analyze_content=False, batch_offset=first.next_offset)
+    assert second.status == "success" and second.indexed_count == 1
+    assert second.next_offset is None
+    original = identities()
+    assert run(folder, analyze_content=False, batch_offset=0).reused_count == 200
+    assert run(folder, analyze_content=False, batch_offset=200).reused_count == 1
+    assert identities() == original
+    assert probe.call_count == 201
+    assert run(folder, batch_offset=0, synchronize=True).status == "failure"
+
+
+@pytest.mark.parametrize("mode", ["clip_assembly", "moment_assembly"])
+def test_service_workflow_through_real_selection_tool_graph(media_analysis, monkeypatch, mode):
+    import json
+    from langchain_core.messages import AIMessage
+    from app.agents import selection_agent as selection
+    from app.orchestrator import production_orchestrator as orch
+    from app.services import search_service as search, delivery_service as delivery
+    from app.services.plan_contract import validate_edit_plan
+    from app.models.schemas import SearchQuery
+
+    folder, media, *_ = media_analysis
+    summary, ingested = orch.run_ingest(str(folder), 1, "editor")
+    assert ingested.status == "success" and ingested.run_id
+    parser = Mock()
+    parser.invoke.return_value = SearchQuery(core_keywords="running", keywords="running")
+    llm = Mock()
+    llm.with_structured_output.return_value = parser
+    monkeypatch.setattr(search, "llm_fast", llm)
+    found = orch.run_search("running", 1, "editor")
+    assert found[0]["file_path"] == str(media)
+    row = db.get_catalogued_clips(1)[str(media)]
+    event = db.get_catalogued_events(1)[str(media)][0]
+    tool = ("plan_clip_assembly" if mode == "clip_assembly" else "plan_moment_assembly")
+    args = ({"ordered_identifiers": str(row["clip_id"])} if mode == "clip_assembly" else
+            {"ordered_event_ids": str(event["event_id"]), "target_seconds": 1})
+    args["ordering_strategy"] = "Use the observed movement as the opening"
+    fake = Mock()
+    fake.invoke.side_effect = [
+        AIMessage(content="", tool_calls=[{"name": tool, "args": args, "id": "test-plan"}]),
+        AIMessage(content="Start on the movement to establish the action.")]
+    monkeypatch.setattr(selection, "llm_with_selection", fake)
+    text, plan = orch.run_selection("Movement-led opening", [str(media)], 1, "editor",
+        editing_mode=mode, target_seconds=None, aspect_ratio="9:16")
+    assert text and plan["schema_version"] == 1 and plan["project_id"] == 1
+    assert plan["mode"] == mode and plan["target_seconds"] is None
+    assert plan["aspect_ratio"] == "9:16"
+    assert plan["segments"][0]["clip_id"] == row["clip_id"]
+    assert "shot_id" not in json.dumps(plan)
+    monkeypatch.setattr(delivery, "count_audio_streams", lambda path: 0)
+    output, exported = orch.run_delivery(plan, 1, "editor")
+    assert exported.status == "success" and exported.run_id != ingested.run_id
+    assert Path(exported.xml_path).is_file() and Path(exported.json_path).is_file()
+    saved = json.loads(Path(exported.json_path).read_text())
+    assert saved["schema_version"] == 1 and saved["project_id"] == 1
+    assert saved["clips"][0]["source_revision"] == row["source_revision"]
+    assert "shot_id" not in json.dumps(saved)
+    restored = validate_edit_plan(saved, 1)
+    assert restored["segments"][0]["clip_id"] == row["clip_id"]
+    parser.invoke.assert_called_once()
+    assert fake.invoke.call_count == 2

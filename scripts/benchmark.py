@@ -82,7 +82,7 @@ def run(baseline: Path, output: Path, repeats: int = 5) -> dict:
                                  **percentiles(durations), "result_count": len(results), "recall_at_20": recall})
             edits = []
             for pid in (1, 2):
-                all_clips = db.get_catalogued_shots(pid)
+                all_clips = db.get_catalogued_clips(pid)
                 clips = list(all_clips.values())[:12]
                 events = [e for group in db.get_catalogued_events(pid).values() for e in group][:40]
                 durations = {r["file_path"]: r["duration_seconds"] for r in clips}
@@ -96,10 +96,10 @@ def run(baseline: Path, output: Path, repeats: int = 5) -> dict:
                         start = time.perf_counter()
                         plan = (build_clip_timeline(clips) if mode == "clip" else
                                 build_moment_timeline(events, target_seconds=60))
-                        rows = db.get_catalogued_shots(pid)
+                        rows = db.get_catalogued_clips(pid)
                         media = [{**rows[s["file_path"]], "in_point": s["in_point"], "out_point": s["out_point"]}
                                  for s in plan["segments"]]
-                        result = compile_project(media, write=False, verify_media=False)
+                        result = compile_project(media, project_id=pid, write=False, verify_media=False)
                         ET.fromstring(result["xml"])
                         times.append((time.perf_counter() - start) * 1000)
                     edits.append({"project_id": pid, "mode": mode, "segments": len(media), **percentiles(times)})

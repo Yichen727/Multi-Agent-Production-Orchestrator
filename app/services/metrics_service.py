@@ -155,3 +155,7 @@ class UsageCallback(BaseCallbackHandler):
              elapsed_ms=elapsed, error_type=type(error).__name__,
              **normalise_usage(None), estimated_usd=None, price_version=PRICE_VERSION,
              sdk_retry_count=None)
+
+def current_run_id() -> str:
+    """Read the invocation ID without sharing mutable results between callers."""
+    return _context.get().get("run_id", "")

@@ -4,7 +4,8 @@ from unittest.mock import Mock
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from app.agents import ingest_agent as ingest, selection_agent as selection, delivery_agent as delivery
+from app.agents import selection_agent as selection
+from app.services import ingest_service as ingest, delivery_service as delivery
 from app.services import database_service as db
 from app.services.retrieval_service import hybrid_search
 
@@ -14,9 +15,8 @@ def state(**kwargs):
 
 
 def test_ingest_missing_directory_records_failure(tmp_path):
-    ingest.reset_last_ingest_result()
-    ingest.ingest_footage.func(directory=str(tmp_path / "missing"), state=state())
-    assert ingest.get_last_ingest_result().status == "failure"
+    result = ingest.ingest_footage(directory=str(tmp_path / "missing"), project_id=1)
+    assert result.status == "failure"
 
 
 def test_ingest_unchanged_file_skips_probe_and_model_work(tmp_path, monkeypatch):
@@ -33,23 +33,21 @@ def test_ingest_unchanged_file_skips_probe_and_model_work(tmp_path, monkeypatch)
     monkeypatch.setattr(ingest, "analyze_frames", unexpected_model)
     monkeypatch.setattr(ingest, "embed_texts", unexpected_model)
     for _ in range(2):
-        ingest.ingest_footage.func(directory=str(folder), analyze_content=False, state=state())
+        result = ingest.ingest_footage(directory=str(folder), analyze_content=False, project_id=1)
     assert probe.call_count == 1
-    assert ingest.get_last_ingest_result().reused_count == 1
+    assert result.reused_count == 1
     unexpected_model.assert_not_called()
 
 
 def test_planner_refuses_wrong_mode(seed_catalogue):
     row = seed_catalogue()[0]
-    text = selection.plan_clip_assembly.func(str(row["shot_id"]), state=state(editing_mode="moment_assembly"))
+    text = selection.plan_clip_assembly.func(str(row["clip_id"]), state=state(editing_mode="moment_assembly"))
     assert "does not apply" in text
 
 
 def test_delivery_refuses_invalid_or_unresolved_plan():
-    delivery.compile_plan({"segments": [{"valid": False, "file_path": "bad.mov"}]}, project_id=1)
-    assert delivery.get_last_delivery_result().status == "failure"
-    delivery.compile_plan({"segments": [{"shot_id": 999}]}, project_id=1)
-    assert delivery.get_last_delivery_result().status == "failure"
+    assert delivery.compile_plan({"segments": [{"valid": False, "file_path": "bad.mov"}]}, project_id=1).status == "failure"
+    assert delivery.compile_plan({"segments": [{"clip_id": 999}]}, project_id=1).status == "failure"
 
 
 def test_plan_extraction_trusts_tool_not_model_prose():
@@ -63,7 +61,7 @@ def test_plan_extraction_trusts_tool_not_model_prose():
 
 def test_event_aware_search_returns_parent_clip(seed_catalogue):
     rows = seed_catalogue()
-    db.replace_project_events(1, [{"file_path": rows[0]["file_path"], "event_order": 1,
+    db.upsert_project_events(1, [{"file_path": rows[0]["file_path"], "event_order": 1,
                                   "start_seconds": 1, "end_seconds": 4,
                                   "action": "People celebrate the victory", "keywords": "celebration"}])
     found = hybrid_search(1, keywords="celebration", core_keywords="celebration")
@@ -71,11 +69,9 @@ def test_event_aware_search_returns_parent_clip(seed_catalogue):
     assert found[0]["matched_event"]["start_seconds"] == 1
 
 
-@pytest.mark.known_issue
-@pytest.mark.xfail(raises=AssertionError, reason="P1b: candidate whitelist currently exists only in the prompt")
 def test_planner_refuses_same_project_unselected_clip(seed_catalogue):
     rows = seed_catalogue()
-    text = selection.plan_clip_assembly.func(str(rows[1]["shot_id"]),
+    text = selection.plan_clip_assembly.func(str(rows[1]["clip_id"]),
         state=state(selected_candidates=[rows[0]["file_path"]]))
     assert "```json" not in text
 

@@ -3,11 +3,13 @@
 from sqlalchemy import text as _sql
 
 from app.services.database_service import _engine
+from app.services.contracts import project_id_value
+from app.services.media_identity import canonical_path
 
 # Metadata required by Selection and Delivery.
 _DEFAULT_COLUMNS = (
-    "clip_id, clip_id AS shot_id, project_id, canonical_path, source_revision, "
-    "source_mtime_ns, source_size, active_event_set_id, "
+    "clip_id, project_id, canonical_path, source_revision, "
+    "source_mtime_ns, source_size, online, active_event_set_id, "
     "file_path, shot_type, duration_seconds, orientation, fps, "
     "width, height, codec, has_audio, keywords, description, "
     "people_count, mood, "
@@ -23,7 +25,7 @@ class AmbiguousIdentifier(Exception):
         listing = ", ".join(f"#{sid} {fp}" for sid, fp in candidates)
         super().__init__(
             f"'{token}' matches {len(candidates)} clips in this project ({listing}). "
-            "Use the shot_id to pick one."
+            "Use the clip_id to pick one."
         )
 
 
@@ -41,8 +43,8 @@ def _match_by_path(conn, project_id, token: str, columns: str) -> list:
     """Find path-based matches within a project."""
     base = f"SELECT {columns} FROM clips WHERE project_id = :pid AND "
 
-    rows = conn.execute(_sql(base + "file_path = :t"),
-                        {"pid": project_id, "t": token}).fetchall()
+    rows = conn.execute(_sql(base + "(file_path = :t OR canonical_path = :canonical)"),
+                        {"pid": project_id, "t": token, "canonical": canonical_path(token)}).fetchall()
     if rows:
         return rows
 
@@ -60,6 +62,7 @@ def _match_by_path(conn, project_id, token: str, columns: str) -> list:
 
 def resolve_one(project_id, token, *, columns: str = _DEFAULT_COLUMNS) -> dict | None:
     """Resolve one identifier to a catalogue row within a project."""
+    project_id = project_id_value(project_id)
     token = (str(token) if token is not None else "").strip()
     if not token:
         return None
@@ -78,7 +81,7 @@ def resolve_one(project_id, token, *, columns: str = _DEFAULT_COLUMNS) -> dict |
         return None
     if len(rows) > 1:
         raise AmbiguousIdentifier(
-            token, [(r._mapping["shot_id"], r._mapping["file_path"]) for r in rows]
+            token, [(r._mapping["clip_id"], r._mapping["file_path"]) for r in rows]
         )
     return dict(rows[0]._mapping)
 

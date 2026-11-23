@@ -119,7 +119,7 @@ def select_samples(conn: sqlite3.Connection, limit: int = 26) -> list[dict]:
     table, identifier = ("clips", "clip_id") if modern else ("shots", "shot_id")
     active = " AND e.event_set_id=s.active_event_set_id" if modern else ""
     rows = [dict(r) for r in conn.execute(
-        f"SELECT s.{identifier} AS shot_id, s.project_id, s.file_path, s.duration_seconds, s.codec, "
+        f"SELECT s.{identifier} AS clip_id, s.project_id, s.file_path, s.duration_seconds, s.codec, "
         "s.orientation, s.fps, s.scene_count, s.source_size, s.source_mtime, "
         f"COUNT(e.event_id) AS event_count FROM {table} s "
         f"LEFT JOIN clip_events e ON e.{identifier}=s.{identifier}{active} "
@@ -131,17 +131,17 @@ def select_samples(conn: sqlite3.Connection, limit: int = 26) -> list[dict]:
         for key in ("duration_seconds", "scene_count", "event_count", "fps"):
             ordered = sorted(group, key=lambda r: (r[key] or 0, r["file_path"]))
             for row in (ordered[0], ordered[-1]):
-                chosen[row["shot_id"]] = row
+                chosen[row["clip_id"]] = row
         for orientation in ("portrait", "landscape", "square"):
             row = next((r for r in group if r["orientation"] == orientation), None)
             if row:
-                chosen[row["shot_id"]] = row
-    remainder = [r for r in rows if r["shot_id"] not in chosen]
+                chosen[row["clip_id"]] = row
+    remainder = [r for r in rows if r["clip_id"] not in chosen]
     random.Random(20261123).shuffle(remainder)
     for row in remainder:
         if len(chosen) >= limit:
             break
-        chosen[row["shot_id"]] = row
+        chosen[row["clip_id"]] = row
     return list(chosen.values())[:limit]
 
 

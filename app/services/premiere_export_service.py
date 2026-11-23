@@ -304,7 +304,10 @@ def build_timeline(
         entries.append({
             "order": order,
             "role": clip.get("role") or "",
-            "shot_id": clip.get("shot_id"),
+            "clip_id": clip.get("clip_id"),
+            "source_revision": clip.get("source_revision"),
+            "event_id": clip.get("event_id"),
+            "event_set_id": clip.get("event_set_id"),
             "name": Path(file_path).name,
             "file_path": str(file_path),
             "absolute_path": str(abs_path),
@@ -330,6 +333,7 @@ def build_timeline(
         })
 
     return {
+        "schema_version": 1,
         "sequence": {
             "name": sequence_name,
             "fps": seq_fps,
@@ -665,6 +669,7 @@ def compile_project(
 
     timeline = build_timeline(clips, sequence_name=sequence_name, fps=fps,
                               width=width, height=height, aspect_ratio=aspect_ratio)
+    timeline["project_id"] = project_id
     xml = to_fcp7_xml(timeline)
 
     result = {"timeline": timeline, "xml": xml}

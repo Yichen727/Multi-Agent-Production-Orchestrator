@@ -17,13 +17,13 @@ class ProductionState(TypedDict):
     footage_dir: str
 
     ingested_files: list[str]
-    shot_metadata: list[dict]
+    clip_metadata: list[dict]
 
     search_results: list[SearchCandidate]
     search_candidates: list[SearchCandidate]
 
     selected_candidates: list[str]
-    selected_shots: list[dict]
+    selected_clips: list[dict]
 
     editing_mode: str
     target_seconds: Optional[float]

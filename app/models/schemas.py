@@ -4,9 +4,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal, Optional
 
 
-class ShotMetadata(BaseModel):
-    """Metadata for a single shot extracted by the Ingest Agent."""
-    shot_id: int
+class ClipMetadata(BaseModel):
+    """Metadata for a catalogued source clip."""
+    clip_id: int
     file_path: str
     shot_type: str  # wide_shot, close_up, establishing, medium_shot, etc.
     duration_seconds: float
@@ -82,8 +82,10 @@ class ClipEvent(BaseModel):
     """Persisted temporal event with source-clip boundaries."""
     model_config = ConfigDict(extra="ignore")
 
+    event_set_id: Optional[int] = None
+    source_revision: Optional[int] = None
     event_id: Optional[int] = None
-    shot_id: Optional[int] = None
+    clip_id: Optional[int] = None
     file_path: str
     event_order: int = 0
     start_seconds: float = 0.0
@@ -98,8 +100,8 @@ class ClipEvent(BaseModel):
 
 class TransitionSuggestion(BaseModel):
     """Transition suggestion between two shots."""
-    from_shot_id: int
-    to_shot_id: int
+    from_clip_id: int
+    to_clip_id: int
     transition_type: str  # cut, dissolve, wipe, fade
     duration_frames: int
     confidence: float
@@ -108,7 +110,7 @@ class TransitionSuggestion(BaseModel):
 class ProductionReport(BaseModel):
     """Final production report metadata."""
     project_name: str
-    total_shots: int
+    total_clips: int
     total_scenes: int
     best_takes: list[int]
     report_path: str
@@ -125,7 +127,7 @@ class EditingIntent(BaseModel):
 
 class ClipRecommendation(BaseModel):
     """Explainable clip recommendation from the Selection Agent."""
-    shot_id: int
+    clip_id: int
     file_path: str
     rank: int
     score: float = Field(ge=0, le=100)
@@ -137,7 +139,7 @@ class TimelineEntry(BaseModel):
     order: int 
     label: str = ""  
     file_path: str
-    shot_id: Optional[int] = None
+    clip_id: Optional[int] = None
     rationale: str  
 
 
@@ -152,7 +154,9 @@ class SearchCandidate(BaseModel):
     """One candidate returned by hybrid retrieval."""
     model_config = ConfigDict(extra="ignore")
 
-    shot_id: Optional[int] = None
+    project_id: Optional[int] = None
+    source_revision: Optional[int] = None
+    clip_id: Optional[int] = None
     file_path: str
     shot_type: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -172,7 +176,9 @@ class SearchCandidate(BaseModel):
 class TimelineSegment(BaseModel):
     """One ordered segment in the Selection timeline."""
     order: int
-    shot_id: Optional[int] = None
+    clip_id: Optional[int] = None
+    source_revision: Optional[int] = None
+    event_set_id: Optional[int] = None
     event_id: Optional[int] = None
     file_path: str
     name: str = ""
@@ -209,7 +215,10 @@ class ExcludedMaterial(BaseModel):
 
 class EditPlan(BaseModel):
     """Structured timeline plan produced by the Selection stage."""
-    mode: str = "clip_assembly"
+    model_config = ConfigDict(extra="allow")
+    schema_version: Literal[1] = 1
+    project_id: Optional[int] = None
+    mode: Literal["clip_assembly", "moment_assembly"] = "clip_assembly"
     aspect_ratio: Optional[str] = None
     ordering_strategy: str = ""
     order_check: dict = Field(default_factory=dict)
@@ -227,8 +236,10 @@ class EditPlan(BaseModel):
 
 class IngestResult(BaseModel):
     """Structured result of an ingest run."""
+    run_id: str = ""
     status: Literal["success", "partial_success", "failure"]
     project_id: int
+    next_offset: Optional[int] = None
     indexed_count: int = 0
     reused_count: int = 0
     unreadable_count: int = 0
@@ -241,6 +252,7 @@ class IngestResult(BaseModel):
 
 class DeliveryResult(BaseModel):
     """Structured result of a Delivery export."""
+    run_id: str = ""
     status: Literal["success", "failure"] = "success"
     xml_path: Optional[str] = None
     json_path: Optional[str] = None
@@ -256,3 +268,15 @@ class DeliveryResult(BaseModel):
     pillarboxed_clips: int = 0
     message: str = ""
     warnings: list[str] = Field(default_factory=list)
+
+class SearchQuery(BaseModel):
+    """One structured interpretation, followed by deterministic hybrid retrieval."""
+    model_config = ConfigDict(extra="forbid")
+
+    core_keywords: str = Field(default="", description="Literal user content translated to English; no synonyms")
+    keywords: str = Field(default="", description="Core terms plus closely related synonyms, comma separated")
+    shot_type: Optional[str] = None
+    orientation: Optional[Literal["portrait", "landscape", "square"]] = None
+    people: Optional[int] = Field(default=None, ge=0)
+    min_duration: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    max_duration: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)

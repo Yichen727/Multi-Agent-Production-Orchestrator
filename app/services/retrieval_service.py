@@ -9,6 +9,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from sqlalchemy import text as _sql
 
 from app.services.database_service import _engine
+from app.services.contracts import project_id_value
 from app.services.openai_service import embed_texts, llm_fast
 from app.utils.logger import get_logger
 
@@ -17,7 +18,7 @@ logger = get_logger("retrieval_service")
 
 # Metadata returned for each candidate. Embeddings are used internally only.
 _SELECT_COLUMNS = (
-    "clip_id, clip_id AS shot_id, source_revision, file_path, shot_type, duration_seconds, "
+    "clip_id, project_id, source_revision, file_path, shot_type, duration_seconds, "
     "orientation, width, height, fps, keywords, description, "
     "people_count, mood, embedding"
 )
@@ -429,6 +430,7 @@ def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None
     Returns catalogue metadata with relevance, group size, suggestion label,
     and an optional matched event.
     """
+    project_id = project_id_value(project_id)
     keywords, orientation = hoist_orientation(keywords, orientation)
     orient = _normalise_orientation(orientation)
 
@@ -495,7 +497,7 @@ def hybrid_search(project_id, *, keywords: str = None, core_keywords: str = None
 
 # Event retrieval returns precise temporal moments for Selection.
 _EVENT_SELECT = (
-    "e.event_id, e.clip_id, e.clip_id AS shot_id, e.event_set_id, s.source_revision, e.file_path, e.event_order, "
+    "e.event_id, e.clip_id, e.event_set_id, s.source_revision, e.file_path, e.event_order, "
     "e.start_seconds, e.end_seconds, e.duration_seconds, "
     "e.action, e.state_change, e.subjects, e.keywords, e.embedding, "
     "s.shot_type AS shot_type, s.orientation AS orientation, "

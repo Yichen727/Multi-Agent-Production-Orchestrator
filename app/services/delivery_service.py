@@ -1,6 +1,9 @@
 """Delivery — compile the edit timeline into a Premiere Pro project file."""
 
-import json
+import uuid
+from app.services.metrics_service import current_run_id
+from app.services.contracts import project_id_value
+from app.services.plan_contract import validate_edit_plan
 
 from app.models.schemas import DeliveryResult
 from app.services.catalogue_resolver import resolve_one, AmbiguousIdentifier
@@ -9,43 +12,19 @@ from app.services.premiere_export_service import compile_project, InvalidAspectR
 from app.services.ffmpeg_service import count_audio_streams
 from app.utils.logger import get_logger
 
-logger = get_logger("delivery_agent")
+logger = get_logger("delivery_service")
 
 
-# Store the result of the most recent delivery run for the UI/orchestrator.
-_LAST_DELIVERY_RESULT: DeliveryResult | None = None
+def _refuse(message: str, project_id: int | None = None) -> DeliveryResult:
+    return DeliveryResult(status="failure", project_id=project_id, message=message,
+                          run_id=current_run_id() or uuid.uuid4().hex)
 
 
-def _record_delivery_result(result: DeliveryResult) -> DeliveryResult:
-    global _LAST_DELIVERY_RESULT
-    _LAST_DELIVERY_RESULT = result
-    return result
-
-
-def reset_last_delivery_result() -> None:
-    """Clear the previous delivery result."""
-    global _LAST_DELIVERY_RESULT
-    _LAST_DELIVERY_RESULT = None
-
-
-def get_last_delivery_result() -> DeliveryResult | None:
-    """Return the result of the most recent delivery run."""
-    return _LAST_DELIVERY_RESULT
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _refuse(message: str, project_id: int | None = None) -> str:
-    """Record a failed delivery and return the error message."""
-    _record_delivery_result(DeliveryResult(status="failure", project_id=project_id,
-                                           message=message))
-    return message
-
-
-def _record_success(result: dict, project_id: int, message: str) -> None:
-    """Store structured information about a successful export."""
+def _record_success(result: dict, project_id: int, message: str) -> DeliveryResult:
+    """Return structured information owned by this invocation."""
     seq = result["timeline"]["sequence"]
-    _record_delivery_result(DeliveryResult(
+    return DeliveryResult(
+        run_id=current_run_id() or uuid.uuid4().hex,
         status="success",
         xml_path=result.get("xml_path"),
         json_path=result.get("json_path"),
@@ -59,15 +38,7 @@ def _record_success(result: dict, project_id: int, message: str) -> None:
         letterboxed_clips=seq.get("letterboxed_clips") or 0,
         pillarboxed_clips=seq.get("pillarboxed_clips") or 0,
         message=message,
-    ))
-
-
-def _as_pid(value) -> int:
-    """Convert project ID to int, defaulting to 1."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 1
+    )
 
 
 def _frame_summary(seq: dict) -> str:
@@ -89,21 +60,18 @@ def _frame_summary(seq: dict) -> str:
 
 # ── Compile ────────────────────────────────────────────────────────────────────
 
-def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str:
+def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> DeliveryResult:
     """Compile a Selection plan into a Premiere Pro project."""
-    project_id = _as_pid(project_id)
+    try:
+        project_id = project_id_value(project_id)
+    except ValueError as exc:
+        return _refuse(str(exc))
 
-    # Accept either a dict/list or a JSON representation of the plan.
-    if isinstance(plan, (str, bytes)):
-        try:
-            data = json.loads(plan)
-        except (json.JSONDecodeError, TypeError) as e:
-            return _refuse(f"Could not parse the timeline plan JSON: {e}", project_id)
-    else:
-        data = plan
-    segments = data.get("segments") if isinstance(data, dict) else data
-    if not segments or not isinstance(segments, list):
-        return _refuse("No segments to compile. Provide the Selection plan JSON.", project_id)
+    try:
+        data = validate_edit_plan(plan, project_id)
+    except (ValueError, TypeError, KeyError, OSError, AmbiguousIdentifier) as exc:
+        return _refuse(f"Refusing stale/unverified timeline: {exc}", project_id)
+    segments = data["segments"]
 
     # Reject invalid segments rather than silently repairing them.
     invalid = [s for s in segments if s.get("valid") is False]
@@ -116,7 +84,7 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
 
     clips, unresolved = [], []
     for i, seg in enumerate(segments, start=1):
-        ident = seg.get("clip_id", seg.get("shot_id"))
+        ident = seg.get("clip_id")
         ident = str(ident) if ident is not None else (seg.get("file_path") or "")
         try:
             row = resolve_one(project_id, ident)
@@ -124,7 +92,7 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
             unresolved.append(str(e))
             continue
         if row is None:
-            unresolved.append(seg.get("file_path") or seg.get("shot_id") or f"segment #{i}")
+            unresolved.append(seg.get("file_path") or seg.get("clip_id") or f"segment #{i}")
             continue
         try:
             validate_segment_source(seg, row)
@@ -134,7 +102,10 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
         streams = streams if streams > 0 else (1 if row.get("has_audio") else 0)
         clips.append({
             "file_path": row["file_path"],
-            "shot_id": row.get("shot_id"),
+            "clip_id": row["clip_id"],
+            "source_revision": row["source_revision"],
+            "event_id": seg.get("event_id"),
+            "event_set_id": seg.get("event_set_id"),
             "duration_seconds": row.get("duration_seconds") or 0.0,
             "fps": row.get("fps") or None,
             "width": row.get("width") or None,
@@ -184,6 +155,4 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
         f"  Output: {_frame_summary(seq)}\n"
         f"  Segments (order + trim preserved): {order_summary}"
     )
-    _record_success(result, project_id,
-                    f"{seq['clip_count']} segments compiled from the {mode} timeline.")
-    return summary
+    return _record_success(result, project_id, summary)

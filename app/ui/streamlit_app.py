@@ -45,7 +45,7 @@ ASPECT_CHOICES = ["16:9", "9:16", "4:3", "3:4", "1:1"]
 
 
 def _bin_key(path: str) -> str:
-    return f"bin_{path}"
+    return f"clip_selected:{path}"
 
 
 def _set_bin(path: str, value: bool):
@@ -61,14 +61,14 @@ def _set_bin_many(paths: list[str], value: bool):
 
 def _clear_all_selections():
     """Clear all Media Pool selections."""
-    for k in [k for k in st.session_state if k.startswith("bin_")]:
+    for k in [k for k in st.session_state if k.startswith("clip_selected:")]:
         st.session_state[k] = False
 
 
 def _toggle_select_all():
     """Apply the Select-all value to all clips."""
     value = bool(st.session_state.get("select_all_bin", False))
-    for c in st.session_state.get("bin_shots", []):
+    for c in st.session_state.get("bin_clips", []):
         st.session_state[_bin_key(c["file_path"])] = value
 
 
@@ -208,8 +208,11 @@ def run_delivery(plan: dict, project_id: str, user_id: str, sequence_name: str =
 
 def load_bin(project_id):
     """Load the catalogue into the Media Pool."""
-    from app.services.retrieval_service import hybrid_search
-    st.session_state.bin_shots = hybrid_search(_pid(project_id), top_k=1000)
+    from app.services.database_service import get_catalogued_clips
+    from app.services.workspace_state import reconcile_workspace
+    clips = list(get_catalogued_clips(_pid(project_id)).values())
+    reconcile_workspace(st.session_state, project_id,
+                        st.session_state.get("workspace_key", (None, "editor_01"))[1], clips)
 
 
 def do_search(query: str, project_id: str, user_id: str):
@@ -303,8 +306,8 @@ def render_bin(project_id, locked):
         st.info("🔒 Run Ingest to populate the Media Pool.")
         return
 
-    shots = st.session_state.bin_shots
-    if not shots:
+    clips = st.session_state.bin_clips
+    if not clips:
         st.info("Media Pool is empty. Run Ingest to populate it.")
         return
 
@@ -313,7 +316,7 @@ def render_bin(project_id, locked):
                 help="Tick or untick every clip in the pool")
 
     # Keep the full catalogue in ingestion order; Search has its own result list.
-    for c in shots:
+    for c in clips:
         path = c["file_path"]
         name = Path(path).name
         col_name, col_play = st.columns([0.8, 0.2])
@@ -400,7 +403,7 @@ def main():
 
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("ingest_done", False)
-    st.session_state.setdefault("bin_shots", [])
+    st.session_state.setdefault("bin_clips", [])
     st.session_state.setdefault("search_results", [])
     st.session_state.setdefault("selection_output", "")
     st.session_state.setdefault("delivery_output_text", "")
@@ -414,6 +417,17 @@ def main():
         st.header("⚙️ Project Settings")
         project_id = st.text_input("Project ID", value="1")
         user_id = st.text_input("Editor ID", value="editor_01")
+        from app.services.contracts import project_id_value
+        from app.services.database_service import get_catalogued_clips
+        from app.services.workspace_state import reconcile_workspace
+        try:
+            project_id = project_id_value(project_id)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        reconcile_workspace(st.session_state, project_id, user_id,
+                            list(get_catalogued_clips(project_id).values()))
+        locked = not st.session_state.ingest_done
 
         st.divider()
 
@@ -433,7 +447,7 @@ def main():
         st.divider()
 
         # Media Pool — its own section, the shared media pool.
-        if st.session_state.ingest_done and not st.session_state.bin_shots:
+        if st.session_state.ingest_done and not st.session_state.bin_clips:
             load_bin(project_id)
         render_bin(project_id, locked)
 
@@ -450,7 +464,7 @@ def main():
     if st.session_state.ingest_done:
         st.success("✅ Ingest completed. All clips are in the Media Pool.")
     run_ingest = st.button("🎬 Run Ingest Analysis", use_container_width=True,
-                           help="Ingest Agent — scan, vision-tag, embed, catalogue")
+                           help="Ingest service — scan, vision-tag, embed, catalogue")
     st.divider()
 
     # ② Search
@@ -479,7 +493,7 @@ def main():
     # ③ Selection
     st.subheader("③ Selection")
     st.caption("Choose an editing mode and describe your intent.")
-    selected_paths = [c["file_path"] for c in st.session_state.bin_shots
+    selected_paths = [c["file_path"] for c in st.session_state.bin_clips
                       if st.session_state.get(_bin_key(c["file_path"]))]
     have_sel = bool(selected_paths)
     if locked:
@@ -588,7 +602,7 @@ def main():
                              disabled=locked or not have_plan, key="seq_name")
     run_deliver = st.button("📦 Export Project", use_container_width=True,
                             disabled=locked or not have_plan,
-                            help="Delivery Agent — compiles the ordered timeline segments")
+                            help="Export service — compiles the ordered timeline segments")
 
     if st.session_state.get("delivery_output_text"):
         with st.container(border=True):
@@ -598,14 +612,15 @@ def main():
 
     # ── Resolve actions (each button runs exactly one explicit pipeline stage) ──
     if run_ingest:
-        with st.spinner("Ingest Agent is scanning, tagging and cataloguing footage..."):
+        with st.spinner("Ingest service is scanning, tagging and cataloguing footage..."):
             try:
                 from app.services.database_service import get_catalogued_paths
                 response, res = _orch().run_ingest(footage_path, project_id, user_id)
                 st.session_state.messages.append(
                     {"role": "user", "content": f"[Ingest] {footage_path}"})
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                catalogued = len(get_catalogued_paths(_pid(project_id)))
+                load_bin(project_id)
+                catalogued = len(st.session_state.bin_clips)
                 if (res is not None and res.status in ("success", "partial_success")
                         and res.indexed_count > 0 and catalogued > 0):
                     st.session_state.ingest_done = True
@@ -641,13 +656,14 @@ def main():
                     st.session_state.last_timeline = response
                     st.session_state.last_timeline_plan = plan
                     st.session_state.delivery_output_text = ""
+                    st.session_state.delivery_result = None
                 except Exception as e:
                     st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {e}"})
             st.rerun()
         else:
             st.warning("Enter your editing intent first.")
     elif run_deliver:
-        with st.spinner("Delivery Agent is compiling the Premiere project..."):
+        with st.spinner("Export service is compiling the Premiere project..."):
             try:
                 response, res = run_delivery(
                     st.session_state.get("last_timeline_plan"),

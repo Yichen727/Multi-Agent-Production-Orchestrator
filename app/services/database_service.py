@@ -13,6 +13,7 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from app.config import settings
 from app.services.catalogue_schema import MEDIA_COLUMNS, EVENT_COLUMNS, SCHEMA_DDL
 from app.services.catalogue_migrations import initialise, step_key, window_signature
+from app.services.contracts import project_id_value
 from app.services.media_identity import canonical_path, same_stat, fingerprint
 from app.utils.logger import get_logger
 
@@ -23,6 +24,7 @@ _locks, _locks_guard = {}, threading.Lock()
 
 def project_ingest_lock(project_id):
     """Serialize imports in the current UI process; worker leases belong to P2."""
+    project_id = project_id_value(project_id)
     with _locks_guard:
         return _locks.setdefault(int(project_id), threading.RLock())
 
@@ -87,11 +89,8 @@ def _insert(conn, table, values):
     return conn.execute(sql_text("SELECT last_insert_rowid()")).scalar_one()
 
 
-def _legacy_clip(row):
-    """Read-boundary alias, removed when P1b migrates the public model/state."""
-    item = dict(row)
-    item["shot_id"] = item["clip_id"]
-    return item
+def _clip_dict(row):
+    return dict(row)
 
 
 def _changed(current, incoming):
@@ -171,7 +170,7 @@ def publish_clip(project_id, row, *, events=None, steps=None, segmentation_versi
     events=None leaves events untouched. New source versions keep historical events,
     but only the active set is returned by catalogue queries.
     """
-    pid, path = int(project_id), canonical_path(row["file_path"])
+    pid, path = project_id_value(project_id), canonical_path(row["file_path"])
     with _write() as conn:
         conn.execute(sql_text("INSERT INTO projects(project_id,project_name) VALUES (:pid,:name) "
                               "ON CONFLICT(project_id) DO NOTHING"), {"pid": pid, "name": f"Project {pid}"})
@@ -211,42 +210,43 @@ def publish_clip(project_id, row, *, events=None, steps=None, segmentation_versi
         conn.execute(sql_text("UPDATE projects SET clip_count=(SELECT COUNT(*) FROM clips WHERE project_id=:pid) "
                               "WHERE project_id=:pid"), {"pid": pid})
         result = conn.execute(sql_text("SELECT * FROM clips WHERE clip_id=:cid"), {"cid": cid}).mappings().one()
-        return _legacy_clip(result)
+        return _clip_dict(result)
 
 
 def upsert_project_clips(project_id, rows):
+    project_id = project_id_value(project_id)
     for row in rows:
         publish_clip(project_id, row)
     return len(rows)
 
 
-# Temporary function aliases for P1b callers; there are no legacy physical tables.
-replace_project_shots = upsert_project_clips
 
 
 def get_project_info(project_id):
+    project_id = project_id_value(project_id)
     with _engine.connect() as conn:
         row = conn.execute(sql_text("SELECT * FROM projects WHERE project_id=:pid"), {"pid": project_id}).mappings().first()
         return dict(row) if row else None
 
 
 def get_catalogued_clips(project_id):
+    project_id = project_id_value(project_id)
     with _engine.connect() as conn:
-        return {r["file_path"]: _legacy_clip(r) for r in conn.execute(
+        return {r["file_path"]: _clip_dict(r) for r in conn.execute(
             sql_text("SELECT * FROM clips WHERE project_id=:pid ORDER BY clip_id"), {"pid": project_id}).mappings()}
 
 
-get_catalogued_shots = get_catalogued_clips
-
 
 def get_catalogued_paths(project_id):
+    project_id = project_id_value(project_id)
     return set(get_catalogued_clips(project_id))
 
 
-def get_analysis_steps(clip_id, source_revision):
+def get_analysis_steps(project_id, clip_id, source_revision):
+    project_id = project_id_value(project_id)
     with _engine.connect() as conn:
-        rows = conn.execute(sql_text("SELECT * FROM analysis_steps WHERE clip_id=:cid AND source_revision=:rev ORDER BY step_id"),
-                            {"cid": clip_id, "rev": source_revision}).mappings()
+        rows = conn.execute(sql_text("SELECT * FROM analysis_steps WHERE project_id=:pid AND clip_id=:cid AND source_revision=:rev ORDER BY step_id"),
+                            {"pid": project_id, "cid": clip_id, "rev": source_revision}).mappings()
         result = {}
         for row in rows:
             result[row["step"]] = {**row, "details": json.loads(row["details_json"]) if row["details_json"] else None}
@@ -254,6 +254,7 @@ def get_analysis_steps(clip_id, source_revision):
 
 
 def get_catalogued_events(project_id):
+    project_id = project_id_value(project_id)
     with _engine.connect() as conn:
         rows = conn.execute(sql_text("""SELECT e.*, c.source_revision, c.duration_seconds AS source_duration
             FROM clip_events e JOIN clips c ON c.clip_id=e.clip_id AND c.project_id=e.project_id
@@ -261,18 +262,20 @@ def get_catalogued_events(project_id):
             ORDER BY e.file_path,e.event_order"""), {"pid": project_id}).mappings()
         grouped = {}
         for row in rows:
-            grouped.setdefault(row["file_path"], []).append(_legacy_clip(row))
+            grouped.setdefault(row["file_path"], []).append(_clip_dict(row))
         return grouped
 
 
 def get_events_by_ids(project_id, event_ids):
+    project_id = project_id_value(project_id)
     wanted = {int(i) for i in event_ids}
     return {e["event_id"]: e for group in get_catalogued_events(project_id).values() for e in group
             if e["event_id"] in wanted}
 
 
-def replace_project_events(project_id, events):
+def upsert_project_events(project_id, events):
     """Compatibility: update supplied files only, retaining identical-window IDs."""
+    project_id = project_id_value(project_id)
     clips = {canonical_path(p): r for p, r in get_catalogued_clips(project_id).items()}
     grouped = {}
     for item in events:
@@ -286,6 +289,7 @@ def replace_project_events(project_id, events):
 
 
 def mark_offline(project_id, paths):
+    project_id = project_id_value(project_id)
     with _write() as conn:
         for path in paths:
             conn.execute(sql_text("UPDATE clips SET online=0 WHERE project_id=:pid AND canonical_path=:path"),
@@ -294,6 +298,8 @@ def mark_offline(project_id, paths):
 
 def validate_segment_source(segment, row):
     """Reject stale source/event references before any delivery file is written."""
+    if not row or not row.get("online", 1):
+        raise ValueError("Source clip is offline or unavailable")
     if segment.get("file_path") and canonical_path(segment["file_path"]) != row["canonical_path"]:
         raise ValueError("Plan ID/path mismatch; regenerate or explicitly relink the plan")
     if segment.get("source_revision") is None:

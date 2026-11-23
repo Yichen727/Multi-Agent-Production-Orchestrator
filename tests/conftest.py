@@ -46,17 +46,14 @@ def isolated_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "METRICS_OUTPUT_DIR", tmp_path / "metrics")
     monkeypatch.setattr(settings, "METRICS_ENABLED", False)
     monkeypatch.setattr(retrieval, "embed_texts", lambda texts: None)
-    # Ingest's read tools use SQLDatabase; make its wrapper use the isolated engine too.
-    from langchain_community.utilities.sql_database import SQLDatabase
-    import app.agents.ingest_agent as ingest
-    monkeypatch.setattr(ingest, "db", SQLDatabase(engine))
     yield
     engine.dispose()
 
 
 @pytest.fixture
 def seed_catalogue(tmp_path):
-    from app.services.database_service import replace_project_shots, get_catalogued_shots
+    from app.services.database_service import upsert_project_clips, get_catalogued_clips
+    from app.services.media_identity import fingerprint
 
     def seed(project_id=1, names=("arrival.mov", "goal.mov")):
         paths = []
@@ -70,8 +67,8 @@ def seed_catalogue(tmp_path):
                  "shot_type": "wide_shot", "has_audio": 0,
                  "keywords": "football,stadium" if i else "arrival,people",
                  "description": "A player kicks the football" if i else "People arrive",
-                 "source_mtime": 123, "source_size": 10}
+                 **fingerprint(path)}
                 for i, path in enumerate(paths)]
-        replace_project_shots(project_id, rows)
-        return list(get_catalogued_shots(project_id).values())
+        upsert_project_clips(project_id, rows)
+        return list(get_catalogued_clips(project_id).values())
     return seed
