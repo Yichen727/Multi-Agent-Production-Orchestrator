@@ -91,7 +91,7 @@ def source_files(root: Path):
         for path in sorted((root / folder).rglob("*.py")):
             if "data" not in path.relative_to(root).parts and not path.is_symlink():
                 yield path
-    for folder, suffix in (("docs", ".md"), ("benchmarks", ".json")):
+    for folder, suffix in (("docs", ".md"), ("benchmarks", ".json"), ("tests/fixtures", ".sql")):
         for path in sorted((root / folder).rglob("*" + suffix)):
             if path.is_file() and not path.is_symlink():
                 yield path
@@ -115,12 +115,15 @@ def catalogue_schema(conn: sqlite3.Connection) -> dict:
 
 
 def select_samples(conn: sqlite3.Connection, limit: int = 26) -> list[dict]:
+    modern = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='clips'").fetchone()
+    table, identifier = ("clips", "clip_id") if modern else ("shots", "shot_id")
+    active = " AND e.event_set_id=s.active_event_set_id" if modern else ""
     rows = [dict(r) for r in conn.execute(
-        "SELECT s.shot_id, s.project_id, s.file_path, s.duration_seconds, s.codec, "
+        f"SELECT s.{identifier} AS shot_id, s.project_id, s.file_path, s.duration_seconds, s.codec, "
         "s.orientation, s.fps, s.scene_count, s.source_size, s.source_mtime, "
-        "COUNT(e.event_id) AS event_count FROM shots s "
-        "LEFT JOIN clip_events e ON e.shot_id=s.shot_id "
-        "GROUP BY s.shot_id ORDER BY s.project_id, s.file_path"
+        f"COUNT(e.event_id) AS event_count FROM {table} s "
+        f"LEFT JOIN clip_events e ON e.{identifier}=s.{identifier}{active} "
+        f"GROUP BY s.{identifier} ORDER BY s.project_id, s.file_path"
     )]
     chosen = {}
     for pid in sorted({r["project_id"] for r in rows}):
@@ -154,6 +157,10 @@ def capture(database: Path, output: Path) -> Path:
         with closing(sqlite3.connect(snapshot)) as target:
             # SQLite's backup API includes committed WAL contents. Never copy a live .db alone.
             source.backup(target)
+            # The backup inherits the source journal mode. Make the snapshot a
+            # self-contained file so later readers cannot invalidate its manifest
+            # by creating/removing transient WAL/SHM sidecars.
+            target.execute("PRAGMA journal_mode=DELETE")
     finally:
         source.close()
     with closing(read_only_database(snapshot)) as conn:
@@ -195,7 +202,7 @@ def capture(database: Path, output: Path) -> Path:
         "git_commit": command_output(["git", "rev-parse", "HEAD"]),
     })
     files = {p.relative_to(destination).as_posix(): {"sha256": sha256(p), "bytes": p.stat().st_size}
-             for p in destination.rglob("*") if p.is_file()}
+             for p in destination.rglob("*") if p.is_file() and not p.name.endswith(("-wal", "-shm"))}
     dump_json(destination / "manifest.json", {
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
         "database_source": str(database.resolve()), "files": files,
@@ -206,14 +213,27 @@ def capture(database: Path, output: Path) -> Path:
 
 def verify(destination: Path) -> dict:
     manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    checked = 0
+    ignored = []
     for name, record in manifest["files"].items():
+        # P0's older manifests accidentally included transient read sidecars.
+        # Only ignore SHM or an explicitly empty WAL for the known snapshot.
+        # A nonempty WAL is never silently discarded.
+        if name == "catalogue.sqlite3-wal" and record["bytes"] == 0:
+            wal = destination / name
+            if wal.exists() and wal.stat().st_size:
+                raise ValueError("Snapshot has an unexpected nonempty WAL")
+        if name == "catalogue.sqlite3-shm" or (name == "catalogue.sqlite3-wal" and record["bytes"] == 0):
+            ignored.append(name)
+            continue
         path = (destination / name).resolve()
         if not path.is_relative_to(destination.resolve()) or sha256(path) != record["sha256"]:
             raise ValueError(f"Baseline checksum failed: {name}")
+        checked += 1
     with closing(read_only_database(destination / "catalogue.sqlite3")) as conn:
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Baseline database integrity failed")
-    return {"verified_files": len(manifest["files"]), "status": "ok"}
+    return {"verified_files": checked, "ignored_transient_files": ignored, "status": "ok"}
 
 
 def main():

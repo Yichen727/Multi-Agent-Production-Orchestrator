@@ -4,6 +4,7 @@ import json
 
 from app.models.schemas import DeliveryResult
 from app.services.catalogue_resolver import resolve_one, AmbiguousIdentifier
+from app.services.database_service import validate_segment_source
 from app.services.premiere_export_service import compile_project, InvalidAspectRatio
 from app.services.ffmpeg_service import count_audio_streams
 from app.utils.logger import get_logger
@@ -115,7 +116,7 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
 
     clips, unresolved = [], []
     for i, seg in enumerate(segments, start=1):
-        ident = seg.get("shot_id")
+        ident = seg.get("clip_id", seg.get("shot_id"))
         ident = str(ident) if ident is not None else (seg.get("file_path") or "")
         try:
             row = resolve_one(project_id, ident)
@@ -125,6 +126,10 @@ def compile_plan(plan, *, sequence_name: str = "MAPO Edit", project_id=1) -> str
         if row is None:
             unresolved.append(seg.get("file_path") or seg.get("shot_id") or f"segment #{i}")
             continue
+        try:
+            validate_segment_source(seg, row)
+        except (ValueError, OSError) as e:
+            return _refuse(f"Refusing stale/unverified segment #{i}: {e}", project_id)
         streams = count_audio_streams(row["file_path"])
         streams = streams if streams > 0 else (1 if row.get("has_audio") else 0)
         clips.append({

@@ -18,9 +18,10 @@ from app.models.state import ProductionState
 from app.models.schemas import IngestResult
 from app.services.openai_service import llm, embed_texts
 from app.services.database_service import (
-    db, replace_project_shots, get_catalogued_paths, get_catalogued_shots,
-    replace_project_events, get_catalogued_events,
+    db, get_catalogued_paths, get_catalogued_shots, get_catalogued_events,
+    publish_clip, get_analysis_steps, project_ingest_lock, mark_offline,
 )
+from app.services.media_identity import canonical_path, fingerprint, same_stat, content_hash
 from app.services.ffmpeg_service import (
     generate_proxy, get_video_duration, check_ffmpeg_installed,
     check_ffprobe_installed, probe_video_metadata, detect_scene_cuts,
@@ -238,75 +239,71 @@ def _event_semantic_text(action: str | None, state_change: str | None,
     return ". ".join(parts).strip()
 
 
-def _build_clip_events(path: str, duration: float, cut_times: list[float]) -> list[dict]:
-    """Extract ordered temporal events and their embeddings for one clip."""
-    windows = build_event_windows(duration, cut_times,
-                                  max_events=_event_budget(duration))
-    if not windows:
-        return []
-    events: list[dict] = []
-    pending: list[tuple[int, str]] = []   # (event index, semantic text)
-    order = 0
-    for (start, end) in windows:
-        frames = extract_frames_in_window_b64(path, start, end, count=_FRAMES_PER_EVENT)
-        if not frames:
-            continue
-        tags = analyze_event(frames, start_seconds=start, end_seconds=end,
-                             clip_duration=duration)
-        if tags is None:
-            continue
-        kws = [k for k in (s.strip().lower() for s in tags.keywords) if k and k != "unknown"]
-        keywords = ",".join(dict.fromkeys(kws))
-        action = (tags.action or "").strip()
-        state_change = (tags.state_change or "").strip()
+class EventAnalysis(list):
+    """Measured windows, including explicit failed windows, with tagging status."""
 
-        if not action and not keywords:
-            continue
-        order += 1
-        events.append({
-            "file_path": path,
-            "event_order": order,
-            "start_seconds": round(start, 3),
-            "end_seconds": round(end, 3),
-            "duration_seconds": round(max(0.0, end - start), 3),
-            "action": action or None,
-            "state_change": state_change or None,
-            "subjects": tags.subjects or [],
-            "keywords": keywords,
-            "embedding": None,
-        })
-        sem = _event_semantic_text(action, state_change, keywords)
-        if sem:
-            pending.append((len(events) - 1, sem))
+    def __init__(self):
+        super().__init__()
+        self.attempt_failures = 0
 
-    # Embed events in one batch.
+    @property
+    def complete(self):
+        return not self.attempt_failures and all(e.get("action") or e.get("keywords") for e in self)
+
+
+def _build_clip_events(path, duration, cut_times, *, existing_events=None, force=False):
+    cached = {(round(e["start_seconds"] * 1e6), round(e["end_seconds"] * 1e6)): e
+              for e in (existing_events or [])}
+    windows = ([(e["start_seconds"], e["end_seconds"]) for e in existing_events]
+               if existing_events and not force else
+               build_event_windows(duration, cut_times, max_events=_event_budget(duration)))
+    events = EventAnalysis()
+    pending = []
+    for order, (start, end) in enumerate(windows, 1):
+        previous = cached.get((round(start * 1e6), round(end * 1e6)), {})
+        item = {k: previous.get(k) for k in _EVENT_REUSE_COLUMNS}
+        item.update(file_path=path, event_order=order, start_seconds=round(start, 3),
+                    end_seconds=round(end, 3), duration_seconds=round(end - start, 3))
+        if force or not (item.get("action") or item.get("keywords")):
+            frames = extract_frames_in_window_b64(path, start, end, count=_FRAMES_PER_EVENT)
+            tags = analyze_event(frames, start_seconds=start, end_seconds=end,
+                                 clip_duration=duration) if frames else None
+            if tags is not None and (tags.action or tags.keywords):
+                item.update(action=(tags.action or "").strip() or None,
+                            state_change=(tags.state_change or "").strip() or None,
+                            subjects=tags.subjects,
+                            keywords=",".join(dict.fromkeys(k.strip().lower() for k in tags.keywords if k.strip())),
+                            embedding=None)
+            else:
+                events.attempt_failures += 1
+        text = _event_semantic_text(item.get("action"), item.get("state_change"), item.get("keywords") or "")
+        if text and not item.get("embedding"):
+            pending.append((len(events), text))
+        events.append(item)
     if pending:
-        vecs = embed_texts([text for _, text in pending])
-        if vecs and len(vecs) == len(pending):
-            for (idx, _), vec in zip(pending, vecs):
-                events[idx]["embedding"] = json.dumps(vec)
-        elif vecs:
-            logger.error(f"Event embedding count mismatch for {path} "
-                         f"({len(pending)} text(s) → {len(vecs)} vector(s)); "
-                         "storing no event vectors for this clip.")
+        vectors = embed_texts([text for _, text in pending])
+        if vectors and len(vectors) == len(pending):
+            for (index, _), vector in zip(pending, vectors):
+                events[index]["embedding"] = json.dumps(vector)
     return events
-
 
 def _find_video_files(scan_dir: Path) -> tuple[list[Path], bool]:
     """Find supported videos and report whether the scan was truncated."""
     exts = {"." + e.strip().lower().lstrip(".") for e in settings.SUPPORTED_VIDEO_FORMATS}
     found: list[Path] = []
     truncated = False
-    for dirpath, _dirnames, filenames in os.walk(scan_dir, followlinks=False):
+    def scan_error(error):
+        raise error
+    for dirpath, _dirnames, filenames in os.walk(scan_dir, followlinks=False, onerror=scan_error):
         for name in filenames:
             if os.path.splitext(name)[1].lower() in exts:
                 found.append(Path(dirpath) / name)
-                if len(found) >= _MAX_INGEST_FILES:
+                if len(found) > _MAX_INGEST_FILES:
                     truncated = True
                     break
         if truncated:
             break
-    return found, truncated
+    return found[:_MAX_INGEST_FILES], truncated
 
 
 @tool
@@ -328,7 +325,8 @@ def detect_new_footage(directory: str = None, project_id: int = 1,
 
     on_disk, truncated = _find_video_files(scan_dir)
     known = get_catalogued_paths(project_id)
-    new_files = [f for f in on_disk if str(f) not in known]
+    known = {canonical_path(p) for p in known}
+    new_files = [f for f in on_disk if canonical_path(f) not in known]
 
     cap_note = (f"\n⚠ Only the first {_MAX_INGEST_FILES} files were scanned (per-run "
                 "capacity limit) — there may be more.") if truncated else ""
@@ -357,336 +355,189 @@ def _semantic_text(description: str | None, keywords: str, mood: str | None) -> 
     return ". ".join(parts).strip()
 
 
-def _file_fingerprint(path: Path) -> tuple[float | None, int | None]:
-    """Return file modification time and size."""
-    try:
-        st = path.stat()
-        return st.st_mtime, st.st_size
-    except OSError:
-        return None, None
-
-
-def _can_reuse(cached: dict, mtime: float | None, size: int | None) -> bool:
-    """Return whether a cached catalogue row can be reused."""
-    c_size = cached.get("source_size")
-    c_mtime = cached.get("source_mtime")
-    if c_size is not None and size is not None and c_size != size:
-        return False
-    if c_mtime is not None and mtime is not None and abs(c_mtime - mtime) > 1.0:
-        return False
-    return True
-
-
 @tool
 def ingest_footage(directory: str = None, project_id: int = 1,
                    analyze_content: bool = True, generate_proxies: bool = False,
                    analyze_events: bool = True, force_reanalyze: bool = False,
+                   synchronize: bool = False, verify_content: bool = False,
                    state: Annotated[dict, InjectedState] = None) -> str:
-    """Run the ingest pipeline on a directory and (re)build the catalogue.
-
-    INCREMENTAL BY DEFAULT: a file whose path is already catalogued and whose
-    content is unchanged (same size + modification time) is REUSED as-is — its
-    ffprobe metadata and GPT-5.5 Vision tags are kept, so no FFmpeg or LLM work runs
-    for it again. Only new or modified files go through full analysis. This keeps
-    repeated ingests fast and avoids re-spending Vision API calls.
-
-    For each file needing analysis it performs, in order:
-      1. VERIFY the media is readable (ffprobe).
-      2. TECHNICAL METADATA — true dimensions, display orientation
-         (portrait/landscape/square, rotation-aware), fps, codec, audio presence,
-         duration.
-      3. SHOT/SCENE DETECTION — FFmpeg scene-change cut count.
-      4. VISION TAGGING (if analyze_content) — GPT-5.5 watches sampled frames and
-         returns a description, shot type, objects, searchable keywords, and an
-         approximate people count.
-      5. TEMPORAL EVENT EXTRACTION (if analyze_events) — the clip is split into event
-         windows (scene cuts + long-scene sub-division) and GPT-5.5 describes WHAT
-         HAPPENS in each (action + change), stored as ordered ``clip_events`` with real
-         start/end timecodes and their own embeddings for moment-level search.
-      6. (optional) PROXY generation for each clip.
-    The merged results (reused + freshly analysed) REPLACE the project's catalogue,
-    so files deleted from disk drop out too.
-
-    Only measured / model-observed facts are stored. When a step cannot run (no
-    FFmpeg, no API key, unreadable file), the corresponding fields are left
-    unclassified rather than guessed.
+    """Incrementally index videos, preserving existing clip and event identities.
 
     Args:
-        directory: Footage directory to ingest. Defaults to the run's footage directory.
-        project_id: Project to (re)build the catalogue for.
-        analyze_content: Run GPT-5.5 Vision tagging on sampled frames (default True).
-        generate_proxies: Also generate a low-res proxy per clip (slow; default False).
-        analyze_events: Extract temporal 'what happens' events per clip (default True;
-            requires analyze_content / an API key — skipped otherwise).
-        force_reanalyze: Ignore the cache and re-analyse every file (default False).
+        directory: Folder to import; defaults to the directory in injected state.
+        project_id: Project fallback; injected project state is authoritative.
+        analyze_content: Fill missing visual tags and embeddings.
+        generate_proxies: Generate missing editing proxies.
+        analyze_events: Fill missing temporal windows/tags when content analysis is enabled.
+        force_reanalyze: Reanalyse explicitly; use only at the user's request.
+        synchronize: Mark missing files under this root offline after a COMPLETE scan.
+            Default is append/update. Never deletes clips or their history.
+        verify_content: Hash even unchanged-size/mtime files for strict verification.
+        state: Injected project and footage directory.
 
     Returns:
-        A summary: clips indexed, how many were reused vs newly analysed, the
-        orientation breakdown, and how many were vision-tagged.
+        Structured status is recorded for the UI; text reports indexed/reused/failed files.
     """
-    scan_dir = _scan_dir(directory, state)
-    project_id = _resolve_pid(state, project_id)
-    if not scan_dir.exists():
-        msg = f"Directory not found: {scan_dir}"
-        _record_ingest_result(IngestResult(status="failure", project_id=project_id,
-                                            message=msg, errors=[msg]))
-        return msg
-    if not check_ffprobe_installed():
-        msg = ("Error: ffprobe (FFmpeg) is not on PATH, so real metadata cannot be "
-               "probed. Install FFmpeg and try again — nothing was catalogued.")
-        _record_ingest_result(IngestResult(status="failure", project_id=project_id,
-                                            message=msg, errors=["ffprobe not on PATH"]))
-        return msg
+    pid = _resolve_pid(state, project_id)
+    with project_ingest_lock(pid):
+        return _ingest_directory(_scan_dir(directory, state), pid, analyze_content,
+                                 generate_proxies, analyze_events, force_reanalyze,
+                                 synchronize, verify_content)
 
-    found, truncated = _find_video_files(scan_dir)
-    if not found:
-        exts = sorted("." + e.strip().lower().lstrip(".") for e in settings.SUPPORTED_VIDEO_FORMATS)
-        msg = f"No supported video files found in {scan_dir}. Supported: {exts}"
+
+def _ingest_directory(scan_dir, project_id, analyze_content, generate_proxies,
+                      analyze_events, force_reanalyze, synchronize, verify_content):
+    def fail(message, truncated=False):
         _record_ingest_result(IngestResult(status="failure", project_id=project_id,
-                                            message=msg, errors=["no supported files"]))
-        return msg
+            truncated=truncated, message=message, errors=[message]))
+        return message
+    if not scan_dir.is_dir():
+        return fail(f"Directory not found: {scan_dir}")
+    try:
+        found, truncated = _find_video_files(scan_dir)
+    except OSError as exc:
+        return fail(f"Scan could not finish ({type(exc).__name__}); existing catalogue retained.")
     if truncated:
-        # Refuse truncated ingest to protect the existing catalogue.
-        msg = (f"Refusing to ingest: {scan_dir} holds more than {_MAX_INGEST_FILES} "
-               "supported video files, which exceeds this build's per-run capacity. "
-               "Ingesting anyway would DELETE the existing catalogue and keep only the "
-               f"first {_MAX_INGEST_FILES}, so NOTHING was changed. Split the footage "
-               "into smaller batches (or raise the limit) and re-run. No rows were "
-               "written or deleted.")
-        _record_ingest_result(IngestResult(
-            status="failure", project_id=project_id, truncated=True, message=msg,
-            errors=[f"scan exceeded the {_MAX_INGEST_FILES}-file per-run cap"]))
-        return msg
-
-    cache = {} if force_reanalyze else get_catalogued_shots(project_id)
-    events_cache = {} if force_reanalyze else get_catalogued_events(project_id)
-
+        return fail(f"Scan exceeds the {_MAX_INGEST_FILES}-file limit; import a smaller batch. "
+                    "Existing catalogue was not changed.", truncated=True)
+    if not found:
+        return fail(f"No supported video files found in {scan_dir}; existing catalogue retained.")
+    cached_by_path = {canonical_path(k): v for k, v in get_catalogued_shots(project_id).items()}
+    events_by_path = {canonical_path(k): v for k, v in get_catalogued_events(project_id).items()}
     do_vision = analyze_content and bool(settings.OPENAI_API_KEY)
     do_events = do_vision and analyze_events
-
-    all_events: list[dict] = []      
-    clips_with_events = 0            
-    rows: list[dict] = []
-    orientation_counts = {"portrait": 0, "landscape": 0, "square": 0, "unknown": 0}
-    unreadable = 0
-    tagged = 0
-    reused = 0
-    proxies = 0
-    scene_sampled = 0       
-    even_sampled = 0         
-    frames_sent = 0         
-    scene_incomplete = 0     
-
+    indexed = reused = unreadable = event_count = 0
+    warnings, errors, observed = [], [], set()
     for f in found:
-        path = str(f)
-        mtime, size = _file_fingerprint(f)
-
-        # Reuse unchanged files.
-        cached = cache.get(path)
-        if cached is not None and _can_reuse(cached, mtime, size):
-            row = {col: cached.get(col) for col in (
-                "file_path", "shot_type",
-                "duration_seconds",
-                "keywords", "width", "height", "orientation", "fps",
-                "codec", "has_audio", "scene_count", "description", "people_count",
-                "mood", "embedding",
-                "audio_channels", "audio_sample_rate", "audio_bit_depth",
-            )}
-            # Refresh the fingerprint in case the previous ingest stored none.
-            row["source_mtime"] = mtime if mtime is not None else cached.get("source_mtime")
-            row["source_size"] = size if size is not None else cached.get("source_size")
-            rows.append(row)
-            reused += 1
-            orientation_counts[row.get("orientation") or "unknown"] = (
-                orientation_counts.get(row.get("orientation") or "unknown", 0) + 1
-            )
-            # Preserve cached events without re-running vision analysis.
-            cached_events = events_cache.get(path) or []
-            if cached_events:
-                for ev in cached_events:
-                    all_events.append({c: ev.get(c) for c in _EVENT_REUSE_COLUMNS})
-                clips_with_events += 1
+        path = canonical_path(f)
+        if path in observed:
             continue
-
-        # Analyse new or changed files.
-        meta = probe_video_metadata(path)
-        if not meta["ok"]:
-            unreadable += 1
-        orientation_counts[meta["orientation"]] = orientation_counts.get(meta["orientation"], 0) + 1
-
-        # Scene detection; cut timestamps are reused for frame sampling.
-        scene_info = (detect_scene_cuts(path, duration_seconds=meta["duration_seconds"])
-                      if meta["ok"] else None)
-        cut_times = scene_info["cut_times"] if scene_info else []
-        scene_count = scene_info["scene_count"] if scene_info else 0
-        if scene_info and scene_info["ran"] and not scene_info["complete"]:
-            # Keep valid cuts, but mark incomplete detection explicitly.
-            scene_incomplete += 1
-            covered = (f"up to {max(cut_times):.0f}s of {meta['duration_seconds']:.0f}s"
-                       if cut_times else "no cuts at all")
-            logger.warning(f"{f.name}: scene detection ended early, covering {covered}; "
-                           f"kept {len(cut_times)} cut(s). Event boundaries past that point "
-                           "fall back to even sub-division.")
-
-        # Vision tagging from sampled frames.
-        shot_type = "unclassified"
-        keywords = ""
-        description = None
-        people_count = None
-        mood = None
-        if do_vision and meta["ok"]:
-            duration = meta["duration_seconds"]
-            # Allocate more frames to longer or multi-scene clips.
-            frame_count = choose_frame_count(duration, scene_count)
-            # Prefer one representative frame per detected scene (midpoint).
-            frames, sampled_timestamps = extract_scene_representative_frames_b64(
-                path, duration, cut_times, max_frames=frame_count)
-            sampling_strategy = "scene-midpoint" if cut_times else "adaptive-even"
-            if not frames:
-                # Fall back to even sampling if scene sampling fails.
-                frames = extract_sample_frames_b64(path, duration, count=frame_count)
-                sampled_timestamps = []
-                sampling_strategy = "adaptive-even"
-            if frames:
-                frames_sent += len(frames)
-                if sampling_strategy == "scene-midpoint":
-                    scene_sampled += 1
+        observed.add(path)
+        cached = cached_by_path.get(path)
+        unchanged = False
+        try:
+            before = fingerprint(path)
+            unchanged = bool(cached and same_stat(cached, before))
+            digest = cached.get("content_hash") if cached else None
+            if verify_content or not unchanged:
+                measured_hash = content_hash(path)
+                if cached and digest:
+                    unchanged = measured_hash == digest
+                digest = measured_hash
+            previous_steps = get_analysis_steps(cached["clip_id"], cached["source_revision"]) if cached and unchanged else {}
+            def done(name):
+                return previous_steps.get(name, {}).get("status") == "complete"
+            row = dict(cached) if unchanged else {
+                "shot_type": "unclassified", "description": None, "keywords": "",
+                "people_count": None, "mood": None, "embedding": None}
+            row.update(file_path=path, **before, content_hash=digest, online=1)
+            steps = {}
+            needs_probe = force_reanalyze or not unchanged or not done("probe")
+            if needs_probe:
+                if not check_ffprobe_installed():
+                    raise ValueError("ffprobe is not installed; no new metadata was published")
+                meta = probe_video_metadata(path)
+                if not meta["ok"]:
+                    raise ValueError("Video could not be probed; previous analysis was retained")
+                row.update({key: meta.get(key) for key in (
+                    "width", "height", "duration_seconds", "orientation", "fps", "codec", "has_audio",
+                    "audio_channels", "audio_sample_rate", "audio_bit_depth")})
+                steps["probe"] = "complete"
+            old_events = events_by_path.get(path, []) if unchanged else []
+            needs_tags = do_vision and (force_reanalyze or not done("clip_tags"))
+            needs_events = do_events and (force_reanalyze or not done("events") or
+                not old_events or any(not (e.get("action") or e.get("keywords")) for e in old_events))
+            needs_event_vectors = do_events and any(
+                (e.get("action") or e.get("keywords")) and not e.get("embedding") for e in old_events)
+            scene_details = previous_steps.get("scene_cuts", {}).get("details") or {}
+            cuts = scene_details.get("cut_times", [])
+            if needs_probe or (needs_events and (not old_events or force_reanalyze)):
+                scene = detect_scene_cuts(path, duration_seconds=row["duration_seconds"])
+                cuts = scene["cut_times"]
+                row["scene_count"] = scene["scene_count"]
+                steps["scene_cuts"] = {"status": "complete" if scene.get("complete") else "partial",
+                                      "details": {"cut_times": cuts}}
+            if needs_tags:
+                count = choose_frame_count(row["duration_seconds"], row.get("scene_count"))
+                frames, timestamps = extract_scene_representative_frames_b64(
+                    path, row["duration_seconds"], cuts, max_frames=count)
+                if not frames:
+                    frames = extract_sample_frames_b64(path, row["duration_seconds"], count=count)
+                    timestamps = []
+                tags = analyze_frames(frames, duration_seconds=row["duration_seconds"],
+                    scene_count=row.get("scene_count"), sampled_timestamps=timestamps,
+                    sampling_strategy="scene-midpoint" if cuts else "adaptive-even") if frames else None
+                if tags is None:
+                    steps["clip_tags"] = {"status": "failed", "config_version": f"{settings.VISION_MODEL}:clip-v1"}
+                    warnings.append(f"{f.name}: clip tagging incomplete")
                 else:
-                    even_sampled += 1
-            tags = analyze_frames(
-                frames, duration_seconds=duration, scene_count=scene_count or None,
-                sampled_timestamps=sampled_timestamps or None,
-                sampling_strategy=sampling_strategy,
-            ) if frames else None
-            if tags is not None:
-                tagged += 1
-                shot_type = tags.shot_type or "unclassified"
-                kw = list(dict.fromkeys([*tags.keywords, *tags.objects, tags.setting]))
-                keywords = ",".join(k for k in (s.strip().lower() for s in kw) if k and k != "unknown")
-                description = tags.scene_description or None
-                people_count = tags.people_count
-                # Semantic dimension
-                mood = tags.mood if tags.mood != "unknown" else None
-
-        # Embed only observed semantic content.
-        embedding = None
-        semantic_text = _semantic_text(description, keywords, mood)
-        if semantic_text:
-            vecs = embed_texts([semantic_text])
-            if vecs:
-                embedding = json.dumps(vecs[0])
-
-        if generate_proxies and meta["ok"] and check_ffmpeg_installed():
-            try:
-                generate_proxy(path)
-                proxies += 1
-            except Exception as e:
-                logger.error(f"Proxy generation failed for {f.name}: {e}")
-
-        rows.append({
-            "file_path": path,
-            "shot_type": shot_type,
-            "duration_seconds": meta["duration_seconds"],
-            "keywords": keywords,
-            "width": meta["width"],
-            "height": meta["height"],
-            "orientation": meta["orientation"],
-            "fps": meta["fps"],
-            "codec": meta["codec"],
-            "has_audio": 1 if meta["has_audio"] else 0,
-            "scene_count": scene_count,
-            "description": description,
-            "people_count": people_count,
-            "mood": mood,
-            "embedding": embedding,
-            "source_mtime": mtime,
-            "source_size": size,
-            "audio_channels": meta.get("audio_channels"),
-            "audio_sample_rate": meta.get("audio_sample_rate"),
-            "audio_bit_depth": meta.get("audio_bit_depth"),
-        })
-
-        # Extract temporal "what happens" events.
-        if do_events and meta["ok"] and meta["duration_seconds"] > 0:
-            clip_events = _build_clip_events(path, meta["duration_seconds"], cut_times)
-            if clip_events:
-                all_events.extend(clip_events)
-                clips_with_events += 1
-
-    count = replace_project_shots(project_id, rows)
-    # Write events after shots so shot IDs can be resolved.
-    events_indexed = replace_project_events(project_id, all_events)
-    analysed = count - reused
-    logger.info(f"Ingested {count} file(s) into project {project_id} from {scan_dir} "
-                f"({reused} reused, {analysed} analysed, {unreadable} unreadable)")
-
-    # Distinguish clean, partial, and failed ingestion.
-    if count == 0:
-        status = "failure"
-    elif unreadable == 0:
-        status = "success"
-    elif unreadable < count:
-        status = "partial_success"
-    else:
-        status = "failure"
-
-    warnings: list[str] = []
-    if unreadable:
-        warnings.append(f"{unreadable} file(s) could not be probed and were stored as 'unknown'")
-    if do_vision and tagged < analysed:
-        warnings.append(f"{analysed - tagged} newly analysed clip(s) were not vision-tagged")
-    if scene_incomplete:
-        warnings.append(
-            f"{scene_incomplete} clip(s) hit the scene-detection timeout — their cut list "
-            "covers only the analysed head, so scene_count is a lower bound and later "
-            "event boundaries are evenly sub-divided rather than cut-aligned"
-        )
-
-    breakdown = ", ".join(f"{k}: {v}" for k, v in orientation_counts.items() if v)
-    headline = {
-        "success": "Ingest completed successfully.",
-        "partial_success": "Ingest completed with warnings (some files were unreadable).",
-        "failure": "Ingest FAILED — no usable clips were indexed.",
-    }[status]
-    summary = (
-        f"{headline} Indexed {count} clip(s) from {scan_dir} "
-        f"into project {project_id} — {analysed} newly analysed, {reused} reused "
-        f"from previous analysis.\n"
-        f"Orientation — {breakdown}."
-    )
-    if do_vision:
-        summary += f"\nVision-tagged {tagged} newly analysed clip(s) with GPT-5.5."
-        summary += (
-            f"\nFrame sampling — {scene_sampled} clip(s) via scene midpoints, "
-            f"{even_sampled} via adaptive even sampling; "
-            f"{frames_sent} frame(s) sent to the vision model."
-        )
-    if do_events:
-        summary += (
-            f"\nTemporal events — extracted {events_indexed} 'what happens' event(s) "
-            f"across {clips_with_events} clip(s) for moment-level search."
-        )
-    elif analyze_content:
-        summary += "\nVision tagging skipped (no OPENAI_API_KEY)."
-    else:
-        summary += "\nVision tagging disabled for this run."
-    if generate_proxies:
-        summary += f"\nGenerated {proxies} proxy file(s)."
-    if unreadable:
-        summary += f"\n({unreadable} file(s) could not be probed and were stored as 'unknown'.)"
-    if scene_incomplete:
-        summary += (f"\n({scene_incomplete} clip(s) hit the scene-detection timeout — the "
-                    "cuts found were kept, but their scene count is a lower bound.)")
-    if status != "failure":
-        summary += "\nFootage indexed and ready for search."
-
-    _record_ingest_result(IngestResult(
-        status=status, project_id=project_id, indexed_count=count,
-        reused_count=reused, unreadable_count=unreadable, event_count=events_indexed,
-        truncated=False, message=headline, warnings=warnings,
-    ))
-    return summary
-
+                    keywords = [*tags.keywords, *tags.objects, tags.setting]
+                    row.update(shot_type=tags.shot_type or "unclassified",
+                               keywords=",".join(dict.fromkeys(k.strip().lower() for k in keywords
+                                                             if k.strip() and k != "unknown")),
+                               description=tags.scene_description or None,
+                               people_count=tags.people_count,
+                               mood=tags.mood if tags.mood != "unknown" else None, embedding=None)
+                    steps["clip_tags"] = {"status": "complete", "config_version": f"{settings.VISION_MODEL}:clip-v1"}
+            semantic = _semantic_text(row.get("description"), row.get("keywords") or "", row.get("mood"))
+            if do_vision and semantic and (force_reanalyze or not row.get("embedding")):
+                vectors = embed_texts([semantic])
+                if vectors:
+                    row["embedding"] = json.dumps(vectors[0])
+                steps["clip_embedding"] = {"status": "complete" if vectors else "failed",
+                                           "config_version": settings.EMBEDDING_MODEL}
+            new_events = None
+            complete = True
+            if needs_events or needs_event_vectors:
+                new_events = _build_clip_events(path, row["duration_seconds"], cuts,
+                    existing_events=old_events, force=force_reanalyze)
+                complete = new_events.complete
+                steps["events"] = {"status": "complete" if complete else "partial",
+                                   "config_version": f"{settings.VISION_MODEL}:events-v1"}
+                vector_complete = all(e.get("embedding") for e in new_events if e.get("action") or e.get("keywords"))
+                steps["event_embedding"] = {"status": "complete" if vector_complete else "partial",
+                                            "config_version": settings.EMBEDDING_MODEL}
+                if not complete:
+                    warnings.append(f"{f.name}: some event windows need analysis")
+            if generate_proxies and (force_reanalyze or not done("proxy")):
+                try:
+                    proxy = generate_proxy(path)
+                    steps["proxy"] = {"status": "complete", "details": {"path": proxy}}
+                except Exception:
+                    steps["proxy"] = "failed"
+                    warnings.append(f"{f.name}: proxy generation failed")
+            if fingerprint(path) != before:
+                raise ValueError("Source changed during analysis; result discarded")
+            saved = cached if unchanged and not steps and row == cached else publish_clip(
+                project_id, row, events=new_events, steps=steps, events_complete=complete,
+                expected_revision=cached["source_revision"] if cached else 0)
+            cached_by_path[path] = saved
+            indexed += 1
+            if unchanged and not any(key not in ("probe",) for key in steps):
+                reused += 1
+            event_count += len(new_events if new_events is not None else old_events)
+        except Exception as exc:
+            unreadable += 1
+            errors.append(f"{f.name}: {type(exc).__name__}: {exc}")
+            if cached:
+                try:
+                    still_usable = unchanged and same_stat(cached, fingerprint(path))
+                except OSError:
+                    still_usable = False
+                if not still_usable:
+                    mark_offline(project_id, [path])
+    if synchronize and not errors:
+        root = Path(canonical_path(scan_dir))
+        missing = [p for p in cached_by_path if Path(p).is_relative_to(root) and p not in observed]
+        mark_offline(project_id, missing)
+    status = "failure" if not indexed else ("partial_success" if errors or warnings else "success")
+    message = (f"Ingest {status}: {indexed} clip(s) indexed; {reused} reused; "
+               f"{unreadable} failed; {event_count} active event(s) in this import. "
+               "Existing IDs and unrelated catalogue entries are retained.")
+    _record_ingest_result(IngestResult(status=status, project_id=project_id,
+        indexed_count=indexed, reused_count=reused, unreadable_count=unreadable,
+        event_count=event_count, message=message, warnings=warnings, errors=errors))
+    return message
 
 # ── Tools: shot classification / catalogue queries ─────────────────────────────
 
@@ -702,11 +553,11 @@ def get_shots_by_type(shot_type: str) -> str:
         shot_type: Type of shot to search for.
     """
     return db.run(
-        _sql("""SELECT s.shot_id, s.file_path, s.shot_type,
+        _sql("""SELECT s.clip_id AS shot_id, s.file_path, s.shot_type,
                        s.duration_seconds, s.keywords
-                FROM shots s
+                FROM clips s
                 WHERE s.shot_type LIKE :stype
-                ORDER BY s.shot_id"""),
+                ORDER BY s.clip_id"""),
         parameters={"stype": f"%{shot_type}%"},
         include_columns=True,
     )
@@ -720,7 +571,7 @@ def classify_shot_attributes(shot_id: int) -> str:
         shot_id: Unique shot identifier.
     """
     return db.run(
-        _sql("SELECT * FROM shots WHERE shot_id = :sid"),
+        _sql("SELECT * FROM clips WHERE clip_id = :sid"),
         parameters={"sid": shot_id},
         include_columns=True,
     )
@@ -740,7 +591,7 @@ def export_metadata_json(project_id: int = 1) -> str:
         Path to the exported JSON file.
     """
     shots = db.run(
-        _sql("SELECT * FROM shots WHERE project_id = :pid"),
+        _sql("SELECT * FROM clips WHERE project_id = :pid"),
         parameters={"pid": project_id},
         include_columns=True,
     )

@@ -80,8 +80,6 @@ def test_planner_refuses_same_project_unselected_clip(seed_catalogue):
     assert "```json" not in text
 
 
-@pytest.mark.known_issue
-@pytest.mark.xfail(raises=AssertionError, reason="P1a: exactly 200 files is incorrectly marked as truncated")
 def test_ingest_cap_allows_exactly_200_files(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest.os, "walk", lambda *a, **k: [(str(tmp_path), [], [f"{i}.mov" for i in range(200)])])
     files, truncated = ingest._find_video_files(tmp_path)

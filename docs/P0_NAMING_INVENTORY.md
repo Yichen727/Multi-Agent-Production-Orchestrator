@@ -1,6 +1,6 @@
 # P0 命名与引用清单
 
-这是 P1 迁移范围，不表示数据库和 UI 已经改名。逐行引用见 `.local/p0/20261123T111707Z-da4ccd44/naming_references.json`；表/列/索引/外键见同目录 `schema.json`。实施时重新扫描，避免依赖过期行号。
+这是 P0 时点记录的 P1 迁移范围。P1a 已完成物理表/字段及运行 SQL 的迁移，公开字段别名与 UI 命名仍待 P1b/P1c；见 [P1A_CATALOGUE.md](P1A_CATALOGUE.md)。原逐行引用见 `.local/p0/20261123T111707Z-da4ccd44/naming_references.json`；表/列/索引/外键见同目录 `schema.json`。后续实施应重新扫描，避免依赖过期行号。
 
 ## 数据库
 

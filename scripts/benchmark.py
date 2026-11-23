@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -46,6 +47,11 @@ def run(baseline: Path, output: Path, repeats: int = 5) -> dict:
             database = Path(directory) / "benchmark.sqlite3"
             shutil.copy2(baseline / "catalogue.sqlite3", database)
             os.environ["METADATA_DB_PATH"] = str(database)
+            from app.services.catalogue_migrations import initialise
+            with sqlite3.connect(database) as migration:
+                migration.execute("PRAGMA foreign_keys=ON")
+                initialise(migration, allow_migration=True)
+            migration.close()
             from app.services import database_service as db, retrieval_service as retrieval
             cleanup.callback(db._engine.dispose)
             from app.services.timeline_service import build_clip_timeline, build_moment_timeline

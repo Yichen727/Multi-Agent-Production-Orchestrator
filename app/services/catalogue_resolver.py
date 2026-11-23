@@ -6,7 +6,9 @@ from app.services.database_service import _engine
 
 # Metadata required by Selection and Delivery.
 _DEFAULT_COLUMNS = (
-    "shot_id, file_path, shot_type, duration_seconds, orientation, fps, "
+    "clip_id, clip_id AS shot_id, project_id, canonical_path, source_revision, "
+    "source_mtime_ns, source_size, active_event_set_id, "
+    "file_path, shot_type, duration_seconds, orientation, fps, "
     "width, height, codec, has_audio, keywords, description, "
     "people_count, mood, "
     "audio_channels, audio_sample_rate, audio_bit_depth"
@@ -37,7 +39,7 @@ def _basename(path) -> str:
 
 def _match_by_path(conn, project_id, token: str, columns: str) -> list:
     """Find path-based matches within a project."""
-    base = f"SELECT {columns} FROM shots WHERE project_id = :pid AND "
+    base = f"SELECT {columns} FROM clips WHERE project_id = :pid AND "
 
     rows = conn.execute(_sql(base + "file_path = :t"),
                         {"pid": project_id, "t": token}).fetchall()
@@ -65,8 +67,8 @@ def resolve_one(project_id, token, *, columns: str = _DEFAULT_COLUMNS) -> dict |
     with _engine.begin() as conn:
         if token.isdigit():
             rows = conn.execute(
-                _sql(f"SELECT {columns} FROM shots "
-                     "WHERE project_id = :pid AND shot_id = :sid"),
+                _sql(f"SELECT {columns} FROM clips "
+                     "WHERE project_id = :pid AND clip_id = :sid"),
                 {"pid": project_id, "sid": int(token)},
             ).fetchall()
         else:

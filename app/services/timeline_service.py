@@ -239,6 +239,8 @@ def build_clip_timeline(clips: list[dict], labels: list[str] | None = None,
         segments.append({
             "order": i + 1,
             "shot_id": c.get("shot_id"),
+            "clip_id": c.get("clip_id", c.get("shot_id")),
+            "source_revision": c.get("source_revision"),
             "file_path": c.get("file_path"),
             "name": Path(c.get("file_path") or "").name,
             "label": (labels[i] if labels and i < len(labels) else ""),
@@ -307,6 +309,9 @@ def build_moment_timeline(events: list[dict], *, target_seconds: float | None = 
         segments.append({
             "order": i + 1,
             "shot_id": e.get("shot_id"),
+            "clip_id": e.get("clip_id", e.get("shot_id")),
+            "source_revision": e.get("source_revision"),
+            "event_set_id": e.get("event_set_id"),
             "event_id": e.get("event_id"),
             "file_path": e.get("file_path"),
             "name": Path(e.get("file_path") or "").name,

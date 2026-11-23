@@ -232,3 +232,22 @@ python -m scripts.evaluate --budget-usd 0.05 --max-requests 2  # dry-run
 Known P1/P5 defects are strict expected failures, listed in the baseline document.
 The upcoming database/model/form/UI rename is tracked in
 [docs/P0_NAMING_INVENTORY.md](docs/P0_NAMING_INVENTORY.md).
+
+## P1a catalogue migration
+
+The catalogue now uses physical `clips/clip_id` tables/fields with stable source
+identities, active event sets and per-step analysis status. Importing unchanged
+media reuses completed work and preserves both clip and event IDs; importing
+another folder appends instead of replacing the project. See
+[docs/P1A_CATALOGUE.md](docs/P1A_CATALOGUE.md) for scope, backups and validation.
+
+Fresh databases are created automatically. Deploy an existing legacy database
+explicitly before starting/restarting the app:
+
+```bash
+python -m scripts.migrate_catalogue app/data/mapo_catalogue.db
+```
+
+The command creates a consistent backup and migrates once; repeated execution
+does not recreate IDs. This workspace's catalogue has already been migrated.
+Public model/state naming and UI navigation remain scheduled for P1b/P1c.

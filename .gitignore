@@ -31,6 +31,7 @@ app/data/outputs/*
 app/data/output/exports/*
 !app/data/output/exports/.gitkeep
 app/data/output/metrics/
+app/data/backups/
 
 # Local catalogue / database
 *.db

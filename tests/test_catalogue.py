@@ -45,8 +45,6 @@ def test_event_lookup_is_project_scoped(seed_catalogue):
     assert db.get_events_by_ids(2, [event["event_id"]])[event["event_id"]]["source_duration"] == 10
 
 
-@pytest.mark.known_issue
-@pytest.mark.xfail(raises=AssertionError, reason="P1a: replacing a project reallocates clip/event IDs")
 def test_unchanged_catalogue_write_preserves_clip_and_event_ids(seed_catalogue):
     one = seed_catalogue(1)[0]
     event = {"file_path": one["file_path"], "event_order": 1, "start_seconds": 0, "end_seconds": 5}
