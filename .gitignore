@@ -10,9 +10,12 @@ __pycache__/
 venv/
 .pytest_cache/
 .mypy_cache/
+<<<<<<< HEAD
 .local/
 .coverage
 htmlcov/
+=======
+>>>>>>> ea5d43a8e259afbc126d40cd440a79f2bc53c3e1
 
 # Media / raw footage
 *.mp4
@@ -30,7 +33,10 @@ app/data/outputs/*
 !app/data/output/exports/
 app/data/output/exports/*
 !app/data/output/exports/.gitkeep
+<<<<<<< HEAD
 app/data/output/metrics/
+=======
+>>>>>>> ea5d43a8e259afbc126d40cd440a79f2bc53c3e1
 
 # Local catalogue / database
 *.db
@@ -44,4 +50,8 @@ app/data/output/metrics/
 
 # Claude Code
 CLAUDE.md
+<<<<<<< HEAD
 .claude/
+=======
+.claude/
+>>>>>>> ea5d43a8e259afbc126d40cd440a79f2bc53c3e1
